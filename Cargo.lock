@@ -3504,6 +3504,7 @@ dependencies = [
  "nix 0.26.4",
  "oci-spec 0.8.4",
  "opentelemetry 0.17.0",
+ "pathrs",
  "procfs 0.12.0",
  "prometheus",
  "protobuf",
@@ -5129,6 +5130,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45c58ab1edb03f77d0bb3f08e4a179dd43ce9bc8eab9867ec53a78285ea3039b"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "pathrs"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fb2311801201fc6fd2e8a9f4841b41eee565e992fbe713731e29e367b8e3f17"
+dependencies = [
+ "bitflags 2.11.0",
+ "itertools 0.14.0",
+ "libc",
+ "memchr",
+ "once_cell",
+ "rustix 1.1.4",
+ "rustversion",
+ "static_assertions",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
