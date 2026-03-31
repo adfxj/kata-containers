@@ -52,7 +52,6 @@ pub struct NydusdConfig {
     pub extra_args: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl NydusdConfig {
     pub fn new(
         path: PathBuf,
