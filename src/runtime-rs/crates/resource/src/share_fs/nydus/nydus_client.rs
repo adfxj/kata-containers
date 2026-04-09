@@ -54,7 +54,6 @@ pub struct NydusClient {
     client: Client<hyperlocal::UnixConnector>,
 }
 
-#[allow(dead_code)]
 impl NydusClient {
     pub fn new(sock_path: &Path) -> Self {
         Self {
