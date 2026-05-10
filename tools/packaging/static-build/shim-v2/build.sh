@@ -43,6 +43,7 @@ esac
 
 # Variants (targets) that build a measured rootfs as of now are:
 # - rootfs-image-confidential
+# - rootfs-image-coco-addon
 # - rootfs-image-nvidia-gpu
 # - rootfs-image-nvidia-gpu-confidential
 #
@@ -50,6 +51,7 @@ esac
 root_hash_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
 verity_variants=(
 	"confidential:KERNELVERITYPARAMS"
+	"coco-addon:COCOVERITYPARAMS"
 	"nvidia-gpu:KERNELVERITYPARAMS_NV"
 	"nvidia-gpu-confidential:KERNELVERITYPARAMS_CONFIDENTIAL_NV"
 )

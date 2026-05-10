@@ -15,7 +15,7 @@
 [hypervisor.qemu]
 path = "@QEMUPATH@"
 kernel = "@KERNELPATH_COCO@"
-image = "@IMAGECONFIDENTIALPATH@"
+image = "@IMAGEPATH@"
 # initrd = "@INITRDPATH@"
 machine_type = "@MACHINETYPE@"
 tdx_quote_generation_service_socket_port = @QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT@
@@ -703,3 +703,7 @@ enable_pprof = false
 # (default: /run/kata-containers/dans)
 dan_conf = "@DEFDANCONF@"
 
+[[hypervisor.qemu.extra_images]]
+name = "coco"
+path = "@COCOIMAGEPATH@"
+verity_params = "@COCOVERITYPARAMS@"
