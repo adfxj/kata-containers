@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use super::cmdline_generator::{get_network_device, QemuCmdLine};
+use super::cmdline_generator::{get_network_device, QemuCmdLine, VirtioMemConfig};
 use super::qmp::Qmp;
 use crate::device::topology::PCIePort;
 use crate::qemu::qmp::get_qmp_socket_path;
@@ -291,6 +291,20 @@ impl QemuInner {
                 if let Some(subchannel) = cmdline.take_ccw_subchannel() {
                     qmp.set_ccw_subchannel(subchannel);
                 }
+                
+                // Setup virtio-mem device if enabled
+                if self.config.memory_info.enable_virtio_mem {
+                    let virtio_mem_config = VirtioMemConfig::new(
+                        self.config.memory_info.default_memory,
+                        self.config.memory_info.default_maxmemory,
+                        self.config.machine_info.machine_type.clone(),
+                        self.config.shared_fs.shared_fs.clone(),
+                        self.config.memory_info.file_mem_backend.clone(),
+                    );
+                    qmp.setup_virtio_mem(&virtio_mem_config)
+                        .context("Failed to setup virtio-mem during VM initialization")?;
+                }
+                
                 self.qmp = Some(qmp);
             }
             Err(e) => {
