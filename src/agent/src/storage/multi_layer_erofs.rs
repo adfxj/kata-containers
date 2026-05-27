@@ -17,7 +17,7 @@ use nix::sys::stat::{self, Mode, SFlag};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -40,6 +40,16 @@ use tokio::sync::Mutex;
 // dm-verity support imports
 use devicemapper::{DevId, DmFlags, DmName, DmOptions, DmUdevFlags, DM};
 use kata_types::mount::DmVerityInfo;
+
+/// Detect whether udevd is running in the guest.
+///
+/// Checks for the udevd control socket — its presence reliably indicates a
+/// running udevd. The result is cached for the process lifetime since udev
+/// availability does not change after boot.
+fn has_udev() -> bool {
+    static UDEV_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *UDEV_AVAILABLE.get_or_init(|| Path::new("/run/udev/control").exists())
+}
 
 /// EROFS Type
 const EROFS_TYPE: &str = "erofs";
@@ -90,6 +100,33 @@ fn dm_opts_readonly() -> DmOptions {
 /// Build DmOptions for deferred device removal in a no-udev environment.
 fn dm_opts_deferred_remove() -> DmOptions {
     no_udev_dm_options().set_flags(DmFlags::DM_DEFERRED_REMOVE)
+}
+
+/// DmOptions for device creation (read-only): udev-aware.
+fn dm_create_options() -> DmOptions {
+    if has_udev() {
+        DmOptions::default().set_flags(DmFlags::DM_READONLY)
+    } else {
+        dm_opts_readonly()
+    }
+}
+
+/// DmOptions for device suspend/resume: udev-aware.
+fn dm_suspend_options() -> DmOptions {
+    if has_udev() {
+        DmOptions::default()
+    } else {
+        no_udev_dm_options()
+    }
+}
+
+/// DmOptions for deferred device removal: udev-aware.
+fn dm_remove_options() -> DmOptions {
+    if has_udev() {
+        DmOptions::default().set_flags(DmFlags::DM_DEFERRED_REMOVE)
+    } else {
+        dm_opts_deferred_remove()
+    }
 }
 
 /// Create a block device node for a dm-verity device using mknod(2).
@@ -620,7 +657,7 @@ fn parse_dmverity_options(storage: &Storage) -> Result<DmVerityInfo> {
 
 /// Create dm-verity device for a partition and return the verity device path
 #[allow(dead_code)]
-fn create_partition_dmverity_device(
+async fn create_partition_dmverity_device(
     partition_path: &str,
     storage: &Storage,
     logger: &Logger,
@@ -638,6 +675,7 @@ fn create_partition_dmverity_device(
 
     // Create dm-verity device
     let verity_device_path = create_dmverity_device(&verity_info, Path::new(partition_path))
+        .await
         .context("failed to create dm-verity device")?;
 
     info!(
@@ -651,21 +689,24 @@ fn create_partition_dmverity_device(
 }
 
 /// Create a dm-verity device using devicemapper
-fn create_dmverity_device(verity_info: &DmVerityInfo, source_device_path: &Path) -> Result<String> {
+async fn create_dmverity_device(
+    verity_info: &DmVerityInfo,
+    source_device_path: &Path,
+) -> Result<String> {
     let dm = DM::new()?;
     let verity_name_string = build_dmverity_device_name(source_device_path, verity_info);
     let verity_name = DmName::new(&verity_name_string)?;
     let id = DevId::Name(verity_name);
 
-    let opts = no_udev_dm_options();
-    let ro_opts = dm_opts_readonly();
+    let opts = dm_suspend_options();
+    let ro_opts = dm_create_options();
 
     // Step 0: Remove stale device if it already exists
-    if dm.device_remove(&id, dm_opts_deferred_remove()).is_ok() {
+    if dm.device_remove(&id, dm_remove_options()).is_ok() {
         // Stale device removed; continue with creation.
     }
 
-    // Step 1: Create device as read-only with no-udev flags
+    // Step 1: Create device as read-only
     dm.device_create(verity_name, None, ro_opts)?;
 
     // Calculate hash start block.
@@ -733,16 +774,19 @@ fn create_dmverity_device(verity_info: &DmVerityInfo, source_device_path: &Path)
         "table_params" => &verity_params,
     );
 
-    // Step 2: Load table and resume (activate) with read-only + no-udev flags
+    // Step 2: Load table and resume (activate)
     dm.table_load(&id, verity_table.as_slice(), ro_opts)?;
     dm.device_suspend(&id, opts)?;
 
-    // Step 3: Get device info and create the device node via mknod.
-    // In a udev-less guest VM, /dev/block/M:N and /dev/mapper/<name> are
-    // never created by udev. We must create the node ourselves using the
-    // major:minor numbers returned by the device-mapper ioctl.
-    let device_info = dm.device_info(&id)?;
-    let dev_path = create_dm_dev_node(&verity_name_string, device_info.device())?;
+    // Step 3: Ensure the device node exists under /dev/mapper/.
+    let dev_path = if has_udev() {
+        // udev is running — it will create the node from the uevent. Wait for it.
+        wait_for_dm_dev_node(&verity_name_string).await?
+    } else {
+        // No udev — create the node ourselves via mknod(2).
+        let device_info = dm.device_info(&id)?;
+        create_dm_dev_node(&verity_name_string, device_info.device())?
+    };
 
     Ok(dev_path)
 }
@@ -752,7 +796,7 @@ fn destroy_dmverity_device(verity_device_name: &str) -> Result<()> {
     let dm = devicemapper::DM::new()?;
     let name = devicemapper::DmName::new(verity_device_name)?;
 
-    dm.device_remove(&devicemapper::DevId::Name(name), dm_opts_deferred_remove())
+    dm.device_remove(&devicemapper::DevId::Name(name), dm_remove_options())
         .context(format!("remove DmverityDevice {}", verity_device_name))?;
 
     Ok(())
@@ -774,8 +818,11 @@ fn destroy_partition_dmverity_device(verity_device_path: &str, logger: &Logger) 
         "device-name" => &device_name,
     );
 
-    // Remove the device node we created with mknod.
-    remove_dm_dev_node(verity_device_path);
+    // Only remove the device node manually if we created it via mknod.
+    // When udev is running, it handles node lifecycle automatically.
+    if !has_udev() {
+        remove_dm_dev_node(verity_device_path);
+    }
 
     Ok(())
 }
@@ -971,7 +1018,7 @@ async fn wait_and_mount_layer(
         })?;
 
         // Create dm-verity device
-        let verity_device = create_partition_dmverity_device(partition, layer, logger)?;
+        let verity_device = create_partition_dmverity_device(partition, layer, logger).await?;
         info!(
             logger,
             "Using dm-verity device for mount";
@@ -1141,6 +1188,35 @@ async fn wait_for_partition_device(device_path: &str, logger: &Logger) -> Result
     Err(anyhow!(
         "partition device {} did not appear within {} ms",
         device_path,
+        MAX_WAIT_MS
+    ))
+}
+
+/// Wait for udev to create a device-mapper node under /dev/mapper/.
+///
+/// After a DM ioctl creates a device, udevd receives the uevent and creates
+/// the node asynchronously. Poll until it appears or time out.
+async fn wait_for_dm_dev_node(name: &str) -> Result<String> {
+    let dev_path = format!("/dev/mapper/{}", name);
+    let path = Path::new(&dev_path);
+
+    if path.exists() {
+        return Ok(dev_path);
+    }
+
+    const MAX_WAIT_MS: u64 = 2000;
+    const POLL_INTERVAL_MS: u64 = 50;
+
+    for _attempt in 0..(MAX_WAIT_MS / POLL_INTERVAL_MS) {
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        if path.exists() {
+            return Ok(dev_path);
+        }
+    }
+
+    Err(anyhow!(
+        "udev did not create dm device node {} within {} ms",
+        dev_path,
         MAX_WAIT_MS
     ))
 }
