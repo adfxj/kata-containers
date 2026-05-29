@@ -561,7 +561,24 @@ impl VirtSandbox {
         hypervisor_config: &HypervisorConfig,
         init_data: Option<String>,
     ) -> Result<Option<ProtectionDeviceConfig>> {
-        let available_protection = available_guest_protection()?;
+        let available_protection = match available_guest_protection() {
+            Ok(p) => p,
+            // A detection failure must not stop a non-confidential guest from
+            // booting (e.g. a host that advertises SEV but cannot use it);
+            // fall back to running without protection.
+            Err(e) if !hypervisor_config.security_info.confidential_guest => {
+                info!(
+                    sl!(),
+                    "guest protection detection failed ({}); confidential_guest \
+                     is not set, skipping protection device config",
+                    e
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(anyhow!("failed to check guest protection: {}", e));
+            }
+        };
         // We need to cover the following case:
         // - Required to run Kata containers in TEE environment
         // E.g., available_guest_protection() returns Se, but confidential_guest is not set.
