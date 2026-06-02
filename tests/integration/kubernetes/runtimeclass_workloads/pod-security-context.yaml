@@ -11,6 +11,7 @@ spec:
   runtimeClassName: kata
   securityContext:
     runAsUser: 1000
+    runAsGroup: 0
   containers:
   - name: sec-text
     image: quay.io/kata-containers/sysbench-kata:latest

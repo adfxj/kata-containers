@@ -17,6 +17,10 @@ spec:
         jobgroup: jobtest
     spec:
       runtimeClassName: kata
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        supplementalGroups: [10]
       containers:
       - name: test
         image: quay.io/prometheus/busybox:latest

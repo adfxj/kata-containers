@@ -10,6 +10,10 @@ metadata:
   name: pod-termination-log-fail
 spec:
   runtimeClassName: kata
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
   restartPolicy: Never
   containers:
     - name: termination-log-test

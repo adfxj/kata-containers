@@ -9,6 +9,10 @@ metadata:
   name: test-shared-volume
 spec:
   runtimeClassName: kata
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
   restartPolicy: Never
   volumes:
   - name: shared-data

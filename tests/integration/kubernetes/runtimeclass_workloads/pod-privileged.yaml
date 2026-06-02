@@ -10,6 +10,10 @@ metadata:
   name: privileged
 spec:
   runtimeClassName: kata
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
   restartPolicy: Never
   containers:
   - image: quay.io/prometheus/busybox:latest
