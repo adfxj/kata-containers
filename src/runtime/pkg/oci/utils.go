@@ -201,6 +201,11 @@ type RuntimeConfig struct {
 	// KubeletRootDir is the kubelet root directory used to match ConfigMap/Secret
 	// volume paths (e.g. /var/lib/k0s/kubelet for k0s). If empty, default is used.
 	KubeletRootDir string
+
+	// Vsock port that the following below unix domain socket will be exposed on. 
+	VsockUDSForwardPort uint32
+	// Unix domain socket that will be proxied to the above vsock port.
+	VsockUDSForwardUDS  string
 }
 
 // AddKernelParam allows the addition of new kernel parameters to an existing
