@@ -600,6 +600,16 @@ dial_timeout = @DEFAULTTIMEOUT_NV@
 # (agent default when unset: 6)
 launch_process_timeout = @DEFAULTLAUNCHPROCESSTIMEOUT_NV@
 
+# If enabled, the agent translates a container's KATA_VISIBLE_DEVICES
+# environment variable into CDI GPU device requests (nvidia.com/gpu), resolved
+# against the GPUs present in the VM via the CDI spec generated in the guest at
+# /var/run/cdi/nvidia.yaml. For example, KATA_VISIBLE_DEVICES=all makes every
+# GPU in the VM visible to the container, while KATA_VISIBLE_DEVICES=0,1
+# selects individual GPUs by index. This is intentionally a distinct variable
+# from NVIDIA_VISIBLE_DEVICES and does not promise identical semantics.
+# (default: false)
+kata_visible_devices = false
+
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
 # system log
