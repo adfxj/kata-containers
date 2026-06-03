@@ -457,9 +457,7 @@ pub struct ClusterConfig {
     /// Pause container image reference.
     pub pause_container_image: String,
 
-    /// Whether or not the cluster uses the guest pull mechanism
-    /// In guest pull, host can't look into layers to determine GID.
-    /// See issue https://github.com/kata-containers/kata-containers/issues/11162
+    /// Whether or not the cluster uses the guest pull mechanism.
     pub guest_pull: bool,
 
     /// Supported values:
@@ -854,6 +852,89 @@ impl AgentPolicy {
         }
     }
 
+    fn fail_if_guest_pull_needs_security_context(
+        &self,
+        resource: &dyn yaml::K8sResource,
+        yaml_container: &pod::Container,
+        is_pause_container: bool,
+        process: &KataProcess,
+    ) {
+        if is_pause_container || !self.config.settings.cluster_config.guest_pull {
+            return;
+        }
+
+        let pod_security_context = resource.get_pod_security_context();
+        let uid = i64::from(process.User.UID);
+        let gid = i64::from(process.User.GID);
+
+        let explicit_uid = yaml_container.run_as_user() == Some(uid)
+            || pod_security_context.and_then(|context| context.runAsUser) == Some(uid);
+
+        let explicit_gid = yaml_container.run_as_group() == Some(gid)
+            || pod_security_context.and_then(|context| context.runAsGroup) == Some(gid);
+
+        let mut explicitly_added_gids = BTreeSet::new();
+        if let Some(context) = pod_security_context {
+            if let Some(fs_group) = context.fsGroup {
+                explicitly_added_gids.insert(u32::try_from(fs_group).unwrap());
+            }
+            if let Some(supplemental_groups) = &context.supplementalGroups {
+                explicitly_added_gids.extend(supplemental_groups.iter().copied());
+            }
+        }
+
+        let recommended_supplemental_groups: Vec<u32> = process
+            .User
+            .AdditionalGids
+            .iter()
+            .copied()
+            .filter(|additional_gid| *additional_gid != process.User.GID)
+            .collect();
+
+        // No failure for default root identity.
+        if process.User.UID == 0
+            && process.User.GID == 0
+            && recommended_supplemental_groups.is_empty()
+        {
+            return;
+        }
+
+        let explicit_supplemental_groups = recommended_supplemental_groups
+            .iter()
+            .all(|gid| explicitly_added_gids.contains(gid));
+
+        if explicit_uid && explicit_gid && explicit_supplemental_groups {
+            return;
+        }
+
+        let mut recommendation = format!(
+            "securityContext:\n  runAsUser: {}\n  runAsGroup: {}",
+            process.User.UID, process.User.GID
+        );
+        if !recommended_supplemental_groups.is_empty() {
+            let supplemental_groups = recommended_supplemental_groups
+                .iter()
+                .map(|gid| gid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            recommendation.push_str(&format!("\n  supplementalGroups: [{supplemental_groups}]"));
+        }
+
+        panic!(
+            "guest_pull is enabled for container '{}' using image '{}'. \
+             The generated policy expects UID={}, GID={}, AdditionalGids={:?}; \
+             containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. \
+             Set an explicit Kubernetes securityContext, for example:\n{}\n\
+             See docs/Limitations.md#guest-pulled-container-images.",
+            yaml_container.name,
+            yaml_container.image,
+            process.User.UID,
+            process.User.GID,
+            process.User.AdditionalGids,
+            recommendation
+        );
+    }
+
     fn get_container_process(
         &self,
         resource: &dyn yaml::K8sResource,
@@ -1023,6 +1104,12 @@ impl AgentPolicy {
         debug!(
             "get_container_process: returning: User = {:?}",
             &process.User
+        );
+        self.fail_if_guest_pull_needs_security_context(
+            resource,
+            yaml_container,
+            is_pause_container,
+            &process,
         );
         process
     }
