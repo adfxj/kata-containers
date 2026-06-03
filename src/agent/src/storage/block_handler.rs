@@ -16,7 +16,7 @@ use kata_types::device::DRIVER_BLK_CCW_TYPE;
 use kata_types::device::{
     DRIVER_BLK_MMIO_TYPE, DRIVER_BLK_PCI_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_SCSI_TYPE,
 };
-use kata_types::mount::StorageDevice;
+use kata_types::mount::{StorageDevice, KATA_BLOCK_VOLUME_FS_TYPE};
 use nix::sys::stat::{major, minor};
 use protocols::agent::Storage;
 use tracing::instrument;
@@ -37,6 +37,9 @@ use slog::Logger;
 #[cfg(target_arch = "s390x")]
 use std::str::FromStr;
 
+const EPHEMERAL_ENCRYPTION_DRIVER_OPTION: &str = "encryption_key=ephemeral";
+const MKFS_EXT4: &str = "mkfs.ext4";
+
 fn get_device_number(dev_path: &str, metadata: Option<&fs::Metadata>) -> Result<String> {
     let dev_id = match metadata {
         Some(m) => m.rdev(),
@@ -56,7 +59,8 @@ async fn handle_block_storage(
 ) -> Result<Arc<dyn StorageDevice>> {
     let has_ephemeral_encryption = storage
         .driver_options
-        .contains(&"encryption_key=ephemeral".to_string());
+        .iter()
+        .any(|opt| opt == EPHEMERAL_ENCRYPTION_DRIVER_OPTION);
 
     if has_ephemeral_encryption {
         crate::rpc::cdh_secure_mount(
@@ -70,9 +74,77 @@ async fn handle_block_storage(
         set_ownership(logger, storage)?;
         new_device(storage.mount_point.clone())
     } else {
+        if let Some(fstype) = requested_block_filesystem_type(storage) {
+            ensure_block_filesystem(logger, storage, fstype).await?;
+        }
         let path = common_storage_handler(logger, storage)?;
         new_device(path)
     }
+}
+
+fn requested_block_filesystem_type(storage: &Storage) -> Option<&str> {
+    storage.driver_options.iter().find_map(|opt| {
+        opt.split_once('=')
+            .and_then(|(key, value)| (key == KATA_BLOCK_VOLUME_FS_TYPE).then_some(value))
+    })
+}
+
+async fn ensure_block_filesystem(logger: &Logger, storage: &Storage, fstype: &str) -> Result<()> {
+    if fstype != storage.fstype {
+        return Err(anyhow!(
+            "requested block filesystem {} does not match storage fstype {}",
+            fstype,
+            storage.fstype
+        ));
+    }
+
+    match fstype {
+        "ext4" => ensure_ext4_filesystem(logger, &storage.source).await,
+        _ => Err(anyhow!(
+            "creating filesystem {} for block storage is unsupported",
+            fstype
+        )),
+    }
+}
+
+async fn ensure_ext4_filesystem(logger: &Logger, source: &str) -> Result<()> {
+    // This option is emitted for block emptyDir volumes, whose backing device
+    // is ephemeral and freshly allocated for the pod.
+    info!(logger, "creating ext4 filesystem"; "source" => source);
+    let output = {
+        // Keep the agent SIGCHLD handler from reaping this child before
+        // tokio::process observes it.
+        let _locker = rustjail::container::WAIT_PID_LOCKER.lock().await;
+        tokio::process::Command::new(MKFS_EXT4)
+            .args([
+                "-F",
+                "-O",
+                "^has_journal",
+                "-m",
+                "0",
+                "-i",
+                "163840",
+                "-I",
+                "128",
+                source,
+            ])
+            .output()
+            .await
+            .with_context(|| format!("run {MKFS_EXT4} for {source}"))?
+    };
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "{} failed for {}: status={}, stdout={}, stderr={}",
+        MKFS_EXT4,
+        source,
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 #[derive(Debug)]
@@ -96,8 +168,8 @@ impl StorageHandler for VirtioBlkMmioHandler {
                 .await
                 .context("failed to get mmio device name")?;
         }
-        let path = common_storage_handler(ctx.logger, &storage)?;
-        new_device(path)
+        let dev_num = get_device_number(&storage.source, None)?;
+        handle_block_storage(ctx.logger, &storage, &dev_num).await
     }
 }
 
