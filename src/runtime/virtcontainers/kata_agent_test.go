@@ -338,6 +338,25 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 				},
 			},
 		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				BlockDeviceFsType: "ext4",
+				Options:           []string{blockVolumeDiscardOption},
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver:        kataBlkDevType,
+				Source:        testPCIPath.String(),
+				DriverOptions: []string{volume.BlockVolumeFsTypeDriverKey + "=ext4"},
+				Options:       []string{blockVolumeDiscardOption},
+			},
+		},
 	}
 
 	for _, test := range tests {
