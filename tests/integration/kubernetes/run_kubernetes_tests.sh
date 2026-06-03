@@ -74,6 +74,7 @@ else
 		"k8s-cron-job.bats" \
 		"k8s-custom-dns.bats" \
 		"k8s-empty-dirs.bats" \
+		"k8s-plain-ephemeral-data-storage.bats" \
 		"k8s-env.bats" \
 		"k8s-exec.bats" \
 		"k8s-file-volume.bats" \
