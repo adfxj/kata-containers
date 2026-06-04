@@ -13,11 +13,14 @@
 //! - Supports X-kata.mkdir.path options to create directories in upper layer before overlay mount
 //! - Supports GPT-partitioned disks with dm-verity integrity verification for each partition
 
+#[cfg(feature = "devicemapper")]
 use nix::sys::stat::{self, Mode, SFlag};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "devicemapper")]
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -38,7 +41,9 @@ use slog::Logger;
 use tokio::sync::Mutex;
 
 // dm-verity support imports
+#[cfg(feature = "devicemapper")]
 use devicemapper::{DevId, DmFlags, DmName, DmOptions, DmUdevFlags, DM};
+#[cfg(feature = "devicemapper")]
 use kata_types::mount::DmVerityInfo;
 
 /// EROFS Type
@@ -62,13 +67,21 @@ const OPT_PARTITION_NUMBER: &str = "X-kata.partition-number=";
 /// dm-verity related storage options
 #[allow(dead_code)]
 const OPT_DMVERITY_ENABLED: &str = "X-kata.dmverity-enabled=true";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_ROOT_HASH: &str = "X-kata.dmverity.roothash=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_HASH_OFFSET: &str = "X-kata.dmverity.hashoffset=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_BLOCK_SIZE: &str = "X-kata.dmverity.blocksize=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_HASH_SIZE: &str = "X-kata.dmverity.hashsize=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_HASH_ALGORITHM: &str = "X-kata.dmverity.algorithm=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_SALT: &str = "X-kata.dmverity.salt=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_HASH_TYPE: &str = "X-kata.dmverity.hashtype=";
+#[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_NO_SUPERBLOCK: &str = "X-kata.dmverity.no-superblock=";
 
 /// Path to check for udev control socket to detect if udevd is running in the guest.
@@ -77,12 +90,14 @@ const DM_UDEV_CONTROL: &str = "/run/udev/control";
 const DEVICE_MAPPER: &str = "/dev/mapper/";
 
 /// Detect whether udevd is running in the guest.
+#[cfg(feature = "devicemapper")]
 fn has_udev() -> bool {
     static UDEV_AVAILABLE: OnceLock<bool> = OnceLock::new();
     *UDEV_AVAILABLE.get_or_init(|| Path::new(DM_UDEV_CONTROL).exists())
 }
 
 /// Build DmOptions that fully disable udev synchronization.
+#[cfg(feature = "devicemapper")]
 fn no_udev_dm_options() -> DmOptions {
     DmOptions::default().set_udev_flags(
         DmUdevFlags::DM_UDEV_DISABLE_LIBRARY_FALLBACK
@@ -94,16 +109,19 @@ fn no_udev_dm_options() -> DmOptions {
 }
 
 /// Build DmOptions for read-only device removal in a no-udev environment.
+#[cfg(feature = "devicemapper")]
 fn dm_opts_readonly() -> DmOptions {
     no_udev_dm_options().set_flags(DmFlags::DM_READONLY)
 }
 
 /// Build DmOptions for deferred device removal in a no-udev environment.
+#[cfg(feature = "devicemapper")]
 fn dm_opts_deferred_remove() -> DmOptions {
     no_udev_dm_options().set_flags(DmFlags::DM_DEFERRED_REMOVE)
 }
 
 /// DmOptions for device creation (read-only): udev-aware.
+#[cfg(feature = "devicemapper")]
 fn dm_create_options() -> DmOptions {
     if has_udev() {
         DmOptions::default().set_flags(DmFlags::DM_READONLY)
@@ -113,6 +131,7 @@ fn dm_create_options() -> DmOptions {
 }
 
 /// DmOptions for device suspend/resume: udev-aware.
+#[cfg(feature = "devicemapper")]
 fn dm_suspend_options() -> DmOptions {
     if has_udev() {
         DmOptions::default()
@@ -122,6 +141,7 @@ fn dm_suspend_options() -> DmOptions {
 }
 
 /// DmOptions for deferred device removal: udev-aware.
+#[cfg(feature = "devicemapper")]
 fn dm_remove_options() -> DmOptions {
     if has_udev() {
         DmOptions::default().set_flags(DmFlags::DM_DEFERRED_REMOVE)
@@ -131,6 +151,7 @@ fn dm_remove_options() -> DmOptions {
 }
 
 /// Create a block device node for a dm-verity device using mknod(2).
+#[cfg(feature = "devicemapper")]
 fn create_dm_dev_node(name: &str, dev: devicemapper::Device) -> Result<String> {
     // Ensure /dev/mapper exists.
     let mapper_dir = Path::new(DEVICE_MAPPER);
@@ -160,6 +181,7 @@ fn create_dm_dev_node(name: &str, dev: devicemapper::Device) -> Result<String> {
 }
 
 /// Remove a device node that was created by create_dm_dev_node.
+#[cfg(feature = "devicemapper")]
 fn remove_dm_dev_node(dev_path: &str) {
     if dev_path.starts_with(DEVICE_MAPPER) && Path::new(dev_path).exists() {
         if let Err(e) = std::fs::remove_file(dev_path) {
@@ -174,6 +196,7 @@ fn remove_dm_dev_node(dev_path: &str) {
 }
 
 /// Generate a unique dm-verity device name based on the source device path and verity hash.
+#[cfg(feature = "devicemapper")]
 fn build_dmverity_device_name(source_device_path: &Path, verity_info: &DmVerityInfo) -> String {
     let source_short = source_device_path
         .file_name()
@@ -577,6 +600,7 @@ fn is_dmverity_enabled(storage: &Storage) -> bool {
 }
 
 /// Parse dm-verity configuration from storage options
+#[cfg(feature = "devicemapper")]
 fn parse_dmverity_options(storage: &Storage) -> Result<DmVerityInfo> {
     let mut hashtype = String::from("sha256");
     let mut hash = String::new();
@@ -657,7 +681,7 @@ fn parse_dmverity_options(storage: &Storage) -> Result<DmVerityInfo> {
 }
 
 /// Create dm-verity device for a partition and return the verity device path
-#[allow(dead_code)]
+#[cfg(feature = "devicemapper")]
 async fn create_partition_dmverity_device(
     partition_path: &str,
     storage: &Storage,
@@ -690,6 +714,7 @@ async fn create_partition_dmverity_device(
 }
 
 /// Create a dm-verity device using devicemapper
+#[cfg(feature = "devicemapper")]
 async fn create_dmverity_device(
     verity_info: &DmVerityInfo,
     source_device_path: &Path,
@@ -798,6 +823,7 @@ async fn create_dmverity_device(
 }
 
 /// Destroy a dm-verity device
+#[cfg(feature = "devicemapper")]
 fn destroy_dmverity_device(verity_device_name: &str) -> Result<()> {
     let dm = devicemapper::DM::new()?;
     let name = devicemapper::DmName::new(verity_device_name)?;
@@ -809,6 +835,7 @@ fn destroy_dmverity_device(verity_device_name: &str) -> Result<()> {
 }
 
 /// Destroy dm-verity device by path
+#[cfg(feature = "devicemapper")]
 fn destroy_partition_dmverity_device(verity_device_path: &str, logger: &Logger) -> Result<()> {
     // The verity device path is /dev/mapper/<name> (as created by create_dm_dev_node).
     // Extract the DM device name for removal. Also remove the mknod-created device node.
@@ -834,6 +861,7 @@ fn destroy_partition_dmverity_device(verity_device_path: &str, logger: &Logger) 
 }
 
 /// Cleanup all dm-verity devices for a multi-layer EROFS mount
+#[cfg(feature = "devicemapper")]
 pub fn cleanup_dmverity_devices(verity_devices: &[String], logger: &Logger) {
     info!(
         logger,
@@ -1202,6 +1230,7 @@ async fn wait_for_partition_device(device_path: &str, logger: &Logger) -> Result
 ///
 /// After a DM ioctl creates a device, udevd receives the uevent and creates
 /// the node asynchronously. Poll until it appears or time out.
+#[cfg(feature = "devicemapper")]
 async fn wait_for_dm_dev_node(name: &str) -> Result<String> {
     let dev_path = format!("{}{}", DEVICE_MAPPER, name);
     let path = Path::new(&dev_path);
@@ -1225,6 +1254,27 @@ async fn wait_for_dm_dev_node(name: &str) -> Result<String> {
         dev_path,
         MAX_WAIT_MS
     ))
+}
+
+#[cfg(not(feature = "devicemapper"))]
+async fn create_partition_dmverity_device(
+    _partition_path: &str,
+    _storage: &Storage,
+    _logger: &Logger,
+) -> Result<String> {
+    Err(anyhow!(
+        "dm-verity support not compiled in: build with `--features devicemapper` to enable",
+    ))
+}
+
+#[cfg(not(feature = "devicemapper"))]
+pub fn cleanup_dmverity_devices(verity_devices: &[String], logger: &Logger) {
+    if !verity_devices.is_empty() {
+        warn!(
+            logger,
+            "It's called in a build without the `devicemapper` feature; ignoring"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1419,6 +1469,7 @@ mod tests {
 
     // --- parse_dmverity_options ---
 
+    #[cfg(feature = "devicemapper")]
     #[test]
     fn test_parse_dmverity_options_required_fields_and_blocknum() {
         // Test required fields and blocknum calculation.

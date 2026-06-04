@@ -60,7 +60,7 @@ tracing-subscriber.workspace = true
 # TODO: bump tracing-opentelemetry to sync with version in workspace
 tracing-opentelemetry = "0.17.0"
 opentelemetry.workspace = true
-devicemapper.workspace = true
+devicemapper = { workspace = true, optional = true }
 
 # Configuration
 serde.workspace = true
@@ -107,3 +107,4 @@ lto = true
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]
 init-data = []
+devicemapper = ["dep:devicemapper"]
