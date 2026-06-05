@@ -23,7 +23,7 @@ spec:
           sleep 1;
         done;
       resources:
-        requests:
+        limits:
           memory: "32Mi"
       env:
         - name: MY_POD_NAME
