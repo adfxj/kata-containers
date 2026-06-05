@@ -97,11 +97,10 @@ readonly -a systemd_units=(
 	"systemd-random-seed"
 	"systemd-timesyncd"
 	"systemd-tmpfiles-setup"
-	# udevd and udev-trigger are temporarily disabled due to issues in some distros (e.g. debian) caused by missing dependencies. We can re-enable them once we have a better understanding of the root cause of these issues.
-	"systemd-udevd"
-	"systemd-udevd-control"
-	"systemd-udevd-kernel"
-	"systemd-udev-trigger"
+	# Note: udevd and udev-trigger units are intentionally NOT listed here
+	# because they must remain active for device management (e.g., dm-verity
+	# device node creation). They are explicitly enabled under
+	# kata-containers.target.wants in setup_rootfs().
 	"systemd-update-utmp"
 )
 
@@ -792,9 +791,15 @@ EOF
 		ln -sf "/usr/lib/systemd/system/kata-containers.target" "${ROOTFS_DIR}/etc/systemd/system/basic.target.wants/kata-containers.target"
 		mkdir -p "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants"
 		ln -sf "/usr/lib/systemd/system/dbus.socket" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/dbus.socket"
-		# Temporarily disable udevd and udev-trigger services, as they are not needed for the agent and they cause some issues in some distros (e.g. debian) due to missing dependencies. We can re-enable them once we have a better understanding of the root cause of these issues.
-		# ln -sf "/usr/lib/systemd/system/systemd-udevd.service" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udevd.service"
-		# ln -sf "/usr/lib/systemd/system/systemd-udev-trigger.service" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udev-trigger.service"
+		# Enable udevd and udev-trigger services so that device manager
+		# events are properly handled inside the guest VM. This is required
+		# for dm-verity device node creation and other device management tasks.
+		ln -sf "/usr/lib/systemd/system/systemd-udevd.service" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udevd.service"
+		ln -sf "/usr/lib/systemd/system/systemd-udev-trigger.service" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udev-trigger.service"
+		# udevd requires its socket units for activation; enable them
+		# under kata-containers.target so they are started before udevd.
+		ln -sf "/usr/lib/systemd/system/systemd-udevd-control.socket" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udevd-control.socket"
+		ln -sf "/usr/lib/systemd/system/systemd-udevd-kernel.socket" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udevd-kernel.socket"
 		chmod g+rx,o+x "${ROOTFS_DIR}"
 
 		if [[ "${CONFIDENTIAL_GUEST}" == "yes" ]]; then

@@ -8,6 +8,8 @@ OS_NAME=centos
 OS_VERSION=${OS_VERSION:-stream9}
 PACKAGES="chrony iptables"
 # shellcheck disable=SC2154
+# Note: on CentOS/RHEL 9, systemd-udevd is part of the 'systemd' package,
+# so installing 'systemd' is sufficient for udev support.
 [[ "${AGENT_INIT}" = no ]] && PACKAGES+=" systemd"
 # shellcheck disable=SC2154
 [[ "${SECCOMP}" = yes ]] && PACKAGES+=" libseccomp"

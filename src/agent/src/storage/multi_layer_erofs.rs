@@ -51,10 +51,28 @@ use kata_types::mount::DmVerityInfo;
 /// Checks for the udevd control socket — its presence reliably indicates a
 /// running udevd. The result is cached for the process lifetime since udev
 /// availability does not change after boot.
+///
+/// On the first probe, if the socket is not yet present, a brief polling
+/// loop (up to 2 seconds) allows time for udevd to finish starting.
+/// This guards against a race where the first dm-verity call arrives
+/// before systemd has fully brought up udevd.
 #[cfg(feature = "devicemapper")]
 fn has_udev() -> bool {
     static UDEV_AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *UDEV_AVAILABLE.get_or_init(|| Path::new("/run/udev/control").exists())
+    *UDEV_AVAILABLE.get_or_init(|| {
+        let control = Path::new("/run/udev/control");
+        if control.exists() {
+            return true;
+        }
+        // udevd may still be starting; poll briefly before giving up.
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            if control.exists() {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// EROFS Type
