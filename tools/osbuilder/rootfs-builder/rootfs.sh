@@ -97,6 +97,7 @@ readonly -a systemd_units=(
 	"systemd-random-seed"
 	"systemd-timesyncd"
 	"systemd-tmpfiles-setup"
+	# udevd and udev-trigger are temporarily disabled due to issues in some distros (e.g. debian) caused by missing dependencies. We can re-enable them once we have a better understanding of the root cause of these issues.
 	"systemd-udevd"
 	"systemd-udevd-control"
 	"systemd-udevd-kernel"
@@ -791,6 +792,9 @@ EOF
 		ln -sf "/usr/lib/systemd/system/kata-containers.target" "${ROOTFS_DIR}/etc/systemd/system/basic.target.wants/kata-containers.target"
 		mkdir -p "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants"
 		ln -sf "/usr/lib/systemd/system/dbus.socket" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/dbus.socket"
+		# Temporarily disable udevd and udev-trigger services, as they are not needed for the agent and they cause some issues in some distros (e.g. debian) due to missing dependencies. We can re-enable them once we have a better understanding of the root cause of these issues.
+		# ln -sf "/usr/lib/systemd/system/systemd-udevd.service" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udevd.service"
+		# ln -sf "/usr/lib/systemd/system/systemd-udev-trigger.service" "${ROOTFS_DIR}/etc/systemd/system/kata-containers.target.wants/systemd-udev-trigger.service"
 		chmod g+rx,o+x "${ROOTFS_DIR}"
 
 		if [[ "${CONFIDENTIAL_GUEST}" == "yes" ]]; then

@@ -108,10 +108,10 @@ debug: false
 #
 # The startup probe uses /readyz so it only passes once install completes. While
 # the startup probe is active the liveness probe is suppressed, giving install up
-# to failureThreshold * periodSeconds (default 20 min) before the kubelet kills
+# to failureThreshold * periodSeconds (default 15 min) before the kubelet kills
 # the container. Without a startup probe the liveness probe would fire immediately.
 #
-# The 20-min budget covers slow GitHub-hosted free runners — single-node kubeadm
+# The 15-min budget covers slow GitHub-hosted free runners — single-node kubeadm
 # clusters on small Azure VMs, where artifact extraction and `systemctl restart
 # containerd` (which restarts the apiserver static pod with it) can push install
 # past the 15-min mark (seen on dragonball + lts containerd matrix jobs). On
@@ -126,7 +126,7 @@ health:
     enabled: true
     initialDelaySeconds: 1
     periodSeconds: 10
-    failureThreshold: 60
+    failureThreshold: 90
     timeoutSeconds: 3
   livenessProbe:
     enabled: true
@@ -141,6 +141,10 @@ health:
 
 snapshotter:
   setup: ["nydus"]  # ["nydus", "erofs"] or []
+  # EROFS snapshotter mode. When set to "integrity", dm-verity is enabled
+  # and fsverity/immutable are disabled for erofs layers.
+  # Valid values: "" (default) or "integrity".
+  erofsSnapshotterMode: ""
 
 # Shim configuration
 # By default (disableAll: false), all shims with enabled: ~ (null) are enabled.

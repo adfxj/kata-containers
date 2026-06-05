@@ -76,7 +76,7 @@ const OPT_MKDIR_PATH: &str = "X-kata.mkdir.path=";
 const OPT_PARTITION_NUMBER: &str = "X-kata.partition-number=";
 
 /// dm-verity related storage options
-#[cfg(feature = "devicemapper")]
+#[allow(dead_code)]
 const OPT_DMVERITY_ENABLED: &str = "X-kata.dmverity-enabled=true";
 #[cfg(feature = "devicemapper")]
 const OPT_DMVERITY_ROOT_HASH: &str = "X-kata.dmverity.roothash=";
