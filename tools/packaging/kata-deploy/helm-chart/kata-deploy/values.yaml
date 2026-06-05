@@ -141,6 +141,10 @@ health:
 
 snapshotter:
   setup: ["nydus"]  # ["nydus", "erofs"] or []
+  # EROFS snapshotter mode. When set to "integrity", dm-verity is enabled
+  # and fsverity/immutable are disabled for erofs layers.
+  # Valid values: "" (default) or "integrity".
+  erofsSnapshotterMode: ""
 
 # Shim configuration
 # By default (disableAll: false), all shims with enabled: ~ (null) are enabled.

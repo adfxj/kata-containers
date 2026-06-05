@@ -85,8 +85,9 @@ const OPT_DMVERITY_HASH_TYPE: &str = "X-kata.dmverity.hashtype=";
 const OPT_DMVERITY_NO_SUPERBLOCK: &str = "X-kata.dmverity.no-superblock=";
 
 /// Path to check for udev control socket to detect if udevd is running in the guest.
+#[cfg(feature = "devicemapper")]
 const DM_UDEV_CONTROL: &str = "/run/udev/control";
-
+#[cfg(feature = "devicemapper")]
 const DEVICE_MAPPER: &str = "/dev/mapper/";
 
 /// Detect whether udevd is running in the guest.
