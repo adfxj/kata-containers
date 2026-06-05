@@ -17,6 +17,4 @@ spec:
         - "infinity"
     resources:
       limits:
-        cpu: "1"
-      requests:
         cpu: "500m"

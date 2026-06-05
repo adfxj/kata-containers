@@ -23,6 +23,9 @@ setup_yaml() {
 
 
 @test "Exceeding memory constraints" {
+	# pod-memory-limit.yaml has a fixed 500Mi request. Rendering a lower
+	# limit makes the pod invalid, so the Kubernetes API rejects it before
+	# the stress workload can start.
 	memory_limit_size="50Mi"
 	allocated_size="250M"
 
@@ -41,7 +44,9 @@ setup_yaml() {
 }
 
 @test "Running within memory constraints" {
-	memory_limit_size="600Mi"
+	# Render a limit that matches the fixed 500Mi request. Kubernetes accepts
+	# the pod, and the workload allocates less than the aligned request/limit.
+	memory_limit_size="500Mi"
 	allocated_size="150M"
 
 	# Create test .yaml
