@@ -302,6 +302,10 @@ spec:
         - name: CONTAINERD_USER_DROP_IN_SOURCE_FILE
           value: "/custom-containerd-config/containerd-user-dropin.toml"
 {{- end }}
+{{- with .Values.snapshotter.erofsSnapshotterMode }}
+        - name: EROFS_SNAPSHOTTER_MODE
+          value: {{ . | quote }}
+{{- end }}
 {{- with .Values.env.hostOS }}
         - name: HOST_OS
           value: {{ . | quote }}
@@ -312,7 +316,7 @@ spec:
 {{- end }}
 {{- $healthDefaults := dict
     "port" 8090
-    "startupProbe" (dict "enabled" true "initialDelaySeconds" 1 "periodSeconds" 10 "failureThreshold" 60 "timeoutSeconds" 3)
+    "startupProbe" (dict "enabled" true "initialDelaySeconds" 1 "periodSeconds" 10 "failureThreshold" 90 "timeoutSeconds" 3)
     "livenessProbe" (dict "enabled" true "periodSeconds" 30 "failureThreshold" 3 "timeoutSeconds" 3)
     "readinessProbe" (dict "enabled" true "periodSeconds" 10 "failureThreshold" 3 "timeoutSeconds" 3)
 }}
