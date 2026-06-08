@@ -734,6 +734,10 @@ function helm_helper() {
 	fi
 	yq -i ".image.tag = \"${HELM_IMAGE_TAG}\"" "${values_yaml}"
 
+	local dispatcher_reference="${HELM_IMAGE_REFERENCE%-ci}-job-dispatcher-ci"
+	yq -i ".job.dispatcherImage.reference = \"${dispatcher_reference}\"" "${values_yaml}"
+	yq -i ".job.dispatcherImage.tag = \"${HELM_IMAGE_TAG}\"" "${values_yaml}"
+
 	[[ -n "${HELM_K8S_DISTRIBUTION}" ]] && yq -i ".k8sDistribution = \"${HELM_K8S_DISTRIBUTION}\"" "${values_yaml}"
 
 	if [[ "${HELM_DEFAULT_INSTALLATION}" = "false" ]]; then
