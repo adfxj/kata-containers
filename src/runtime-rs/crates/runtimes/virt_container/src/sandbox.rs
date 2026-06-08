@@ -59,7 +59,7 @@ use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
-use kata_types::config::{hypervisor::Factory, TomlConfig};
+use kata_types::config::{hypervisor::Factory, parse_vsock_uds_forward, TomlConfig};
 use kata_types::initdata::{calculate_initdata_digest, ProtectedPlatform};
 use oci_spec::runtime as oci;
 use persist::{self, sandbox_persist::Persist};
@@ -74,6 +74,8 @@ use resource::network::{dan_config_path, DanNetworkConfig, NetworkConfig, Networ
 use resource::{ResourceConfig, ResourceManager};
 use runtime_spec as spec;
 use std::path::{Path, PathBuf};
+
+use crate::vsock_uds_forward::{guest_cid_from_agent_url, VsockUdsForward};
 use std::sync::Arc;
 use std::time::SystemTime;
 use strum::Display;
@@ -108,6 +110,7 @@ struct SandboxInner {
     state: SandboxState,
     exit_info: Option<SandboxExitInfo>,
     created_at: Option<SystemTime>,
+    vsock_uds_forward: Option<VsockUdsForward>,
 }
 
 impl SandboxInner {
@@ -116,6 +119,7 @@ impl SandboxInner {
             state: SandboxState::Init,
             exit_info: None,
             created_at: None,
+            vsock_uds_forward: None,
         }
     }
 }
@@ -733,6 +737,46 @@ impl VirtSandbox {
             network_created: false,
         })
     }
+
+    async fn stop_vsock_uds_forward(&self) {
+        let forwarder = self.inner.write().await.vsock_uds_forward.take();
+        if let Some(forwarder) = forwarder {
+            forwarder.stop().await;
+        }
+    }
+
+    async fn build_vsock_uds_forward(&self) -> Option<VsockUdsForward> {
+        let config = self.resource_manager.config().await;
+        let parsed = match parse_vsock_uds_forward(&config.runtime.vsock_uds_forward) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                warn!(sl!(), "vsock UDS forward: invalid config: {err}");
+                return None;
+            }
+        };
+        let (port, uds) = parsed?;
+
+        let agent_url = match self.hypervisor.get_agent_socket().await {
+            Ok(url) => url,
+            Err(err) => {
+                warn!(sl!(), "vsock UDS forward: cannot get agent URL: {err:#}");
+                return None;
+            }
+        };
+
+        let guest_cid = match guest_cid_from_agent_url(&agent_url) {
+            Ok(cid) => cid,
+            Err(err) => {
+                warn!(
+                    sl!(),
+                    "vsock UDS forward: cannot determine guest CID from {agent_url:?}: {err:#}"
+                );
+                return None;
+            }
+        };
+
+        Some(VsockUdsForward::start(guest_cid, port, PathBuf::from(uds)))
+    }
 }
 
 #[async_trait]
@@ -890,6 +934,10 @@ impl Sandbox for VirtSandbox {
             .await
             .context("create sandbox")?;
 
+        if let Some(forwarder) = self.build_vsock_uds_forward().await {
+            inner.vsock_uds_forward = Some(forwarder);
+        }
+
         inner.state = SandboxState::Running;
         inner.created_at = Some(std::time::SystemTime::now());
 
@@ -1040,6 +1088,8 @@ impl Sandbox for VirtSandbox {
     }
 
     async fn stop(&self) -> Result<()> {
+        self.stop_vsock_uds_forward().await;
+
         let state = {
             let sandbox_inner = self.inner.read().await;
             sandbox_inner.state
