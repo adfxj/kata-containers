@@ -26,6 +26,7 @@ const CDH_API_TIMOUT_OPTION: &str = "agent.cdh_api_timeout";
 const CDH_IMAGE_PULL_TIMEOUT_OPTION: &str = "agent.image_pull_timeout";
 const CDI_TIMEOUT_OPTION: &str = "agent.cdi_timeout";
 const LAUNCH_PROCESS_TIMEOUT_OPTION: &str = "agent.launch_process_timeout";
+const KATA_VISIBLE_DEVICES_OPTION: &str = "agent.kata_visible_devices";
 const DEBUG_CONSOLE_VPORT_OPTION: &str = "agent.debug_console_vport";
 const LOG_VPORT_OPTION: &str = "agent.log_vport";
 const CONTAINER_PIPE_SIZE_OPTION: &str = "agent.container_pipe_size";
@@ -133,6 +134,10 @@ pub struct AgentConfig {
     pub image_pull_timeout: time::Duration,
     pub cdi_timeout: time::Duration,
     pub launch_process_timeout: time::Duration,
+    // When enabled, the agent translates a container's KATA_VISIBLE_DEVICES
+    // environment variable into CDI device requests (nvidia.com/gpu) so that
+    // the container sees the matching GPUs present in the VM.
+    pub kata_visible_devices: bool,
     pub debug_console_vport: i32,
     pub log_vport: i32,
     pub container_pipe_size: i32,
@@ -167,6 +172,7 @@ pub struct AgentConfigBuilder {
     pub image_pull_timeout: Option<time::Duration>,
     pub cdi_timeout: Option<time::Duration>,
     pub launch_process_timeout: Option<time::Duration>,
+    pub kata_visible_devices: Option<bool>,
     pub debug_console_vport: Option<i32>,
     pub log_vport: Option<i32>,
     pub container_pipe_size: Option<i32>,
@@ -262,6 +268,7 @@ impl Default for AgentConfig {
             image_pull_timeout: DEFAULT_IMAGE_PULL_TIMEOUT,
             cdi_timeout: DEFAULT_CDI_TIMEOUT,
             launch_process_timeout: DEFAULT_LAUNCH_PROCESS_TIMEOUT,
+            kata_visible_devices: false,
             debug_console_vport: 0,
             log_vport: 0,
             container_pipe_size: DEFAULT_CONTAINER_PIPE_SIZE,
@@ -304,6 +311,7 @@ impl FromStr for AgentConfig {
         config_override!(agent_config_builder, agent_config, image_pull_timeout);
         config_override!(agent_config_builder, agent_config, cdi_timeout);
         config_override!(agent_config_builder, agent_config, launch_process_timeout);
+        config_override!(agent_config_builder, agent_config, kata_visible_devices);
         config_override!(agent_config_builder, agent_config, debug_console_vport);
         config_override!(agent_config_builder, agent_config, log_vport);
         config_override!(agent_config_builder, agent_config, container_pipe_size);
@@ -493,6 +501,13 @@ impl AgentConfig {
                 config.launch_process_timeout,
                 get_timeout,
                 |launch_process_timeout: &time::Duration| launch_process_timeout.as_secs() > 0
+            );
+
+            parse_cmdline_param!(
+                param,
+                KATA_VISIBLE_DEVICES_OPTION,
+                config.kata_visible_devices,
+                get_bool_value
             );
 
             // vsock port should be positive values

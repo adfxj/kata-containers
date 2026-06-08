@@ -300,12 +300,63 @@ pub fn dump_nvidia_cdi_yaml(logger: &Logger) -> Result<()> {
     Ok(())
 }
 
+/// The CDI kind used for GPUs. This must match the kind produced by
+/// `nvidia-ctk cdi generate` inside the guest (written to
+/// /var/run/cdi/nvidia.yaml), which is what resolves KATA_VISIBLE_DEVICES
+/// requests against the GPUs present in the VM.
+const CDI_GPU_KIND: &str = "nvidia.com/gpu";
+
+/// Environment variable, set on a container, that selects which GPUs present
+/// in the VM should be made visible to that container. Deliberately distinct
+/// from NVIDIA_VISIBLE_DEVICES so we do not imply identical semantics.
+const KATA_VISIBLE_DEVICES_ENV: &str = "KATA_VISIBLE_DEVICES";
+
+/// Translate a container's KATA_VISIBLE_DEVICES environment variable into a
+/// list of fully-qualified CDI device names (e.g. "nvidia.com/gpu=all" or
+/// "nvidia.com/gpu=0"). Returns an empty vector when the variable is unset,
+/// empty, "none" or "void".
+pub fn cdi_devices_from_kata_visible_devices(spec: &Spec) -> Result<Vec<String>> {
+    let prefix = format!("{KATA_VISIBLE_DEVICES_ENV}=");
+    let value = spec
+        .process()
+        .as_ref()
+        .and_then(|p| p.env().as_ref())
+        .and_then(|env| env.iter().find_map(|e| e.strip_prefix(prefix.as_str())));
+
+    let value = match value {
+        Some(v) => v.trim(),
+        None => return Ok(Vec::new()),
+    };
+
+  match value {
+      "" | "none" | "void" => Ok(Vec::new()),
+      "all" => Ok(vec![format!("{CDI_GPU_KIND}=all")]),
+      list => list
+          .split(',')
+          .map(str::trim)
+          .map(|d| {
+              d.parse::<u32>()
+                  .map(|n| format!("{CDI_GPU_KIND}={n}"))
+                  .map_err(|_| {
+                      anyhow!(
+                          "invalid {}: {:?} is not a non-negative GPU index",
+                          KATA_VISIBLE_DEVICES_ENV,
+                          d
+                      )
+                  })
+          })
+          .collect(),
+  }
+
+}
+
 #[instrument]
 pub async fn handle_cdi_devices(
     logger: &Logger,
     spec: &mut Spec,
     spec_dir: &str,
     cdi_timeout: time::Duration,
+    extra_devices: &[String],
 ) -> Result<()> {
     if let Some(container_type) = spec
         .annotations()
@@ -317,7 +368,19 @@ pub async fn handle_cdi_devices(
         }
     }
 
-    let (_, devices) = parse_annotations(spec.annotations().as_ref().unwrap())?;
+    let mut devices = match spec.annotations().as_ref() {
+        Some(annotations) => parse_annotations(annotations)?.1,
+        None => Vec::new(),
+    };
+
+    // Devices requested via the container's KATA_VISIBLE_DEVICES environment
+    // variable are merged with any devices the host injected through
+    // cdi.k8s.io/* annotations.
+    for dev in extra_devices {
+        if !devices.contains(dev) {
+            devices.push(dev.clone());
+        }
+    }
 
     if devices.is_empty() {
         info!(logger, "no CDI annotations, no devices to inject");
@@ -947,6 +1010,49 @@ mod tests {
     use tempfile::tempdir;
 
     const VM_ROOTFS: &str = "/";
+
+    #[test]
+    fn test_cdi_devices_from_kata_visible_devices() {
+        let make_spec = |val: Option<&str>| {
+            let mut spec = Spec::default();
+            if let Some(v) = val {
+                let mut process = oci::Process::default();
+                *process.env_mut() = Some(vec![format!("KATA_VISIBLE_DEVICES={v}")]);
+                spec.set_process(Some(process));
+            }
+            spec
+        };
+
+        // Unset, or a disabling value, yields no devices.
+        assert!(cdi_devices_from_kata_visible_devices(&make_spec(None))
+            .expect("Failed to get CDI devices")
+            .is_empty());
+        for v in ["", "none", "void"] {
+            assert!(
+                cdi_devices_from_kata_visible_devices(&make_spec(Some(v))).expect("Failed to get CDI devices").is_empty(),
+                "expected no devices for KATA_VISIBLE_DEVICES={v:?}"
+            );
+        }
+
+        assert_eq!(
+            cdi_devices_from_kata_visible_devices(&make_spec(Some("all")))
+            .expect("Failed to get CDI devices"),
+            vec!["nvidia.com/gpu=all".to_string()]
+        );
+
+       assert!(cdi_devices_from_kata_visible_devices(&make_spec(Some("0, 1 ,,2"))).is_err());
+
+        // Indices are mapped individually; whitespace is ignored.
+        assert_eq!(
+            cdi_devices_from_kata_visible_devices(&make_spec(Some("0, 1,2")))
+            .expect("Failed to get CDI devices"),
+            vec![
+                "nvidia.com/gpu=0".to_string(),
+                "nvidia.com/gpu=1".to_string(),
+                "nvidia.com/gpu=2".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn test_update_device_cgroup() {
@@ -1701,6 +1807,7 @@ mod tests {
             &mut spec,
             temp_dir.path().to_str().unwrap(),
             cdi_timeout,
+            &[],
         )
         .await;
         println!("modfied spec {spec:?}");

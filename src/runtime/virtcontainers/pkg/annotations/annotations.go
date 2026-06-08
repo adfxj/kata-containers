@@ -342,6 +342,12 @@ const (
 	LaunchProcessTimeoutOption      = "launch_process_timeout"
 	LaunchProcessTimeoutKernelParam = "agent." + LaunchProcessTimeoutOption
 
+	// KataVisibleDevices, when enabled, lets the agent translate a
+	// container's KATA_VISIBLE_DEVICES environment variable into CDI GPU
+	// device requests inside the guest.
+	KataVisibleDevicesOption      = "kata_visible_devices"
+	KataVisibleDevicesKernelParam = "agent." + KataVisibleDevicesOption
+
 	// Policy is an annotation containing the contents of an agent policy file, base64 encoded.
 	Policy = kataAnnotAgentPrefix + "policy"
 )
