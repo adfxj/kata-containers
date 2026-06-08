@@ -9,6 +9,10 @@ metadata:
   name: qos-test
 spec:
   runtimeClassName: kata
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
   containers:
   - name: qos-guaranteed
     image: quay.io/prometheus/busybox:latest

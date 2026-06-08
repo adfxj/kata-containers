@@ -70,6 +70,44 @@ fn secret_in_separate_file() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn guest_pull_missing_security_context_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let workdir = prepare_workdir("guest_pull_missing_security_context_fails", &[]);
+    let pod_yaml_path = workdir.join("missing_security_context.yaml");
+    fs::write(
+        &pod_yaml_path,
+        r#"---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: missing-security-context
+spec:
+  restartPolicy: Never
+  runtimeClassName: kata-cc
+  containers:
+    - name: busybox
+      image: "quay.io/prometheus/busybox:latest"
+      command:
+        - /bin/sh
+      args:
+        - "-c"
+        - echo hello
+"#,
+    )?;
+
+    let mut cmd = Command::cargo_bin("genpolicy")?;
+    cmd.arg("--yaml-file").arg(&pod_yaml_path);
+
+    let output = cmd.output()?;
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Set an explicit Kubernetes securityContext"));
+    assert!(stderr.contains("supplementalGroups: [10]"));
+
+    Ok(())
+}
+
+#[test]
 fn output_behavior() -> Result<(), Box<dyn std::error::Error>> {
     struct TestCase {
         name: &'static str,

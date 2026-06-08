@@ -12,6 +12,7 @@ spec:
   restartPolicy: Never
   securityContext:
     runAsUser: 1001
+    runAsGroup: 0
     fsGroup: 123
   containers:
   - name: mounttest-container

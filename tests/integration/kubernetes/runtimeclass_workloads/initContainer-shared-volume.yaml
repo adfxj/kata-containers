@@ -9,6 +9,10 @@ metadata:
   name: initcontainer-shared-volume
 spec:
   runtimeClassName: kata
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
   initContainers:
   - name: first
     image: quay.io/prometheus/busybox:latest

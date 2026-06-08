@@ -10,6 +10,9 @@ metadata:
 spec:
   runtimeClassName: kata
   securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
     sysctls:
     - name: kernel.shm_rmid_forced
       value: "0"

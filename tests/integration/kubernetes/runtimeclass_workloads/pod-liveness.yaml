@@ -11,6 +11,10 @@ metadata:
   name: liveness-exec
 spec:
   runtimeClassName: kata
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    supplementalGroups: [10]
   containers:
   - name: liveness
     image: quay.io/prometheus/busybox:latest
