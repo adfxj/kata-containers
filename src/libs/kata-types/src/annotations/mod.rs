@@ -99,7 +99,8 @@ pub const KATA_ANNO_CFG_HYPERVISOR_JAILER_PATH: &str =
 pub const KATA_ANNO_CFG_HYPERVISOR_JAILER_HASH: &str =
     "io.katacontainers.config.hypervisor.jailer_hash";
 /// A sandbox annotation to enable IO to be processed in a separate thread.
-/// Supported currently for virtio-scsi driver.
+/// Supported for virtio-scsi and for virtio-blk-pci hotplug when
+/// `indep_iothreads` is configured.
 pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_IO_THREADS: &str =
     "io.katacontainers.config.hypervisor.enable_iothreads";
 /// A sandbox annotation to specify the number of independent IO threads.
@@ -580,10 +581,7 @@ impl Annotation {
                             hv.indep_iothreads = indep_iothreads;
                         }
                         Err(_e) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "failed to parse indep_iothreads",
-                            ));
+                            return Err(u32_err);
                         }
                     },
                     // Hypervisor Block Device related annotations

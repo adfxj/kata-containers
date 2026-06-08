@@ -1721,7 +1721,8 @@ pub struct Hypervisor {
     /// Enables the use of iothreads (data-plane).
     ///
     /// When enabled, I/O operations are handled in a separate I/O thread.
-    /// This is currently only implemented for SCSI devices.
+    /// Supported for virtio-scsi and for virtio-blk-pci hotplug when
+    /// `indep_iothreads` is configured.
     #[serde(default)]
     pub enable_iothreads: bool,
 
