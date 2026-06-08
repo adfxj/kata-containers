@@ -68,6 +68,7 @@ const (
 const (
 	clhStateCreated = "Created"
 	clhStateRunning = "Running"
+	clhStatePaused  = "Paused"
 )
 
 const (
@@ -84,6 +85,7 @@ const (
 	clhHotPlugAPITimeout                   = 5
 	clhStopSandboxTimeout                  = 3
 	clhStopSandboxTimeoutConfidentialGuest = 10
+	clhRestoreTimeout                      = 2
 	clhSocket                              = "clh.sock"
 	clhAPISocket                           = "clh-api.sock"
 	virtioFsSocket                         = "virtiofsd.sock"
@@ -112,8 +114,16 @@ type clhClient interface {
 	VmAddDevicePut(ctx context.Context, deviceConfig chclient.DeviceConfig) (chclient.PciDeviceInfo, *http.Response, error)
 	// Add a new disk device to the VM
 	VmAddDiskPut(ctx context.Context, diskConfig chclient.DiskConfig) (chclient.PciDeviceInfo, *http.Response, error)
+	// Pause the VM
+	VmPausePut(ctx context.Context) (*http.Response, error)
+	// Create a snapshot of the VM
+	VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error)
 	// Remove a device from the VM
 	VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error)
+	// Restore VM from a snapshot
+	VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error)
+	// Resume a paused VM
+	ResumeVM(ctx context.Context) (*http.Response, error)
 }
 
 type clhClientApi struct {
@@ -153,8 +163,24 @@ func (c *clhClientApi) VmAddDiskPut(ctx context.Context, diskConfig chclient.Dis
 	return c.ApiInternal.VmAddDiskPut(ctx).DiskConfig(diskConfig).Execute()
 }
 
+func (c *clhClientApi) VmPausePut(ctx context.Context) (*http.Response, error) {
+	return c.ApiInternal.PauseVM(ctx).Execute()
+}
+
+func (c *clhClientApi) VmSnapshotPut(ctx context.Context, vmSnapshotConfig chclient.VmSnapshotConfig) (*http.Response, error) {
+	return c.ApiInternal.VmSnapshotPut(ctx).VmSnapshotConfig(vmSnapshotConfig).Execute()
+}
+
 func (c *clhClientApi) VmRemoveDevicePut(ctx context.Context, vmRemoveDevice chclient.VmRemoveDevice) (*http.Response, error) {
 	return c.ApiInternal.VmRemoveDevicePut(ctx).VmRemoveDevice(vmRemoveDevice).Execute()
+}
+
+func (c *clhClientApi) VmRestorePut(ctx context.Context, restoreConfig chclient.RestoreConfig) (*http.Response, error) {
+	return c.ApiInternal.VmRestorePut(ctx).RestoreConfig(restoreConfig).Execute()
+}
+
+func (c *clhClientApi) ResumeVM(ctx context.Context) (*http.Response, error) {
+	return c.ApiInternal.ResumeVM(ctx).Execute()
 }
 
 // This is done in order to be able to override such a function as part of
@@ -1287,16 +1313,56 @@ func (clh *cloudHypervisor) Cleanup(ctx context.Context) error {
 
 func (clh *cloudHypervisor) PauseVM(ctx context.Context) error {
 	clh.Logger().WithField("function", "PauseVM").Info("Pause Sandbox")
+
+	cl := clh.client()
+	ctx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	defer cancel()
+
+	_, err := cl.VmPausePut(ctx)
+	if err != nil {
+		clh.Logger().WithError(err).Error("Failed to pause VM")
+		return openAPIClientError(err)
+	}
+
 	return nil
 }
 
 func (clh *cloudHypervisor) SaveVM() error {
-	clh.Logger().WithField("function", "saveSandboxC").Info("Save Sandbox")
+	clh.Logger().WithField("function", "SaveVM").Info("Save Sandbox")
+
+	cl := clh.client()
+	ctx, cancel := context.WithTimeout(context.Background(), clh.getClhAPITimeout()*time.Second)
+	defer cancel()
+
+	// Create snapshot config with file URL to template path
+	// Use MemoryPath as base for snapshot destination
+	// When creating a template, the MemoryPath is set to the template path, so we can use it to save the snapshot.
+	fileURL := "file://" + filepath.Dir(clh.config.MemoryPath)
+
+	vmSnapshotConfig := *chclient.NewVmSnapshotConfig()
+	vmSnapshotConfig.SetDestinationUrl(fileURL)
+
+	_, err := cl.VmSnapshotPut(ctx, vmSnapshotConfig)
+	if err != nil {
+		clh.Logger().WithError(err).Error("Failed to save VM snapshot")
+		return openAPIClientError(err)
+	}
+
 	return nil
 }
 
 func (clh *cloudHypervisor) ResumeVM(ctx context.Context) error {
 	clh.Logger().WithField("function", "ResumeVM").Info("Resume Sandbox")
+	cl := clh.client()
+	ctx, cancel := context.WithTimeout(ctx, clh.getClhAPITimeout()*time.Second)
+	defer cancel()
+
+	_, err := cl.ResumeVM(ctx)
+	if err != nil {
+		clh.Logger().WithError(err).Error("Failed to resume VM")
+		return openAPIClientError(err)
+	}
+
 	return nil
 }
 
@@ -1738,6 +1804,58 @@ func (clh *cloudHypervisor) bootVM(ctx context.Context) error {
 		return fmt.Errorf("VM state is not 'Running' after 'BootVM'")
 	}
 
+	return nil
+}
+
+func (clh *cloudHypervisor) restoreVM(ctx context.Context) error {
+	clh.Logger().Info("Restoring VM from template")
+
+	cl := clh.client()
+
+	// use the VMStorePath as the base for the restore source URL
+	snapshotDir := clh.config.VMStorePath
+
+	// check if the snapshot directory contains the state.json and config.json files
+	// which contain the VM state and configuration respectively
+	stateFile := filepath.Join(snapshotDir, "state.json")
+	configFile := filepath.Join(snapshotDir, "config.json")
+
+	if _, err := os.Stat(stateFile); err != nil {
+		return fmt.Errorf("Failed to access state file %s: %v", stateFile, err)
+	}
+
+	if _, err := os.Stat(configFile); err != nil {
+		return fmt.Errorf("Failed to access config file %s: %v", configFile, err)
+	}
+
+	// Prepare restore configuration
+	sourceURL := "file://" + snapshotDir
+	restoreConfig := *chclient.NewRestoreConfig(sourceURL)
+
+	clh.Logger().WithField("sourceURL", sourceURL).Debug("Restore configuration")
+
+	// Restore VM from template
+	ctxWithTimeout, cancelRestore := context.WithTimeout(ctx, clhRestoreTimeout*time.Second)
+	defer cancelRestore()
+	_, err := cl.VmRestorePut(ctxWithTimeout, restoreConfig)
+	if err != nil {
+		clh.Logger().WithError(err).Error("Failed to restore VM from template")
+		return openAPIClientError(err)
+	}
+
+	// Check VM state after restoration
+	info, err := clh.vmInfo()
+	if err != nil {
+		return err
+	}
+
+	clh.Logger().Debugf("VM state after restore: %#v", info)
+
+	if info.State != clhStatePaused {
+		clh.Logger().Warnf("VM state is '%s' after restore, expected 'Paused'", info.State)
+	}
+
+	clh.Logger().Info("Successfully restored VM from template")
 	return nil
 }
 
