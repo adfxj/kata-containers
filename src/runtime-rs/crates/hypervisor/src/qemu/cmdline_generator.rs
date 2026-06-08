@@ -708,6 +708,94 @@ impl ToQemuParams for MemoryBackendFile {
     }
 }
 
+/// Configuration for virtio-mem memory hotplug.
+///
+/// This struct holds the configuration parameters needed for virtio-mem setup.
+/// The actual virtio-mem operations (setup, cleanup, resize) are implemented
+/// in the Qmp struct methods.
+#[derive(Debug)]
+pub struct VirtioMemConfig {
+    /// Default memory size in MB
+    default_memory: u32,
+    /// Maximum memory size in MB
+    default_maxmemory: u32,
+    /// Machine type (e.g., "s390-ccw-virtio")
+    machine_type: String,
+    /// Shared filesystem type (e.g., "virtio-fs")
+    shared_fs: Option<String>,
+    /// File-backed memory backend path
+    file_mem_backend: String,
+}
+
+impl VirtioMemConfig {
+    /// Create a new VirtioMemConfig
+    pub fn new(
+        default_memory: u32,
+        default_maxmemory: u32,
+        machine_type: String,
+        shared_fs: Option<String>,
+        file_mem_backend: String,
+    ) -> Self {
+        VirtioMemConfig {
+            default_memory,
+            default_maxmemory,
+            machine_type,
+            shared_fs,
+            file_mem_backend,
+        }
+    }
+
+    /// Get default memory size in MB
+    pub fn get_default_memory(&self) -> u32 {
+        self.default_memory
+    }
+
+    /// Get maximum memory size in MB
+    pub fn get_default_maxmemory(&self) -> u32 {
+        self.default_maxmemory
+    }
+
+    /// Get machine type
+    pub fn get_machine_type(&self) -> &str {
+        &self.machine_type
+    }
+
+    /// Determine memory backend type, path, and sharing based on configuration.
+    /// Returns (backend_type, mem_path, share)
+    pub fn select_memory_backend(&self) -> (&'static str, &str, bool) {
+        let shared_fs_type = self.shared_fs.as_deref().unwrap_or("");
+        let uses_virtio_fs = matches!(shared_fs_type, "virtio-fs" | "virtio-fs-nydus");
+
+        let (backend_type, mem_path) = if uses_virtio_fs || !self.file_mem_backend.is_empty() {
+            (
+                "memory-backend-file",
+                if !self.file_mem_backend.is_empty() {
+                    self.file_mem_backend.as_str()
+                } else {
+                    "/dev/shm"
+                },
+            )
+        } else {
+            ("memory-backend-ram", "")
+        };
+
+        let share = uses_virtio_fs;
+
+        (backend_type, mem_path, share)
+    }
+
+    /// Validate and convert resize size from MB to bytes.
+    pub fn validate_resize_size(new_size_mb: i64) -> Result<u64> {
+        if new_size_mb < 0 {
+            return Err(anyhow!(
+                "cannot resize virtio-mem device to negative size ({}) memory",
+                new_size_mb
+            ));
+        }
+        Ok((new_size_mb as u64) * 1024 * 1024)
+    }
+}
+
 #[derive(Debug)]
 struct TcpSocketOpts {
     host: String,

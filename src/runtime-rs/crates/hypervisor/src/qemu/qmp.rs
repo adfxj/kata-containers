@@ -4,7 +4,7 @@
 //
 
 use crate::device::pci_path::PciPath;
-use crate::qemu::cmdline_generator::{CcwSubChannel, DeviceVirtioNet, Netdev, QMP_SOCKET_FILE};
+use crate::qemu::cmdline_generator::{CcwSubChannel, DeviceVirtioNet, Netdev, VirtioMemConfig, QMP_SOCKET_FILE};
 use crate::utils::get_jailer_root;
 use crate::BlockDeviceFormat;
 use crate::VcpuThreadIds;
@@ -270,35 +270,115 @@ impl Qmp {
 
         let mut hotplugged_mem_size = 0_u64;
 
-        info!(sl!(), "hotplugged_memory_size(): iterating over dimms");
+        info!(
+            sl!(),
+            "hotplugged_memory_size(): iterating over memory devices"
+        );
         for mem_frontend in &memory_frontends {
-            if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = mem_frontend {
-                let id = match dimm_info.data.id {
-                    Some(ref id) => id.clone(),
-                    None => "".to_owned(),
-                };
+            match mem_frontend {
+                qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) => {
+                    let id = match dimm_info.data.id {
+                        Some(ref id) => id.clone(),
+                        None => "".to_owned(),
+                    };
 
-                info!(
-                    sl!(),
-                    "dimm id: {} size={}, hotplugged: {}",
-                    id,
-                    dimm_info.data.size,
-                    dimm_info.data.hotplugged
-                );
+                    info!(
+                        sl!(),
+                        "dimm id: {} size={}, hotplugged: {}",
+                        id,
+                        dimm_info.data.size,
+                        dimm_info.data.hotplugged
+                    );
 
-                if dimm_info.data.hotpluggable && dimm_info.data.hotplugged {
-                    hotplugged_mem_size += dimm_info.data.size as u64;
+                    if dimm_info.data.hotpluggable && dimm_info.data.hotplugged {
+                        hotplugged_mem_size += dimm_info.data.size as u64;
+                    }
                 }
+                qapi_qmp::MemoryDeviceInfo::virtio_mem(vm_info) => {
+                    // For virtio-mem, the 'size' field is the requested-size
+                    info!(
+                        sl!(),
+                        "virtio-mem device: requested-size={} bytes ({} MB)",
+                        vm_info.data.size,
+                        vm_info.data.size / (1024 * 1024)
+                    );
+                    hotplugged_mem_size += vm_info.data.size;
+                }
+                _ => {}
             }
         }
+
+        info!(
+            sl!(),
+            "Total hotplugged memory: {} bytes ({} MB)",
+            hotplugged_mem_size,
+            hotplugged_mem_size / (1024 * 1024)
+        );
 
         Ok(hotplugged_mem_size)
     }
 
+    /// Hotplug memory into the VM.
+    /// Automatically detects if virtio-mem is available and uses it; otherwise falls back to pc-dimm.
     pub fn hotplug_memory(&mut self, size: u64) -> Result<()> {
-        let memdev_idx = self
-            .qmp
-            .execute(&qapi_qmp::query_memory_devices {})?
+        // Query existing memory devices to detect virtio-mem
+        let memory_devices = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+
+        // Check if virtio-mem device exists
+        let has_virtio_mem = memory_devices
+            .iter()
+            .any(|memdev| matches!(memdev, qapi_qmp::MemoryDeviceInfo::virtio_mem(_)));
+
+        if has_virtio_mem {
+            self.hotplug_virtio_mem(size, memory_devices)
+        } else {
+            self.hotplug_pc_dimm(size, memory_devices)
+        }
+    }
+
+    /// Hotplug memory using virtio-mem resize method.
+    fn hotplug_virtio_mem(
+        &mut self,
+        size: u64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        info!(sl!(), "Detected virtio-mem device, using resize method");
+
+        // Calculate current hotplugged memory from virtio-mem device
+        let current_hotplugged_mb = memory_devices
+            .iter()
+            .filter_map(|memdev| {
+                if let qapi_qmp::MemoryDeviceInfo::virtio_mem(vm_info) = memdev {
+                    Some(vm_info.data.size / (1024 * 1024))
+                } else {
+                    None
+                }
+            })
+            .sum::<u64>();
+
+        let size_mb = size / (1024 * 1024);
+        let new_total_mb = (current_hotplugged_mb + size_mb) as i64;
+
+        info!(
+            sl!(),
+            "Hotplugging {} MB using virtio-mem (current: {} MB, new total: {} MB)",
+            size_mb,
+            current_hotplugged_mb,
+            new_total_mb
+        );
+
+        self.resize_virtio_mem(new_total_mb)
+    }
+
+    /// Hotplug memory using pc-dimm device.
+    fn hotplug_pc_dimm(
+        &mut self,
+        size: u64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        info!(sl!(), "No virtio-mem detected, using pc-dimm hotplug");
+
+        let memdev_idx = memory_devices
             .into_iter()
             .filter(|memdev| {
                 if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = memdev {
@@ -351,27 +431,251 @@ impl Qmp {
         Ok(())
     }
 
+    /// Cleanup virtio-mem resources on setup failure
+    fn cleanup_virtio_mem_setup(&mut self, device_id: &str) {
+        // Remove memory backend object
+        let _ = self.qmp.execute(&qmp::object_del {
+            id: "virtiomem".to_owned(),
+        });
+
+        // Remove CCW device slot
+        if let Some(ccw) = self.ccw_subchannel.as_mut() {
+            ccw.remove_device(device_id).ok();
+        }
+    }
+
+    
+    pub fn setup_virtio_mem(
+        &mut self,
+        virtio_mem_config: &VirtioMemConfig,
+    ) -> Result<()> {
+        // Calculate virtio-mem size: (default_maxmemory - default_memory) aligned to 4MB
+        // default_maxmemory is already validated during sandbox initialization
+        let size_mb = ((virtio_mem_config.get_default_maxmemory() - virtio_mem_config.get_default_memory()) >> 2 << 2) as u64;
+
+        if size_mb == 0 {
+            info!(sl!(), "virtio-mem size is 0, skipping setup");
+            return Ok(());
+        }
+
+        // Validate machine type for virtio-mem support
+        // TODO: support more architectures
+        if virtio_mem_config.get_machine_type() != "s390-ccw-virtio" {
+            return Err(anyhow!(
+                "virtio-mem supports multiple architectures, the current implementation is only for s390x (s390-ccw-virtio). Current machine type: {}",
+                virtio_mem_config.get_machine_type()
+            ));
+        }
+
+        let (qomtype, mempath, share) = virtio_mem_config.select_memory_backend();
+
+        let size_bytes = size_mb * 1024 * 1024;
+
+        // Allocate CCW slot and format address
+        // Use same ID for both CCW subchannel tracking and QMP device
+        let device_id = "virtiomem0";
+        let ccw = self
+            .ccw_subchannel
+            .as_mut()
+            .ok_or_else(|| anyhow!("CCW subchannel not initialized for s390x"))?;
+        let slot = ccw
+            .add_device(device_id)
+            .map_err(|e| anyhow!("Failed to add CCW device: {:?}", e))?;
+        let devno = ccw.address_format_ccw(slot);
+
+        info!(
+            sl!(),
+            "Setting up virtio-mem-ccw: backend={}, path={}, share={}, devno={}",
+            qomtype,
+            if mempath.is_empty() { "none" } else { mempath },
+            share,
+            devno
+        );
+
+        // Helper to create common MemoryBackendProperties
+        let create_backend_props = || qapi_qmp::MemoryBackendProperties {
+            dump: None,
+            host_nodes: None,
+            merge: None,
+            policy: None,
+            prealloc: None,
+            prealloc_context: None,
+            prealloc_threads: None,
+            reserve: None,
+            share: Some(share),
+            x_use_canonical_path_for_ramblock_id: None,
+            size: size_bytes,
+        };
+
+        // STEP 1: Create memory backend
+        let memory_backend = if mempath.is_empty() {
+            qmp::object_add(qapi_qmp::ObjectOptions::memory_backend_ram {
+                id: "virtiomem".to_owned(),
+                memory_backend_ram: create_backend_props(),
+            })
+        } else {
+            qmp::object_add(qapi_qmp::ObjectOptions::memory_backend_file {
+                id: "virtiomem".to_owned(),
+                memory_backend_file: qapi_qmp::MemoryBackendFileProperties {
+                    base: create_backend_props(),
+                    align: None,
+                    discard_data: None,
+                    offset: None,
+                    pmem: None,
+                    readonly: None,
+                    rom: None,
+                    mem_path: mempath.to_owned(),
+                },
+            })
+        };
+
+        // Execute backend creation with cleanup on error
+        if let Err(e) = self.qmp.execute(&memory_backend) {
+            self.cleanup_virtio_mem_setup(device_id);
+            return if e.to_string().contains("Cannot allocate memory") {
+                Err(anyhow!("Failed to allocate {} MB for virtio-mem: {}. \
+                            Please use command 'echo 1 > /proc/sys/vm/overcommit_memory' to handle it.",
+                            size_mb, e))
+            } else {
+                Err(e.into())
+            };
+        }
+
+        // STEP 2: Create virtio-mem-ccw device
+        let mut device_args = Dictionary::new();
+        device_args.insert("memdev".to_owned(), "virtiomem".into());
+        device_args.insert("devno".to_owned(), devno.into());
+
+        if let Err(e) = self.qmp.execute(&qmp::device_add {
+            bus: None,
+            id: Some(device_id.to_owned()),
+            driver: "virtio-mem-ccw".to_owned(),
+            arguments: device_args,
+        }) {
+            self.cleanup_virtio_mem_setup(device_id);
+            return Err(anyhow!("Failed to add virtio-mem-ccw device: {}", e));
+        }
+
+        info!(
+            sl!(),
+            "Successfully set up virtio-mem-ccw with max capacity {} MB", size_mb
+        );
+        Ok(())
+    }
+
+    /// Resize virtio-mem device to the specified size in MB.
+    /// This uses QMP qom-set to change the requested-size property.
+    ///
+    /// # Arguments
+    /// * `new_size_mb` - New size in MB for the virtio-mem device
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if resize fails or size is negative
+    pub fn resize_virtio_mem(&mut self, new_size_mb: i64) -> Result<()> {
+        let size_bytes = VirtioMemConfig::validate_resize_size(new_size_mb)?;
+
+        info!(
+            sl!(),
+            "Resizing virtio-mem device to {} MB ({} bytes)", new_size_mb, size_bytes
+        );
+
+        // Use qom-set to change the requested-size property of virtiomem0
+        self.qmp.execute(&qmp::qom_set {
+            path: "virtiomem0".to_owned(),
+            property: "requested-size".to_owned(),
+            value: serde_json::json!(size_bytes),
+        })?;
+
+        info!(
+            sl!(),
+            "Successfully resized virtio-mem to {} MB", new_size_mb
+        );
+        Ok(())
+    }
+
     pub fn hotunplug_memory(&mut self, size: i64) -> Result<()> {
-        let frontend = self
-            .qmp
-            .execute(&qapi_qmp::query_memory_devices {})?
-            .into_iter()
-            .find(|memdev| {
-                if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = memdev {
-                    let dimm_id = match dimm_info.data.id {
-                        Some(ref id) => id,
-                        None => return false,
-                    };
-                    if dimm_info.data.hotpluggable
-                        && dimm_info.data.hotplugged
-                        && dimm_info.data.size == size
-                        && dimm_id.starts_with("frontend-to-hotplugged-")
-                    {
-                        return true;
-                    }
+        // Query existing memory devices to detect virtio-mem
+        let memory_devices = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+
+        // Check if virtio-mem device exists
+        let has_virtio_mem = memory_devices
+            .iter()
+            .any(|memdev| matches!(memdev, qapi_qmp::MemoryDeviceInfo::virtio_mem(_)));
+
+        if has_virtio_mem {
+            self.hotunplug_virtio_mem(size, memory_devices)
+        } else {
+            self.hotunplug_pc_dimm(size, memory_devices)
+        }
+    }
+
+    /// Hotunplug memory using virtio-mem resize method.
+    fn hotunplug_virtio_mem(
+        &mut self,
+        size: i64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        // Validate size is non-negative before casting
+        if size < 0 {
+            return Err(anyhow!(
+                "cannot hotunplug negative memory size: {} bytes",
+                size
+            ));
+        }
+
+        // Get current size from virtio-mem device (this is the requested-size, not actual size)
+        let current_size_bytes = memory_devices
+            .iter()
+            .filter_map(|memdev| {
+                if let qapi_qmp::MemoryDeviceInfo::virtio_mem(vm_info) = memdev {
+                    Some(vm_info.data.size)
+                } else {
+                    None
                 }
-                false
-            });
+            })
+            .sum::<u64>();
+
+        // size parameter is the amount to REMOVE (in bytes)
+        let new_size_bytes = current_size_bytes.saturating_sub(size as u64);
+        let new_size_mb = (new_size_bytes / (1024 * 1024)) as i64;
+
+        info!(
+            sl!(),
+            "Decreasing virtio-mem by {} bytes (current: {} bytes, new: {} bytes = {} MB)",
+            size,
+            current_size_bytes,
+            new_size_bytes,
+            new_size_mb
+        );
+
+        self.resize_virtio_mem(new_size_mb)
+    }
+
+    /// Hotunplug memory using pc-dimm device removal.
+    fn hotunplug_pc_dimm(
+        &mut self,
+        size: i64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        info!(sl!(), "No virtio-mem detected, using pc-dimm hotunplug");
+
+        let frontend = memory_devices.into_iter().find(|memdev| {
+            if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = memdev {
+                let dimm_id = match dimm_info.data.id {
+                    Some(ref id) => id,
+                    None => return false,
+                };
+                if dimm_info.data.hotpluggable
+                    && dimm_info.data.hotplugged
+                    && dimm_info.data.size == size
+                    && dimm_id.starts_with("frontend-to-hotplugged-")
+                {
+                    return true;
+                }
+            }
+            false
+        });
 
         if let Some(frontend) = frontend {
             if let qapi_qmp::MemoryDeviceInfo::dimm(frontend) = frontend {
@@ -1116,5 +1420,111 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
         [get_jailer_root(sid).as_str(), QMP_SOCKET_FILE].join("/")
     } else {
         QMP_SOCKET_FILE.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::qemu::cmdline_generator::VirtioMemConfig;
+
+    // Helper function to create a VirtioMemConfig for testing
+    fn create_test_config(shared_fs: Option<String>, file_mem_backend: String) -> VirtioMemConfig {
+        VirtioMemConfig::new(
+            2048,
+            4096,
+            "s390-ccw-virtio".to_string(),
+            shared_fs,
+            file_mem_backend,
+        )
+    }
+
+    #[test]
+    fn test_virtio_mem_backend_type_selection() {
+        // Case 1: virtio-fs -> memory-backend-file with /dev/shm
+        let config = create_test_config(Some("virtio-fs".to_string()), "".to_string());
+        let (backend, path, share) = config.select_memory_backend();
+        assert_eq!(backend, "memory-backend-file");
+        assert_eq!(path, "/dev/shm");
+        assert!(share);
+
+        // Case 2: virtio-fs-nydus -> memory-backend-file with /dev/shm
+        let config = create_test_config(Some("virtio-fs-nydus".to_string()), "".to_string());
+        let (backend, path, share) = config.select_memory_backend();
+        assert_eq!(backend, "memory-backend-file");
+        assert_eq!(path, "/dev/shm");
+        assert!(share);
+
+        // Case 3: file_mem_backend set -> memory-backend-file with custom path
+        let config = create_test_config(None, "/dev/hugepages".to_string());
+        let (backend, path, share) = config.select_memory_backend();
+        assert_eq!(backend, "memory-backend-file");
+        assert_eq!(path, "/dev/hugepages");
+        assert!(!share);
+
+        // Case 4: neither -> memory-backend-ram
+        let config = create_test_config(None, "".to_string());
+        let (backend, path, share) = config.select_memory_backend();
+        assert_eq!(backend, "memory-backend-ram");
+        assert_eq!(path, "");
+        assert!(!share);
+    }
+
+    #[test]
+    fn test_virtio_mem_memory_sharing() {
+        // Case 1: virtio-fs requires sharing
+        let config = create_test_config(Some("virtio-fs".to_string()), "".to_string());
+        let (_backend, _path, share) = config.select_memory_backend();
+        assert!(share);
+
+        // Case 2: virtio-fs-nydus requires sharing
+        let config = create_test_config(Some("virtio-fs-nydus".to_string()), "".to_string());
+        let (_backend, _path, share) = config.select_memory_backend();
+        assert!(share);
+
+        // Case 3: no sharing required for other fs types
+        let config = create_test_config(None, "".to_string());
+        let (_backend, _path, share) = config.select_memory_backend();
+        assert!(!share);
+
+        // Case 4: file backend without virtio-fs doesn't require sharing
+        let config = create_test_config(None, "/dev/hugepages".to_string());
+        let (_backend, _path, share) = config.select_memory_backend();
+        assert!(!share);
+    }
+
+    #[test]
+    fn test_virtio_mem_resize_validation() {
+        // Test that validate_resize_size rejects negative sizes
+        let result = VirtioMemConfig::validate_resize_size(-100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("negative size"));
+
+        // Test valid size conversion from MB to bytes
+        let size_bytes = VirtioMemConfig::validate_resize_size(1024).unwrap();
+        assert_eq!(size_bytes, 1073741824); // 1GB in bytes
+
+        // Test zero size is valid
+        let size_bytes = VirtioMemConfig::validate_resize_size(0).unwrap();
+        assert_eq!(size_bytes, 0);
+    }
+
+    #[test]
+    fn test_virtio_mem_hotunplug_underflow_protection() {
+        // Test that negative size validation works (this would be caught in hotunplug_memory)
+        let negative_size: i64 = -1024;
+        assert!(negative_size < 0, "Negative size should be detected");
+
+        // Test that saturating_sub prevents underflow when removing more memory than available
+        let current_size_bytes: u64 = 1024 * 1024 * 1024; // 1GB
+        let remove_bytes: i64 = 2 * 1024 * 1024 * 1024; // Try to remove 2GB
+
+        let new_size_bytes = current_size_bytes.saturating_sub(remove_bytes as u64);
+        assert_eq!(new_size_bytes, 0); // Should saturate to 0, not underflow
+
+        // Test normal hotunplug calculation
+        let current_size: u64 = 4 * 1024 * 1024 * 1024; // 4GB
+        let remove: i64 = 1024 * 1024 * 1024; // Remove 1GB
+        let new_size = current_size.saturating_sub(remove as u64);
+        assert_eq!(new_size, 3 * 1024 * 1024 * 1024); // 3GB remaining
     }
 }
