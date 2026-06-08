@@ -792,6 +792,7 @@ impl VcpuManager {
         Vcpu::new_x86_64(
             cpu_index,
             vcpu_fd,
+            self.vm_fd.clone(),
             // safe to unwrap
             self.io_manager.as_ref().unwrap().clone(),
             self.supported_cpuid.clone(),
@@ -821,6 +822,7 @@ impl VcpuManager {
         Vcpu::new_aarch64(
             cpu_index,
             vcpu_fd,
+            self.vm_fd.clone(),
             // safe to unwrap
             self.io_manager.as_ref().unwrap().clone(),
             self.reset_event_fd.as_ref().unwrap().try_clone().unwrap(),

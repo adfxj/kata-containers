@@ -48,6 +48,7 @@ impl Vcpu {
     pub fn new_x86_64(
         id: u8,
         vcpu_fd: VcpuFd,
+        vm_fd: Arc<VmFd>,
         io_mgr: IoManagerCached,
         cpuid: CpuId,
         exit_evt: EventFd,
@@ -62,6 +63,7 @@ impl Vcpu {
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             fd: vcpu_fd,
+            vm_fd,
             id,
             io_mgr,
             create_ts,
