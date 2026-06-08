@@ -697,6 +697,13 @@ disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
 #
 emptydir_mode = "@DEFEMPTYDIRMODE_COCO@"
 
+# Bridge a guest vsock listener to a host unix socket. The shim dials guestCID:port
+# (the guest or a sidecar must listen on that port) and forwards to the host UDS.
+# Format: "port:/absolute/unix/socket/path" (port must be > 1024).
+# Empty string disables the feature.
+# Example: vsock_uds_forward = "15001:/var/run/server.sock"
+vsock_uds_forward = ""
+
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.

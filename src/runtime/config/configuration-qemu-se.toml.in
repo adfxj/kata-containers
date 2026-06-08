@@ -744,6 +744,13 @@ experimental_force_guest_pull = @DEFFORCEGUESTPULL@
 # (e.g. k0s: /var/lib/k0s/kubelet).
 kubelet_root_dir = "@DEFKUBELETROOTDIR@"
 
+# Bridge a guest vsock listener to a host unix socket. The shim dials guestCID:port
+# (the guest or a sidecar must listen on that port) and forwards to the host UDS.
+# Format: "port:/absolute/unix/socket/path" (port must be > 1024).
+# Empty string disables the feature.
+# Example: vsock_uds_forward = "15001:/var/run/server.sock"
+vsock_uds_forward = ""
+
 # pod_resource_api_sock specifies the unix socket for the Kubelet's
 # PodResource API endpoint. If empty, kubernetes based cold plug
 # will not be attempted. In order for this feature to work, the
