@@ -21,10 +21,12 @@ setup() {
 
 	total_cpus=2
 	# https://github.com/containers/crun/blob/main/crun.1.md#cgroup-v2
-	# The weight is calculated by the:
-	# weight = (1 + ((request - 2) * 9999) / 262142)
-	total_requests=20
-	total_cpu_container=1
+	# The weight is calculated as:
+	# weight = (1 + ((shares - 2) * 9999) / 262142)
+	# Kubelet maps a 500m CPU request to 512 CPU shares.
+	# Integer division gives 1 + floor((512 - 2) * 9999 / 262142) = 20.
+	cpu_weight_expected=20
+	cpu_limit_millis_expected=500
 
 	setup_common || die "setup_common failed"
 
@@ -80,19 +82,19 @@ setup() {
 	done
 	[ "$total_cpus_container" -eq "$total_cpus" ]
 
-	# Check the total of requests
+	# Check the CPU weight derived from the request.
 	for _ in {1..10}; do
-		total_requests_container=$(kubectl exec $pod_name -c $container_name \
+		cpu_weight_container=$(kubectl exec $pod_name -c $container_name \
 			-- "${exec_weightsyspath_cmd[@]}")
-		if [[ -n "${total_requests_container}" ]]; then
+		if [[ -n "${cpu_weight_container}" ]]; then
 			break
 		fi
 		warn "Empty output from kubectl exec" >&2
 		sleep 1
 	done
-	info "total_requests_container = $total_requests_container"
+	info "cpu_weight_container = $cpu_weight_container"
 
-	[ "$total_requests_container" -eq "$total_requests" ]
+	[ "$cpu_weight_container" -eq "$cpu_weight_expected" ]
 
 	# Check the cpus inside the container
 	for _ in {1..10}; do
@@ -105,9 +107,11 @@ setup() {
 	done
 	read total_cpu_quota total_cpu_period <<< ${maxsyspath}
 
-	division_quota_period=$(echo $((total_cpu_quota/total_cpu_period)))
+	# A 500m limit is commonly 50000/100000. Compare in millicpus because
+	# integer division of quota / period would round this down to 0.
+	cpu_limit_millis_observed=$((total_cpu_quota * 1000 / total_cpu_period))
 
-	[ "$division_quota_period" -eq "$total_cpu_container" ]
+	[ "$cpu_limit_millis_observed" -eq "$cpu_limit_millis_expected" ]
 }
 
 teardown() {
