@@ -95,9 +95,11 @@ crio
 nerdctl
 dockershim
 dentries
+hexdump
 hypercalls
 inodes
 libelf-dev
+loopless
 memcg
 nydus
 patchset
