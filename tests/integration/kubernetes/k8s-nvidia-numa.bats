@@ -281,31 +281,13 @@ gpu_numa_skip_reason() {
 # be paired — a leaked drop-in would silently affect every subsequent pod
 # on the same node.
 
-# kata_runtime_config_dir echoes the per-shim runtime config directory
-# (the one that holds configuration-<shim>.toml and config.d/).  Handles
-# both the Go layout (.../runtimes/<shim>) and the runtime-rs layout
-# (.../runtime-rs/runtimes/<shim>) by probing the filesystem rather than
-# parsing the shim name (some Rust shims like `dragonball` lack the
-# `-runtime-rs` suffix).
-kata_runtime_config_dir() {
-    local base="/opt/kata/share/defaults/kata-containers"
-    local rs_dir="${base}/runtime-rs/runtimes/${KATA_HYPERVISOR}"
-    local go_dir="${base}/runtimes/${KATA_HYPERVISOR}"
-    if [[ -d "${rs_dir}" ]]; then
-        echo "${rs_dir}"
-    elif [[ -d "${go_dir}" ]]; then
-        echo "${go_dir}"
-    else
-        die "no Kata runtime config dir for ${KATA_HYPERVISOR} (looked in ${rs_dir} and ${go_dir})"
-    fi
-}
-
 # kata_hypervisor_section echoes the [hypervisor.X] header from the active
 # config so the drop-in fragment targets the right table.  Discovering it
 # at runtime keeps us hypervisor-agnostic (qemu / clh / firecracker / ...).
 kata_hypervisor_section() {
     local dir
-    dir=$(kata_runtime_config_dir)
+    dir=$(get_kata_runtime_config_dir "${node}") || \
+        die "no Kata runtime config dir for ${KATA_HYPERVISOR}"
     local cfg="${dir}/configuration-${KATA_HYPERVISOR}.toml"
     [[ -f "${cfg}" ]] || die "Kata config not found at ${cfg}"
     local section
@@ -322,7 +304,8 @@ kata_hypervisor_section() {
 patch_kata_numa_mapping() {
     local value="${1}"
     local dir section
-    dir=$(kata_runtime_config_dir)
+    dir=$(get_kata_runtime_config_dir "${node}") || \
+        die "no Kata runtime config dir for ${KATA_HYPERVISOR}"
     section=$(kata_hypervisor_section)
 
     KATA_NUMA_DROPIN_PATH="${dir}/config.d/99-numa-test.toml"

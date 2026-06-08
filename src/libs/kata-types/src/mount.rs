@@ -40,6 +40,9 @@ pub const DEFAULT_KATA_DIRECT_VOLUME_ROOT_PATH: &str = "/run/kata-containers/sha
 pub const KATA_VOLUME_OVERLAYFS_CREATE_DIR: &str =
     "io.katacontainers.volume.overlayfs.create_directory";
 
+/// Key to pass the filesystem type for a fresh block volume.
+pub const KATA_BLOCK_VOLUME_FS_TYPE: &str = "io.katacontainers.volume.block.filesystem_type";
+
 /// SANDBOX_BIND_MOUNTS_DIR is for sandbox bindmounts
 pub const SANDBOX_BIND_MOUNTS_DIR: &str = "sandbox-mounts";
 

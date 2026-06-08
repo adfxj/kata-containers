@@ -18,8 +18,10 @@ const (
 	mountInfoFileName = "mountInfo.json"
 
 	EncryptionKeyMetadataKey       = "encryptionKey"
+	FilesystemTypeMetadataKey      = "filesystemType"
 	FSGroupMetadataKey             = "fsGroup"
 	FSGroupChangePolicyMetadataKey = "fsGroupChangePolicy"
+	BlockVolumeFsTypeDriverKey     = "io.katacontainers.volume.block.filesystem_type"
 )
 
 // FSGroupChangePolicy holds policies that will be used for applying fsGroup to a volume.
