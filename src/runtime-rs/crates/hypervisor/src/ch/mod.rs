@@ -27,6 +27,7 @@ mod inner;
 mod inner_device;
 mod inner_hypervisor;
 mod utils;
+mod vmm_instance;
 
 use inner::CloudHypervisorInner;
 

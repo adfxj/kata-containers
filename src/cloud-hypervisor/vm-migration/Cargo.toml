@@ -1,0 +1,17 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "vm-migration"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+itertools = { workspace = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-atomic", "backend-mmap"] }
+
+[lints]
+workspace = true

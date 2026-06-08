@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2048,SC2086
+set -x
+
+# shellcheck source=/dev/null
+source "$HOME"/.cargo/env
+source "$(dirname "$0")"/test-util.sh
+
+WORKLOADS_DIR="$HOME/workloads"
+mkdir -p "$WORKLOADS_DIR"
+
+process_common_args "$@"
+
+migratable_version=v39.0
+# For now these values are default for kvm
+test_features=""
+
+if [ "$hypervisor" = "mshv" ]; then
+    test_features="--features mshv"
+fi
+
+# if migratable version is set to override the default
+if [ -n "${MIGRATABLE_VERSION}" ]; then
+    # validate the version if matched with vxx.0
+    if ! [[ "${MIGRATABLE_VERSION}" =~ ^v[0-9]{2,}\.[0-9]$ ]]; then
+        echo "MIGRATABLE_VERSION should be in format vxx.0, e.g. v47.0"
+        exit 1
+    fi
+    migratable_version=${MIGRATABLE_VERSION}
+fi
+
+cp scripts/sha1sums-x86_64* "$WORKLOADS_DIR"
+
+if [ ! -f "$WORKLOADS_DIR/hypervisor-fw" ]; then
+    download_hypervisor_fw
+fi
+
+if [ ! -f "$WORKLOADS_DIR/CLOUDHV.fd" ]; then
+    download_amd64_ovmf
+fi
+
+download_x86_guest_images
+
+JAMMY_OS_QCOW_ZLIB_FILE_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20241017-0-zlib.qcow2"
+JAMMY_OS_QCOW_ZLIB_FILE_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_QCOW_ZLIB_FILE_IMAGE_NAME"
+if [ ! -f "$JAMMY_OS_QCOW_ZLIB_FILE_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    time qemu-img convert -c -f raw -O qcow2 -o compression_type=zlib \
+        "$JAMMY_OS_RAW_IMAGE" $JAMMY_OS_QCOW_ZLIB_FILE_IMAGE_NAME
+    popd || exit
+fi
+
+JAMMY_OS_QCOW_ZSTD_FILE_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20241017-0-zstd.qcow2"
+JAMMY_OS_QCOW_ZSTD_FILE_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_QCOW_ZSTD_FILE_IMAGE_NAME"
+if [ ! -f "$JAMMY_OS_QCOW_ZSTD_FILE_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    time qemu-img convert -c -f raw -O qcow2 -o compression_type=zstd \
+        "$JAMMY_OS_RAW_IMAGE" $JAMMY_OS_QCOW_ZSTD_FILE_IMAGE_NAME
+    popd || exit
+fi
+
+JAMMY_OS_QCOW_BACKING_ZSTD_FILE_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20241017-0-backing-zstd.qcow2"
+JAMMY_OS_QCOW_BACKING_ZSTD_FILE_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_QCOW_BACKING_ZSTD_FILE_IMAGE_NAME"
+if [ ! -f "$JAMMY_OS_QCOW_BACKING_ZSTD_FILE_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    time qemu-img create -f qcow2 \
+        -b "$JAMMY_OS_QCOW_ZSTD_FILE_IMAGE" \
+        -F qcow2 $JAMMY_OS_QCOW_BACKING_ZSTD_FILE_IMAGE_NAME
+    popd || exit
+fi
+
+JAMMY_OS_QCOW_BACKING_UNCOMPRESSED_FILE_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20241017-0-backing-uncompressed.qcow2"
+JAMMY_OS_QCOW_BACKING_UNCOMPRESSED_FILE_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_QCOW_BACKING_UNCOMPRESSED_FILE_IMAGE_NAME"
+if [ ! -f "$JAMMY_OS_QCOW_BACKING_UNCOMPRESSED_FILE_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    time qemu-img create -f qcow2 \
+        -b "$JAMMY_OS_IMAGE" \
+        -F qcow2 $JAMMY_OS_QCOW_BACKING_UNCOMPRESSED_FILE_IMAGE_NAME
+    popd || exit
+fi
+
+JAMMY_OS_QCOW_BACKING_RAW_FILE_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20241017-0-backing-raw.qcow2"
+JAMMY_OS_QCOW_BACKING_RAW_FILE_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_QCOW_BACKING_RAW_FILE_IMAGE_NAME"
+if [ ! -f "$JAMMY_OS_QCOW_BACKING_RAW_FILE_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    time qemu-img create -f qcow2 \
+        -b "$JAMMY_OS_RAW_IMAGE" \
+        -F raw $JAMMY_OS_QCOW_BACKING_RAW_FILE_IMAGE_NAME
+    popd || exit
+fi
+
+ALPINE_MINIROOTFS_URL="http://dl-cdn.alpinelinux.org/alpine/v3.11/releases/x86_64/alpine-minirootfs-3.11.3-x86_64.tar.gz"
+ALPINE_MINIROOTFS_TARBALL="$WORKLOADS_DIR/alpine-minirootfs-x86_64.tar.gz"
+if [ ! -f "$ALPINE_MINIROOTFS_TARBALL" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    time wget --quiet $ALPINE_MINIROOTFS_URL -O "$ALPINE_MINIROOTFS_TARBALL" || exit 1
+    popd || exit
+fi
+
+ALPINE_INITRAMFS_IMAGE="$WORKLOADS_DIR/alpine_initramfs.img"
+if [ ! -f "$ALPINE_INITRAMFS_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    mkdir alpine-minirootfs
+    tar xf "$ALPINE_MINIROOTFS_TARBALL" -C alpine-minirootfs
+    cat >alpine-minirootfs/init <<-EOF
+		#! /bin/sh
+		mount -t devtmpfs dev /dev
+		echo \$TEST_STRING > /dev/console
+		poweroff -f
+	EOF
+    chmod +x alpine-minirootfs/init
+    cd alpine-minirootfs || exit
+    find . -print0 |
+        cpio --null --create --verbose --owner root:root --format=newc >"$ALPINE_INITRAMFS_IMAGE"
+    popd || exit
+fi
+
+pushd "$WORKLOADS_DIR" || exit
+# Skip checksum verification for custom-provided workloads
+sha1_exclude=""
+[ -n "$CH_CUSTOM_FIRMWARE" ] && sha1_exclude="${sha1_exclude}|hypervisor-fw"
+[ -n "$CH_CUSTOM_OVMF" ] && sha1_exclude="${sha1_exclude}|CLOUDHV\\.fd"
+sha1_exclude="${sha1_exclude#|}"
+if [ -n "$sha1_exclude" ]; then
+    if ! cat sha1sums-x86_64 sha1sums-x86_64-common | grep -Ev "$sha1_exclude" | sha1sum --check; then
+        echo "sha1sum validation of images failed, remove invalid images to fix the issue."
+        exit 1
+    fi
+else
+    if ! sha1sum sha1sums-x86_64 sha1sums-x86_64-common --check; then
+        echo "sha1sum validation of images failed, remove invalid images to fix the issue."
+        exit 1
+    fi
+fi
+popd || exit
+
+# Download Cloud Hypervisor binary from its last stable release for live-upgrade tests
+CH_RELEASE_URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${migratable_version}/cloud-hypervisor-static"
+CH_RELEASE_NAME="cloud-hypervisor-static"
+pushd "$WORKLOADS_DIR" || exit
+time wget --quiet $CH_RELEASE_URL -O "$CH_RELEASE_NAME" || exit 1
+chmod +x $CH_RELEASE_NAME
+popd || exit
+
+# Build custom kernel based on virtio-pmem and virtio-fs upstream patches
+VMLINUX_IMAGE="$WORKLOADS_DIR/vmlinux-x86_64"
+if [ ! -f "$VMLINUX_IMAGE" ]; then
+    # Prepare linux image (build from source or download pre-built)
+    prepare_linux
+fi
+
+VIRTIOFSD="$WORKLOADS_DIR/virtiofsd"
+VIRTIOFSD_DIR="virtiofsd_build"
+if [ ! -f "$VIRTIOFSD" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    git clone "https://gitlab.com/virtio-fs/virtiofsd.git" $VIRTIOFSD_DIR
+    pushd $VIRTIOFSD_DIR || exit
+    git checkout 0f5865629dc995a3e9d5a73b4eb45bb91740bccb
+    time cargo build --release
+    cp target/release/virtiofsd "$VIRTIOFSD" || exit 1
+    popd || exit
+    rm -rf $VIRTIOFSD_DIR
+    popd || exit
+fi
+
+BLK_IMAGE="$WORKLOADS_DIR/blk.img"
+MNT_DIR="mount_image"
+if [ ! -f "$BLK_IMAGE" ]; then
+    pushd "$WORKLOADS_DIR" || exit
+    fallocate -l 16M "$BLK_IMAGE"
+    mkfs.ext4 -j "$BLK_IMAGE"
+    mkdir $MNT_DIR
+    sudo mount -t ext4 "$BLK_IMAGE" $MNT_DIR
+    sudo bash -c "echo bar > $MNT_DIR/foo" || exit 1
+    sudo umount "$BLK_IMAGE"
+    rm -r $MNT_DIR
+    popd || exit
+fi
+
+SHARED_DIR="$WORKLOADS_DIR/shared_dir"
+if [ ! -d "$SHARED_DIR" ]; then
+    mkdir -p "$SHARED_DIR"
+    echo "foo" >"$SHARED_DIR/file1"
+    echo "bar" >"$SHARED_DIR/file3" || exit 1
+fi
+
+VFIO_DIR="$WORKLOADS_DIR/vfio"
+VFIO_DISK_IMAGE="$WORKLOADS_DIR/vfio.img"
+rm -rf "$VFIO_DIR" "$VFIO_DISK_IMAGE"
+mkdir -p "$VFIO_DIR"
+cp "$JAMMY_OS_RAW_IMAGE" "$VFIO_DIR"
+cp "$FW" "$VFIO_DIR"
+cp "$VMLINUX_IMAGE" "$VFIO_DIR" || exit 1
+
+cargo build --features mshv --all --release --target "$BUILD_TARGET"
+
+# We always copy a fresh version of our binary for our L2 guest.
+cp target/"$BUILD_TARGET"/release/cloud-hypervisor "$VFIO_DIR"
+cp target/"$BUILD_TARGET"/release/ch-remote "$VFIO_DIR"
+
+# Enable KSM with some reasonable parameters so that it won't take too long
+# for the memory to be merged between two processes.
+sudo bash -c "echo 1000000 > /sys/kernel/mm/ksm/pages_to_scan"
+sudo bash -c "echo 10 > /sys/kernel/mm/ksm/sleep_millisecs"
+sudo bash -c "echo 1 > /sys/kernel/mm/ksm/run"
+
+# Both test_vfio, ovs-dpdk and vDPA tests rely on hugepages
+HUGEPAGESIZE=$(grep Hugepagesize /proc/meminfo | awk '{print $2}')
+PAGE_NUM=$((6144 * 1024 / HUGEPAGESIZE))
+echo "$PAGE_NUM" | sudo tee /proc/sys/vm/nr_hugepages
+sudo chmod a+rwX /dev/hugepages
+
+# Update max locked memory to 'unlimited' to avoid issues with vDPA
+ulimit -l unlimited
+
+# Set number of open descriptors high enough for VFIO tests to run
+ulimit -n 4096
+
+# Common configuration for every test run
+export RUST_BACKTRACE=1
+export RUSTFLAGS="$RUSTFLAGS"
+
+TEST_THREADS_DEFAULT="$(($(nproc) / 4))"
+if ! [[ "${PARALLEL_INTEGRATION_TESTS_NUM:-}" =~ ^[1-9][0-9]*$ ]]; then
+    PARALLEL_INTEGRATION_TESTS_NUM="${TEST_THREADS_DEFAULT}"
+fi
+echo "nproc:$(nproc), parallel_integration_tests:${PARALLEL_INTEGRATION_TESTS_NUM}"
+time cargo nextest run -p cloud-hypervisor $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads="${PARALLEL_INTEGRATION_TESTS_NUM}" "common_parallel::$test_filter" -- ${test_binary_args[*]}
+RES=$?
+
+# Run some tests in sequence since the result could be affected by other tests
+# running in parallel.
+if [ $RES -eq 0 ]; then
+    cargo nextest run -p cloud-hypervisor $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads=1 "common_sequential::$test_filter" -- ${test_binary_args[*]}
+    RES=$?
+fi
+
+# Run tests on dbus_api
+if [ $RES -eq 0 ]; then
+    cargo build --features "mshv,dbus_api" --all --release --target "$BUILD_TARGET"
+    # integration tests now do not reply on build feature "dbus_api"
+    time cargo nextest run -p cloud-hypervisor $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads="$TEST_THREADS_DEFAULT" "dbus_api::$test_filter" -- ${test_binary_args[*]}
+    RES=$?
+fi
+
+# Run tests on fw_cfg
+if [ $RES -eq 0 ]; then
+    cargo build --features "mshv,fw_cfg" --all --release --target "$BUILD_TARGET"
+    time cargo nextest run -p cloud-hypervisor $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads="$TEST_THREADS_DEFAULT" "fw_cfg::$test_filter" -- ${test_binary_args[*]}
+    RES=$?
+fi
+
+if [ $RES -eq 0 ]; then
+    cargo build --features "mshv,ivshmem" --all --release --target "$BUILD_TARGET"
+    time cargo nextest run -p cloud-hypervisor $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads="$TEST_THREADS_DEFAULT" "ivshmem::$test_filter" -- ${test_binary_args[*]}
+    RES=$?
+fi
+
+exit $RES

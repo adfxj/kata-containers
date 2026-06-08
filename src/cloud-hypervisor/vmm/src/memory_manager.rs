@@ -1,0 +1,4098 @@
+// Copyright © 2019 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read as _, Seek, SeekFrom, Write};
+use std::ops::{BitAnd, Not, Sub};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Barrier, Mutex};
+use std::{ffi, result, thread};
+
+use acpi_tables::{Aml, aml};
+use anyhow::anyhow;
+use arch::RegionType;
+#[cfg(target_arch = "x86_64")]
+use devices::ioapic;
+#[cfg(target_arch = "aarch64")]
+use hypervisor::HypervisorVmError;
+use libc::_SC_NPROCESSORS_ONLN;
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracer::trace_scoped;
+use virtio_devices::BlocksState;
+#[cfg(target_arch = "x86_64")]
+use vm_allocator::GsiApic;
+use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
+use vm_device::BusDevice;
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::guest_memory::{Error as MmapError, FileOffset};
+use vm_memory::mmap::MmapRegionError;
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion,
+};
+use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
+use vm_migration::{
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
+    UffdError,
+};
+use vmm_sys_util::eventfd::EventFd;
+
+use crate::config::MemoryRestoreMode;
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use crate::coredump::{
+    CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
+};
+use crate::migration::{recv_vm_dirty_log, url_to_path};
+use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
+use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, uffd};
+
+/// Find the next populated (data) extent in `[cursor, end)` of `fd`,
+/// driven by `lseek(SEEK_DATA)` / `lseek(SEEK_HOLE)`. Returns
+/// `Ok(Some((offset, len)))` for the next data extent within the window,
+/// or `Ok(None)` if there is no more data. Returns `Err` if the fd or
+/// filesystem does not support `SEEK_HOLE` (e.g. hugetlbfs) or for any
+/// other I/O error. Callers should treat a first-call error as "fall
+/// back to the dense path".
+fn next_data_extent(fd: BorrowedFd<'_>, cursor: u64, end: u64) -> io::Result<Option<(u64, u64)>> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: BorrowedFd guarantees the fd is valid for the lifetime of
+    // the borrow; lseek does not consume or close it.
+    let data_off = unsafe { libc::lseek(raw, cursor as i64, libc::SEEK_DATA) };
+    if data_off < 0 {
+        let e = io::Error::last_os_error();
+        // ENXIO from SEEK_DATA means there is no more data at or after
+        // cursor. Any other error means the filesystem does not support
+        // SEEK_HOLE; the caller falls back to the dense path.
+        return if e.raw_os_error() == Some(libc::ENXIO) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    let data_off = data_off as u64;
+    if data_off >= end {
+        return Ok(None);
+    }
+    // SAFETY: same as above.
+    let hole_off = unsafe { libc::lseek(raw, data_off as i64, libc::SEEK_HOLE) };
+    if hole_off < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let hole_off = (hole_off as u64).min(end);
+    Ok(Some((data_off, hole_off - data_off)))
+}
+
+struct UffdHandler {
+    stop_event: EventFd,
+    result_rx: Receiver<Result<(), io::Error>>,
+    handle: thread::JoinHandle<()>,
+}
+
+struct UffdRange {
+    host_addr: u64,
+    length: u64,
+    file_offset: u64,
+    page_size: u64,
+    file_index: usize,
+}
+
+pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
+
+const DEFAULT_MEMORY_ZONE: &str = "mem0";
+
+const SNAPSHOT_FILENAME: &str = "memory-ranges";
+
+const SNAPSHOT_FILENUM: u64 = 16;
+
+const DIRTY_LOG_FILENAME: &str = "dirty-log.json";
+
+#[cfg(target_arch = "x86_64")]
+const X86_64_IRQ_BASE: u32 = 5;
+
+const HOTPLUG_COUNT: usize = 8;
+
+// Memory policy constants
+const MPOL_BIND: u32 = 2;
+const MPOL_MF_STRICT: u32 = 1;
+const MPOL_MF_MOVE: u32 = 1 << 1;
+
+// Reserve 1 MiB for platform MMIO devices (e.g. ACPI control devices)
+const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
+
+const MAX_PREFAULT_THREAD_COUNT: usize = 16;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct HotPlugState {
+    base: u64,
+    length: u64,
+    active: bool,
+    inserting: bool,
+    removing: bool,
+}
+
+pub struct VirtioMemZone {
+    region: Arc<GuestRegionMmap>,
+    virtio_device: Option<Arc<Mutex<virtio_devices::Mem>>>,
+    hotplugged_size: u64,
+    hugepages: bool,
+    blocks_state: Arc<Mutex<BlocksState>>,
+}
+
+impl VirtioMemZone {
+    pub fn region(&self) -> &Arc<GuestRegionMmap> {
+        &self.region
+    }
+    pub fn set_virtio_device(&mut self, virtio_device: Arc<Mutex<virtio_devices::Mem>>) {
+        self.virtio_device = Some(virtio_device);
+    }
+    pub fn hotplugged_size(&self) -> u64 {
+        self.hotplugged_size
+    }
+    pub fn hugepages(&self) -> bool {
+        self.hugepages
+    }
+    pub fn blocks_state(&self) -> &Arc<Mutex<BlocksState>> {
+        &self.blocks_state
+    }
+    pub fn plugged_ranges(&self) -> MemoryRangeTable {
+        self.blocks_state
+            .lock()
+            .unwrap()
+            .memory_ranges(self.region.start_addr().raw_value(), true)
+    }
+}
+
+pub struct MemoryZone {
+    regions: Vec<Arc<GuestRegionMmap>>,
+    virtio_mem_zone: Option<VirtioMemZone>,
+    shared: bool,
+    hugepages: bool,
+    backing_page_size: u64,
+    mergeable: bool,
+}
+
+impl MemoryZone {
+    fn new(shared: bool, hugepages: bool, backing_page_size: u64, mergeable: bool) -> Self {
+        Self {
+            regions: Vec::new(),
+            virtio_mem_zone: None,
+            shared,
+            hugepages,
+            backing_page_size,
+            mergeable,
+        }
+    }
+
+    pub fn regions(&self) -> &Vec<Arc<GuestRegionMmap>> {
+        &self.regions
+    }
+    pub fn virtio_mem_zone(&self) -> &Option<VirtioMemZone> {
+        &self.virtio_mem_zone
+    }
+    pub fn virtio_mem_zone_mut(&mut self) -> Option<&mut VirtioMemZone> {
+        self.virtio_mem_zone.as_mut()
+    }
+
+    fn backing_page_size_for_gpa(&self, gpa: u64) -> Option<u64> {
+        if self.regions.iter().any(|region| {
+            let start = region.start_addr().raw_value();
+            gpa >= start && gpa < start + region.len()
+        }) {
+            return Some(self.backing_page_size);
+        }
+
+        self.virtio_mem_zone.as_ref().and_then(|virtio_mem_zone| {
+            let start = virtio_mem_zone.region.start_addr().raw_value();
+            (gpa >= start && gpa < start + virtio_mem_zone.region.len())
+                .then_some(self.backing_page_size)
+        })
+    }
+}
+
+pub type MemoryZones = HashMap<String, MemoryZone>;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GuestRamMapping {
+    slot: u32,
+    gpa: u64,
+    size: u64,
+    zone_id: String,
+    virtio_mem: bool,
+    file_offset: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ArchMemRegion {
+    base: u64,
+    size: usize,
+    r_type: RegionType,
+}
+
+pub struct MemoryManager {
+    boot_guest_memory: GuestMemoryMmap,
+    guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    next_memory_slot: Arc<AtomicU32>,
+    memory_slot_free_list: Arc<Mutex<Vec<u32>>>,
+    start_of_device_area: GuestAddress,
+    end_of_device_area: GuestAddress,
+    end_of_ram_area: GuestAddress,
+    pub vm: Arc<dyn hypervisor::Vm>,
+    hotplug_slots: Vec<HotPlugState>,
+    selected_slot: usize,
+    mergeable: bool,
+    allocator: Arc<Mutex<SystemAllocator>>,
+    hotplug_method: HotplugMethod,
+    boot_ram: u64,
+    current_ram: u64,
+    next_hotplug_slot: usize,
+    shared: bool,
+    hugepages: bool,
+    hugepage_size: Option<u64>,
+    prefault: bool,
+    thp: bool,
+    user_provided_zones: bool,
+    snapshot_memory_ranges: MemoryRangeTable,
+    memory_zones: MemoryZones,
+    log_dirty: bool, // Enable dirty logging for created RAM regions
+    arch_mem_regions: Vec<ArchMemRegion>,
+    ram_allocator: AddressAllocator,
+    dynamic: bool,
+    dirty_log: bool,
+
+    // Keep track of calls to create_userspace_mapping() for guest RAM.
+    // This is useful for getting the dirty pages as we need to know the
+    // slots that the mapping is created in.
+    guest_ram_mappings: Vec<GuestRamMapping>,
+    uffd_handler: Option<UffdHandler>,
+
+    pub acpi_address: Option<GuestAddress>,
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    /// Failed to create shared file.
+    #[error("Failed to create shared file")]
+    SharedFileCreate(#[source] io::Error),
+
+    /// Failed to set shared file length.
+    #[error("Failed to set shared file length")]
+    SharedFileSetLen(#[source] io::Error),
+
+    /// Mmap backed guest memory error
+    #[error("Mmap backed guest memory error")]
+    GuestMemory(#[source] MmapError),
+
+    /// Guest region collection error
+    #[error("Guest region collection error")]
+    GuestRegionCollection(#[source] vm_memory::GuestRegionCollectionError),
+
+    /// Failed to allocate a memory range.
+    #[error("Failed to allocate a memory range")]
+    MemoryRangeAllocation,
+
+    /// Error from region creation
+    #[error("Error from region creation")]
+    GuestMemoryRegion(#[source] MmapRegionError),
+
+    /// No ACPI slot available
+    #[error("No ACPI slot available")]
+    NoSlotAvailable,
+
+    /// Not enough space in the hotplug RAM region
+    #[error("Not enough space in the hotplug RAM region")]
+    InsufficientHotplugRam,
+
+    /// The requested hotplug memory addition is not a valid size
+    #[error("The requested hotplug memory addition is not a valid size")]
+    InvalidSize,
+
+    /// Failed to create the user memory region.
+    #[error("Failed to create the user memory region")]
+    CreateUserMemoryRegion(#[source] hypervisor::HypervisorVmError),
+
+    /// Failed to remove the user memory region.
+    #[error("Failed to remove the user memory region")]
+    RemoveUserMemoryRegion(#[source] hypervisor::HypervisorVmError),
+
+    /// Failed to EventFd.
+    #[error("Failed to EventFd")]
+    EventFdFail(#[source] io::Error),
+
+    /// Eventfd write error
+    #[error("Eventfd write error")]
+    EventfdError(#[source] io::Error),
+
+    /// Failed to virtio-mem resize
+    #[error("Failed to virtio-mem resize")]
+    VirtioMemResizeFail(#[source] virtio_devices::mem::Error),
+
+    /// Cannot enable dirty log.
+    #[error("Cannot enable dirty log")]
+    Dirtylog(#[source] MigratableError),
+
+    /// Cannot restore VM
+    #[error("Cannot restore VM")]
+    Restore(#[source] MigratableError),
+
+    /// Cannot restore VM because source URL is missing
+    #[error("Cannot restore VM because source URL is missing")]
+    RestoreMissingSourceUrl,
+
+    /// Cannot create the system allocator
+    #[error("Cannot create the system allocator")]
+    CreateSystemAllocator,
+
+    /// Failed creating a new MmapRegion instance.
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed creating a new MmapRegion instance")]
+    NewMmapRegion(#[source] vm_memory::mmap::MmapRegionError),
+
+    /// No memory zones found.
+    #[error("No memory zones found")]
+    MissingMemoryZones,
+
+    /// Memory configuration is not valid.
+    #[error("Memory configuration is not valid")]
+    InvalidMemoryParameters,
+
+    /// Forbidden operation. Impossible to resize guest memory if it is
+    /// backed by user defined memory regions.
+    #[error("Impossible to resize guest memory if it is backed by user defined memory regions")]
+    InvalidResizeWithMemoryZones,
+
+    /// It's invalid to try applying a NUMA policy to a memory zone that is
+    /// memory mapped with MAP_SHARED.
+    #[error(
+        "Invalid to try applying a NUMA policy to a memory zone that is memory mapped with MAP_SHARED"
+    )]
+    InvalidSharedMemoryZoneWithHostNuma,
+
+    /// Failed applying NUMA memory policy.
+    #[error("Failed applying NUMA memory policy")]
+    ApplyNumaPolicy(#[source] io::Error),
+
+    /// Memory zone identifier is not unique.
+    #[error("Memory zone identifier is not unique")]
+    DuplicateZoneId,
+
+    /// No virtio-mem resizing handler found.
+    #[error("No virtio-mem resizing handler found")]
+    MissingVirtioMemHandler,
+
+    /// Unknown memory zone.
+    #[error("Unknown memory zone")]
+    UnknownMemoryZone,
+
+    /// Invalid size for resizing. Can be anything except 0.
+    #[error("Invalid size for resizing. Can be anything except 0")]
+    InvalidHotplugSize,
+
+    /// Invalid hotplug method associated with memory zones resizing capability.
+    #[error("Invalid hotplug method associated with memory zones resizing capability")]
+    InvalidHotplugMethodWithMemoryZones,
+
+    /// Could not find specified memory zone identifier from hash map.
+    #[error("Could not find specified memory zone identifier from hash map")]
+    MissingZoneIdentifier,
+
+    /// Resizing the memory zone failed.
+    #[error("Resizing the memory zone failed")]
+    ResizeZone,
+
+    /// Guest address overflow
+    #[error("Guest address overflow")]
+    GuestAddressOverFlow,
+
+    /// Error opening snapshot file
+    #[error("Error opening snapshot file")]
+    SnapshotOpen(#[source] io::Error),
+
+    /// Error reading from snapshot file
+    #[error("Error reading from snapshot file")]
+    SnapshotRead(#[source] io::Error),
+
+     /// Error seek memory file
+     #[error("Error seek memory file")]
+    SeekMemoryFile(#[source] anyhow::Error),
+
+    // Error copying snapshot into region
+    #[error("Error copying snapshot into region")]
+    SnapshotCopy(#[source] GuestMemoryError),
+
+    // Error duplicating snapshot
+    #[error("Error duplicating snapshot")]
+    SnapshotDup(#[source] io::Error),
+
+    /// Failed to allocate MMIO address
+    #[error("Failed to allocate MMIO address")]
+    AllocateMmioAddress,
+
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to create UEFI flash
+    #[error("Failed to create UEFI flash")]
+    CreateUefiFlash(#[source] HypervisorVmError),
+
+    /// Using a directory as a backing file for memory is not supported
+    #[error("Using a directory as a backing file for memory is not supported")]
+    DirectoryAsBackingFileForMemory,
+
+    /// Failed to stat filesystem
+    #[error("Failed to stat filesystem")]
+    GetFileSystemBlockSize(#[source] io::Error),
+
+    /// Memory size is misaligned with default page size or its hugepage size
+    #[error("Memory size is misaligned with default page size or its hugepage size")]
+    MisalignedMemorySize,
+}
+
+impl From<UffdError> for Error {
+    fn from(e: UffdError) -> Self {
+        Error::Restore(MigratableError::OnDemandRestore(e))
+    }
+}
+
+const ENABLE_FLAG: usize = 0;
+const INSERTING_FLAG: usize = 1;
+const REMOVING_FLAG: usize = 2;
+const EJECT_FLAG: usize = 3;
+
+const BASE_OFFSET_LOW: u64 = 0;
+const BASE_OFFSET_HIGH: u64 = 0x4;
+const LENGTH_OFFSET_LOW: u64 = 0x8;
+const LENGTH_OFFSET_HIGH: u64 = 0xC;
+const STATUS_OFFSET: u64 = 0x14;
+const SELECTION_OFFSET: u64 = 0;
+
+// The MMIO address space size is subtracted with 64k. This is done for the
+// following reasons:
+//  - Reduce the addressable space size by at least 4k to workaround a Linux
+//    bug when the VMM allocates devices at the end of the addressable space
+//  - Windows requires the addressable space size to be 64k aligned
+fn mmio_address_space_size(phys_bits: u8) -> u64 {
+    (1 << phys_bits) - (1 << 16)
+}
+
+// The `statfs` function can get information of hugetlbfs, and the hugepage size is in the
+// `f_bsize` field.
+//
+// See: https://github.com/torvalds/linux/blob/v6.3/fs/hugetlbfs/inode.c#L1169
+fn statfs_get_bsize(path: &str) -> Result<u64, Error> {
+    let path = std::ffi::CString::new(path).map_err(|_| Error::InvalidMemoryParameters)?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+
+    // SAFETY: FFI call with a valid path and buffer
+    let ret = unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) };
+    if ret != 0 {
+        return Err(Error::GetFileSystemBlockSize(
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    // SAFETY: `buf` is valid at this point
+    // Because this value is always positive, just convert it directly.
+    // Note that the `f_bsize` is `i64` in glibc and `u64` in musl, using `as u64` will be warned
+    // by `clippy` on musl target.  To avoid the warning, there should be `as _` instead of
+    // `as u64`.
+    let bsize = unsafe { (*buf.as_ptr()).f_bsize } as _;
+    Ok(bsize)
+}
+
+fn memory_zone_get_align_size(zone: &MemoryZoneConfig) -> Result<u64, Error> {
+    // SAFETY: FFI call. Trivially safe.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+
+    // There is no backend file and the `hugepages` is disabled, just use system page size.
+    if zone.file.is_none() && !zone.hugepages {
+        return Ok(page_size);
+    }
+
+    // The `hugepages` is enabled and the `hugepage_size` is specified, just use it directly.
+    if let Some(hugepage_size) = zone.hugepage_size
+        && zone.hugepages
+    {
+        return Ok(hugepage_size);
+    }
+
+    // There are two scenarios here:
+    //  - `hugepages` is enabled but `hugepage_size` is not specified:
+    //     Call `statfs` for `/dev/hugepages` for getting the default size of hugepage
+    //  - The backing file is specified:
+    //     Call `statfs` for the file and get its `f_bsize`.  If the value is larger than the page
+    //     size of normal page, just use the `f_bsize` because the file is in a hugetlbfs.  If the
+    //     value is less than or equal to the page size, just use the page size.
+    let path = zone.file.as_ref().map_or(Ok("/dev/hugepages"), |pathbuf| {
+        pathbuf.to_str().ok_or(Error::InvalidMemoryParameters)
+    })?;
+
+    let align_size = std::cmp::max(page_size, statfs_get_bsize(path)?);
+
+    Ok(align_size)
+}
+
+#[inline]
+fn align_down<T>(val: T, align: T) -> T
+where
+    T: BitAnd<Output = T> + Not<Output = T> + Sub<Output = T> + From<u8>,
+{
+    val & !(align - 1u8.into())
+}
+
+#[inline]
+fn is_aligned<T>(val: T, align: T) -> bool
+where
+    T: BitAnd<Output = T> + Sub<Output = T> + From<u8> + PartialEq,
+{
+    (val & (align - 1u8.into())) == 0u8.into()
+}
+
+impl BusDevice for MemoryManager {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+        if self.selected_slot < self.hotplug_slots.len() {
+            let state = &self.hotplug_slots[self.selected_slot];
+            match offset {
+                BASE_OFFSET_LOW => {
+                    data.copy_from_slice(&state.base.to_le_bytes()[..4]);
+                }
+                BASE_OFFSET_HIGH => {
+                    data.copy_from_slice(&state.base.to_le_bytes()[4..]);
+                }
+                LENGTH_OFFSET_LOW => {
+                    data.copy_from_slice(&state.length.to_le_bytes()[..4]);
+                }
+                LENGTH_OFFSET_HIGH => {
+                    data.copy_from_slice(&state.length.to_le_bytes()[4..]);
+                }
+                STATUS_OFFSET => {
+                    // The Linux kernel, quite reasonably, doesn't zero the memory it gives us.
+                    data.fill(0);
+                    if state.active {
+                        data[0] |= 1 << ENABLE_FLAG;
+                    }
+                    if state.inserting {
+                        data[0] |= 1 << INSERTING_FLAG;
+                    }
+                    if state.removing {
+                        data[0] |= 1 << REMOVING_FLAG;
+                    }
+                }
+                _ => {
+                    warn!("Unexpected offset for accessing memory manager device: {offset:#}");
+                }
+            }
+        } else {
+            warn!("Out of range memory slot: {}", self.selected_slot);
+        }
+    }
+
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        match offset {
+            SELECTION_OFFSET => {
+                self.selected_slot = usize::from(data[0]);
+            }
+            STATUS_OFFSET => {
+                if self.selected_slot < self.hotplug_slots.len() {
+                    let state = &mut self.hotplug_slots[self.selected_slot];
+                    // The ACPI code writes back a 1 to acknowledge the insertion
+                    if (data[0] & (1 << INSERTING_FLAG) == 1 << INSERTING_FLAG) && state.inserting {
+                        state.inserting = false;
+                    }
+                    // Ditto for removal
+                    if (data[0] & (1 << REMOVING_FLAG) == 1 << REMOVING_FLAG) && state.removing {
+                        state.removing = false;
+                    }
+                    // Trigger removal of "DIMM"
+                    if data[0] & (1 << EJECT_FLAG) == 1 << EJECT_FLAG {
+                        warn!("Ejection of memory not currently supported");
+                    }
+                } else {
+                    warn!("Out of range memory slot: {}", self.selected_slot);
+                }
+            }
+            _ => {
+                warn!("Unexpected offset for accessing memory manager device: {offset:#}");
+            }
+        }
+        None
+    }
+}
+
+impl MemoryManager {
+    /// Creates all memory regions based on the available RAM ranges defined
+    /// by `ram_regions`, and based on the description of the memory zones.
+    /// In practice, this function can perform multiple memory mappings of the
+    /// same backing file if there's a hole in the address space between two
+    /// RAM ranges.
+    ///
+    /// One example might be ram_regions containing 2 regions (0-3G and 4G-6G)
+    /// and zones containing two zones (size 1G and size 4G).
+    ///
+    /// This function will create 3 resulting memory regions:
+    /// - First one mapping entirely the first memory zone on 0-1G range
+    /// - Second one mapping partially the second memory zone on 1G-3G range
+    /// - Third one mapping partially the second memory zone on 4G-6G range
+    ///
+    /// Also, all memory regions are page-size aligned (e.g. their sizes must
+    /// be multiple of page-size), which may leave an additional hole in the
+    /// address space when hugepage is used.
+    fn create_memory_regions_from_zones(
+        ram_regions: &[(GuestAddress, usize)],
+        zones: &[MemoryZoneConfig],
+        prefault: Option<bool>,
+        thp: bool,
+    ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
+        let mut zone_iter = zones.iter();
+        let mut mem_regions = Vec::new();
+        let mut zone = zone_iter.next().ok_or(Error::MissingMemoryZones)?;
+        let mut zone_align_size = memory_zone_get_align_size(zone)?;
+        let mut zone_offset = 0u64;
+        let mut memory_zones = HashMap::new();
+
+        if !is_aligned(zone.size, zone_align_size) {
+            return Err(Error::MisalignedMemorySize);
+        }
+
+        // Add zone id to the list of memory zones.
+        memory_zones.insert(
+            zone.id.clone(),
+            MemoryZone::new(zone.shared, zone.hugepages, zone_align_size, zone.mergeable),
+        );
+
+        for ram_region in ram_regions.iter() {
+            let mut ram_region_offset = 0;
+            let mut exit = false;
+
+            loop {
+                let mut ram_region_consumed = false;
+                let mut pull_next_zone = false;
+
+                let ram_region_available_size =
+                    align_down(ram_region.1 as u64 - ram_region_offset, zone_align_size);
+                if ram_region_available_size == 0 {
+                    break;
+                }
+                let zone_sub_size = zone.size - zone_offset;
+
+                let file_offset = zone_offset;
+                let region_start = ram_region
+                    .0
+                    .checked_add(ram_region_offset)
+                    .ok_or(Error::GuestAddressOverFlow)?;
+                let region_size = if zone_sub_size <= ram_region_available_size {
+                    if zone_sub_size == ram_region_available_size {
+                        ram_region_consumed = true;
+                    }
+
+                    ram_region_offset += zone_sub_size;
+                    pull_next_zone = true;
+
+                    zone_sub_size
+                } else {
+                    zone_offset += ram_region_available_size;
+                    ram_region_consumed = true;
+
+                    ram_region_available_size
+                };
+
+                info!(
+                    "create ram region for zone {}, region_start: {:#x}, region_size: {:#x}",
+                    zone.id,
+                    region_start.raw_value(),
+                    region_size
+                );
+                let region = MemoryManager::create_ram_region(
+                    &zone.file,
+                    file_offset,
+                    region_start,
+                    region_size as usize,
+                    prefault.unwrap_or(zone.prefault),
+                    zone.shared,
+                    zone.hugepages,
+                    zone.hugepage_size,
+                    zone.host_numa_node,
+                    None,
+                    None,
+                    0,
+                    thp,
+                )?;
+
+                // Add region to the list of regions associated with the
+                // current memory zone.
+                if let Some(memory_zone) = memory_zones.get_mut(&zone.id) {
+                    memory_zone.regions.push(region.clone());
+                }
+
+                mem_regions.push(region);
+
+                if pull_next_zone {
+                    // Get the next zone and reset the offset.
+                    zone_offset = 0;
+                    if let Some(z) = zone_iter.next() {
+                        zone = z;
+                    } else {
+                        exit = true;
+                        break;
+                    }
+                    zone_align_size = memory_zone_get_align_size(zone)?;
+                    if !is_aligned(zone.size, zone_align_size) {
+                        return Err(Error::MisalignedMemorySize);
+                    }
+
+                    // Check if zone id already exist. In case it does, throw
+                    // an error as we need unique identifiers. Otherwise, add
+                    // the new zone id to the list of memory zones.
+                    if memory_zones.contains_key(&zone.id) {
+                        error!(
+                            "Memory zone identifier '{}' found more than once. \
+                            It must be unique",
+                            zone.id,
+                        );
+                        return Err(Error::DuplicateZoneId);
+                    }
+                    memory_zones.insert(
+                        zone.id.clone(),
+                        MemoryZone::new(
+                            zone.shared,
+                            zone.hugepages,
+                            zone_align_size,
+                            zone.mergeable,
+                        ),
+                    );
+                }
+
+                if ram_region_consumed {
+                    break;
+                }
+            }
+
+            if exit {
+                break;
+            }
+        }
+
+        Ok((mem_regions, memory_zones))
+    }
+
+    // Restore both GuestMemory regions along with MemoryZone zones.
+    fn restore_memory_regions_and_zones(
+        guest_ram_mappings: &[GuestRamMapping],
+        saved_regions: &MemoryRangeTable,
+        zones_config: &[MemoryZoneConfig],
+        prefault: Option<bool>,
+        mut existing_memory_files: HashMap<u32, File>,
+        saved_file: Option<File>,
+        thp: bool,
+    ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
+        let mut memory_regions = Vec::new();
+        let mut memory_zones = HashMap::new();
+
+        for zone_config in zones_config {
+            let zone_page_size = memory_zone_get_align_size(zone_config)?;
+            memory_zones.insert(
+                zone_config.id.clone(),
+                MemoryZone::new(
+                    zone_config.shared,
+                    zone_config.hugepages,
+                    zone_page_size,
+                    zone_config.mergeable,
+                ),
+            );
+        }
+
+        for guest_ram_mapping in guest_ram_mappings {
+            for zone_config in zones_config {
+                if guest_ram_mapping.zone_id == zone_config.id {
+                    let mut file = None;
+                    let mut offset = 0;
+                    if let Some(ref f) = saved_file {
+                        for range in saved_regions.regions() {
+                            if guest_ram_mapping.gpa == range.gpa
+                                && guest_ram_mapping.size == range.length
+                            {
+                                file = Some(f.try_clone().map_err(Error::SnapshotDup)?);
+                                break;
+                            }
+                            offset += range.length;
+                        }
+                    }
+                    let region = MemoryManager::create_ram_region(
+                        if guest_ram_mapping.virtio_mem {
+                            &None
+                        } else {
+                            &zone_config.file
+                        },
+                        guest_ram_mapping.file_offset,
+                        GuestAddress(guest_ram_mapping.gpa),
+                        guest_ram_mapping.size as usize,
+                        prefault.unwrap_or(zone_config.prefault),
+                        zone_config.shared,
+                        zone_config.hugepages,
+                        zone_config.hugepage_size,
+                        zone_config.host_numa_node,
+                        existing_memory_files.remove(&guest_ram_mapping.slot),
+                        file,
+                        offset,
+                        thp,
+                    )?;
+                    memory_regions.push(Arc::clone(&region));
+                    if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
+                        if guest_ram_mapping.virtio_mem {
+                            let hotplugged_size = zone_config.hotplugged_size.unwrap_or(0);
+                            let region_size = region.len();
+                            memory_zone.virtio_mem_zone = Some(VirtioMemZone {
+                                region,
+                                virtio_device: None,
+                                hotplugged_size,
+                                hugepages: zone_config.hugepages,
+                                blocks_state: Arc::new(Mutex::new(BlocksState::new(region_size))),
+                            });
+                        } else {
+                            memory_zone.regions.push(region);
+                        }
+                    }
+                }
+            }
+        }
+
+        memory_regions.sort_by_key(|x| x.start_addr());
+
+        Ok((memory_regions, memory_zones))
+    }
+
+    fn fill_saved_regions(
+        &mut self,
+        source_url: &str,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+
+        let mut dirty_log_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+        dirty_log_file_path.push(String::from(DIRTY_LOG_FILENAME));
+        let memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+        let guest_memory = Arc::new(self.guest_memory.memory());
+
+        if !dirty_log_file_path.exists() {
+            let mut file_path_clone = memory_file_path.clone();
+            file_path_clone.push(String::from(SNAPSHOT_FILENAME));
+            // Open (read only) the snapshot file.
+            let mut memory_file = OpenOptions::new()
+                .read(true)
+                .open(file_path_clone)
+                .map_err(Error::SnapshotOpen)?;
+
+            for range in saved_regions.regions() {
+                let mut offset: u64 = 0;
+                // Here we are manually handling the retry in case we can't write
+                // the whole region at once because we can't use the implementation
+                // from vm-memory::GuestMemory of read_exact_from() as it is not
+                // following the correct behavior. For more info about this issue
+                // see: https://github.com/rust-vmm/vm-memory/issues/174
+                loop {
+                    let bytes_read = guest_memory
+                        .read_volatile_from(
+                            GuestAddress(range.gpa + offset),
+                            &mut memory_file,
+                            (range.length - offset) as usize,
+                        )
+                        .map_err(Error::SnapshotCopy)?;
+                    offset += bytes_read as u64;
+
+                    if offset == range.length {
+                        break;
+                    }
+                }
+            }
+        } else if saved_regions.regions().len() > 1 {
+            let regions = saved_regions.regions();
+            let sub_table = recv_vm_dirty_log(source_url).map_err(Error::Restore)?;
+            let barrier = Arc::new(Barrier::new(regions.len()));
+
+            thread::scope(|s| {
+                for (idx, range) in regions.iter().enumerate() {
+                    let barrier = Arc::clone(&barrier);
+                    let guest_memory_clone = Arc::clone(&guest_memory);
+                    let sub_table = sub_table.clone();
+                    let mut base_path = memory_file_path.clone();
+
+                    s.spawn(move || -> Result<(), Error> {
+                        barrier.wait();
+
+                        base_path.push(format!("{}-{}", SNAPSHOT_FILENAME, idx));
+
+                        let mut memory_file = OpenOptions::new()
+                            .read(true)
+                            .open(&base_path)
+                            .map_err(Error::SnapshotOpen)?;
+
+                        for r in sub_table.regions() {
+                            if r.gpa + r.length <= range.gpa || r.gpa >= range.gpa + range.length {
+                                continue;
+                            }
+
+                            let read_gpa = r.gpa.max(range.gpa);
+                            let read_end = (r.gpa + r.length).min(range.gpa + range.length);
+                            let read_len = read_end - read_gpa;
+
+                            let mut offset = 0;
+                            while offset < read_len {
+                                let bytes_read = guest_memory_clone
+                                    .read_volatile_from(
+                                        GuestAddress(read_gpa + offset),
+                                        &mut memory_file,
+                                        (read_len - offset) as usize,
+                                    )
+                                    .map_err(Error::SnapshotCopy)?;
+                                offset += bytes_read as u64;
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            });
+        } else {
+            let sub_table = recv_vm_dirty_log(source_url).map_err(Error::Restore)?;
+            for range in saved_regions.regions() {
+                // Here we are manually handling the retry in case we can't write
+                // the whole region at once because we can't use the implementation
+                // from vm-memory::GuestMemory of read_exact_from() as it is not
+                // following the correct behavior. For more info about this issue
+                // see: https://github.com/rust-vmm/vm-memory/issues/174
+                let barrier = Arc::new(Barrier::new(SNAPSHOT_FILENUM as usize));
+
+                thread::scope(|s| {
+                    for i in 0..SNAPSHOT_FILENUM {
+                        let barrier = Arc::clone(&barrier);
+                        let mut file_path_clone = memory_file_path.clone();
+                        let guest_memory_clone = Arc::clone(&guest_memory);
+                        let sub_table_clone = sub_table.clone();
+
+                        s.spawn(move || -> Result<(), Error> {
+                            // Wait until all threads have been spawned to avoid contention
+                            // over mmap_sem between thread stack allocation and page faulting.
+                            barrier.wait();
+                            // Open (read only) the snapshot file.
+                            file_path_clone.push(format!("{}-{}", SNAPSHOT_FILENAME, i));
+                            let mut memory_file = OpenOptions::new()
+                                .read(true)
+                                .open(file_path_clone)
+                                .map_err(Error::SnapshotOpen)?;
+
+                            let length = range.length / SNAPSHOT_FILENUM;
+                            for r in sub_table_clone.regions() {
+                                // Skip regions outside our current partition
+                                let partition_start = range.gpa + length * i;
+                                let partition_end = range.gpa + length * (i + 1);
+
+                                if r.gpa + r.length <= partition_start || r.gpa >= partition_end {
+                                    continue;
+                                }
+
+                                // Calculate write parameters based on region position
+                                let (write_gpa, write_len, file_offset) = if r.gpa > partition_start && r.gpa + r.length < partition_end {
+                                    // Region fully contained within partition
+                                    (r.gpa, r.length, r.gpa - partition_start)
+                                } else if r.gpa > partition_start {
+                                    // Region overlaps end of partition
+                                    (r.gpa, partition_end - r.gpa, r.gpa - partition_start)
+                                } else if r.gpa + r.length < partition_end {
+                                    // Region overlaps start of partition
+                                    (partition_start, r.gpa + r.length - partition_start, 0)
+                                } else {
+                                    // Region spans entire partition
+                                    (partition_start, length, 0)
+                                };
+                                if file_offset != 0 {
+                                    memory_file
+                                        .seek(SeekFrom::Start(file_offset))
+                                        .map_err(|e| Error::SeekMemoryFile(e.into()))?;
+                                }
+
+                                let mut offset: u64 = 0;
+                                loop {
+                                    let bytes_read = guest_memory_clone
+                                        .read_volatile_from(
+                                            GuestAddress(write_gpa + offset),
+                                            &mut memory_file,
+                                            (write_len - offset) as usize,
+                                        )
+                                        .map_err(Error::SnapshotCopy)?;
+                                    offset += bytes_read as u64;
+
+                                    if offset == write_len {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(())
+                        });
+                    }
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restore guest memory using userfaultfd for lazy demand paging.
+    ///
+    /// Instead of reading the entire snapshot into guest RAM upfront (which
+    /// blocks restore for hundreds of milliseconds at multi-GB sizes), this
+    /// registers the guest memory regions with a userfaultfd. A background
+    /// thread handles page faults by reading the corresponding page from the
+    /// snapshot file and copying it into guest memory via `UFFDIO_COPY`.
+    ///
+    /// This preserves the original memory mapping type (anonymous or shared),
+    /// making it compatible with VFIO device passthrough and shared-memory
+    /// guest RAM.
+    ///
+    /// Fails the restore if UFFD setup cannot be completed successfully.
+    ///
+    /// The handler thread keeps the snapshot file open while lazy restore
+    /// is active. The file must remain available until the VM is shut down or
+    /// all faulted pages have been served.
+    fn restore_by_uffd(
+        &mut self,
+        source_url: &str,
+        saved_regions: &MemoryRangeTable,
+        exit_evt: &EventFd,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+
+        let guest_memory = self.guest_memory.memory();
+        let required_uffd_features = self.required_uffd_features();
+
+        // SAFETY: FFI call. Trivially safe.
+        let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+
+        info!(
+            "UFFD restore: attempting demand-paged restore for {} region(s)",
+            saved_regions.regions().len()
+        );
+
+        if saved_regions
+            .regions()
+            .iter()
+            .any(|range| range.gpa % base_page_size != 0 || range.length % base_page_size != 0)
+        {
+            return Err(UffdError::UnalignedRanges.into());
+        }
+
+        let uffd_fd = uffd::create(required_uffd_features).map_err(UffdError::Create)?;
+
+        let sub_table = recv_vm_dirty_log(source_url).ok();
+
+        let mut handler_ranges: Vec<UffdRange> = Vec::new();
+        let mut snapshot_files = Vec::new();
+
+         if let Some(sub_table) = sub_table {
+            if saved_regions.regions().len() == 1 {
+                let range = &saved_regions.regions()[0];
+
+                for idx in 0..SNAPSHOT_FILENUM {
+                    let mut file_path = url_to_path(source_url).map_err(Error::Restore)?;
+                    file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, idx));
+                    let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+                    snapshot_files.push(snapshot_file);
+
+                    let range_page_size = self
+                        .memory_zones
+                        .values()
+                        .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
+                        .unwrap_or(base_page_size);
+
+                    let partition_start = range.gpa + (range.length / SNAPSHOT_FILENUM as u64) * idx as u64;
+                    let partition_end = partition_start + (range.length / SNAPSHOT_FILENUM as u64);
+
+                    for dirty_region in sub_table.regions().iter() {
+                        if dirty_region.gpa < partition_end && dirty_region.gpa + dirty_region.length > partition_start {
+                            let overlap_start = dirty_region.gpa.max(partition_start);
+                            let overlap_end = (dirty_region.gpa + dirty_region.length).min(partition_end);
+                            let overlap_length = overlap_end - overlap_start;
+
+                            let host_addr = guest_memory
+                                .get_host_address(GuestAddress(overlap_start))
+                                .map_err(|_| UffdError::GpaTranslation { gpa: overlap_start })?
+                                as u64;
+
+                            let ioctls = uffd::register(uffd_fd.as_fd(), host_addr, overlap_length)
+                                .map_err(|e| UffdError::Register {
+                                    addr: host_addr,
+                                    len: overlap_length,
+                                    source: e,
+                                })?;
+
+                            if ioctls & crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                                != crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                            {
+                                return Err(UffdError::MissingIoctlSupport {
+                                    addr: host_addr,
+                                    len: overlap_length,
+                                }
+                                .into());
+                            }
+
+                            handler_ranges.push(UffdRange {
+                                host_addr,
+                                length: overlap_length,
+                                file_offset: overlap_start - partition_start,
+                                page_size: range_page_size,
+                                file_index: idx as usize,
+                            });
+                        }
+                    }
+                }
+            } else {
+                for (idx, range) in saved_regions.regions().iter().enumerate() {
+                    let mut file_path = url_to_path(source_url).map_err(Error::Restore)?;
+                    file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, idx));
+                    let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+                    snapshot_files.push(snapshot_file);
+
+                    let range_page_size = self
+                        .memory_zones
+                        .values()
+                        .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
+                        .unwrap_or(base_page_size);
+
+                    for dirty_region in sub_table.regions().iter() {
+                        if dirty_region.gpa < range.gpa + range.length && dirty_region.gpa + dirty_region.length > range.gpa {
+                            let overlap_start = dirty_region.gpa.max(range.gpa);
+                            let overlap_end = (dirty_region.gpa + dirty_region.length).min(range.gpa + range.length);
+                            let overlap_length = overlap_end - overlap_start;
+
+                            let host_addr = guest_memory
+                                .get_host_address(GuestAddress(overlap_start))
+                                .map_err(|_| UffdError::GpaTranslation { gpa: overlap_start })?
+                                as u64;
+
+                            let ioctls = uffd::register(uffd_fd.as_fd(), host_addr, overlap_length)
+                                .map_err(|e| UffdError::Register {
+                                    addr: host_addr,
+                                    len: overlap_length,
+                                    source: e,
+                                })?;
+
+                            if ioctls & crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                                != crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                            {
+                                return Err(UffdError::MissingIoctlSupport {
+                                    addr: host_addr,
+                                    len: overlap_length,
+                                }
+                                .into());
+                            }
+
+                            handler_ranges.push(UffdRange {
+                                host_addr,
+                                length: overlap_length,
+                                file_offset: overlap_start - range.gpa,
+                                page_size: range_page_size,
+                                file_index: idx,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut file_path = url_to_path(source_url).map_err(Error::Restore)?;
+            file_path.push(SNAPSHOT_FILENAME);
+            let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+            snapshot_files.push(snapshot_file);
+
+            let mut file_offset: u64 = 0;
+
+            for range in saved_regions.regions() {
+                let host_addr = guest_memory
+                    .get_host_address(GuestAddress(range.gpa))
+                    .map_err(|_| UffdError::GpaTranslation { gpa: range.gpa })?
+                    as u64;
+
+                let ioctls = uffd::register(uffd_fd.as_fd(), host_addr, range.length).map_err(|e| {
+                    UffdError::Register {
+                        addr: host_addr,
+                        len: range.length,
+                        source: e,
+                    }
+                })?;
+
+                if ioctls & crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                    != crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                {
+                    return Err(UffdError::MissingIoctlSupport {
+                        addr: host_addr,
+                        len: range.length,
+                    }
+                    .into());
+                }
+
+                let range_page_size = self
+                    .memory_zones
+                    .values()
+                    .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
+                    .unwrap_or(base_page_size);
+
+                handler_ranges.push(UffdRange {
+                    host_addr,
+                    length: range.length,
+                    file_offset,
+                    page_size: range_page_size,
+                    file_index: 0,
+                });
+
+                file_offset += range.length;
+            }
+        }
+
+        info!(
+            "UFFD restore: registered {} region(s), spawning handler",
+            handler_ranges.len()
+        );
+
+        let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
+        let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
+        let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let handle = thread::Builder::new()
+            .name("uffd-handler".to_string())
+            .spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let max_page_size = handler_ranges
+                        .iter()
+                        .map(|r| r.page_size)
+                        .max()
+                        .unwrap_or(base_page_size);
+                    let result = Self::uffd_handler_loop(
+                        uffd_fd,
+                        thread_stop_event,
+                        snapshot_files,
+                        &handler_ranges,
+                        max_page_size,
+                        &ready_tx,
+                    );
+
+                    if let Err(e) = &result {
+                        error!("UFFD handler exited with error: {e}");
+                    }
+
+                    result_tx.send(result).ok();
+                }))
+                .map_err(|_| {
+                    error!("uffd-handler thread panicked");
+                    thread_exit_evt.write(1).ok();
+                })
+                .ok();
+            })
+            .map_err(UffdError::SpawnThread)?;
+
+        if ready_rx.recv().is_err() {
+            handle.join().ok();
+            return Err(UffdError::HandlerStartup.into());
+        }
+
+        if let Ok(Err(e)) = result_rx.try_recv() {
+            handle.join().ok();
+            return Err(UffdError::HandlerFailed(e).into());
+        }
+
+        self.uffd_handler = Some(UffdHandler {
+            stop_event,
+            result_rx,
+            handle,
+        });
+
+        info!("UFFD restore: demand-paged restore enabled");
+
+        Ok(())
+    }
+
+    fn required_uffd_features(&self) -> u64 {
+        let mut features = 0u64;
+        if self.memory_zones.values().any(|z| z.shared && !z.hugepages) {
+            features |= crate::userfaultfd::UFFD_FEATURE_MISSING_SHMEM;
+        }
+        if self.memory_zones.values().any(|z| z.hugepages) {
+            features |= crate::userfaultfd::UFFD_FEATURE_MISSING_HUGETLBFS;
+        }
+        features
+    }
+
+    fn stop_uffd_handler(&mut self) {
+        if let Some(uffd_handler) = self.uffd_handler.take() {
+            uffd_handler.stop_event.write(1).ok();
+            uffd_handler.handle.join().ok();
+
+            match uffd_handler.result_rx.try_recv() {
+                Ok(Err(e)) => error!("UFFD handler terminated with error: {e}"),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("UFFD handler terminated unexpectedly (possible panic)");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Poll the UFFD fd and serve page faults from the snapshot file.
+    ///
+    /// Runs until the fd is closed (EPOLLHUP) or an unrecoverable error occurs.
+    /// Each fault triggers a seek + read from the snapshot file followed by a
+    /// `UFFDIO_COPY` to resolve the fault and wake the faulting thread.
+    #[allow(clippy::needless_pass_by_value)]
+    fn uffd_handler_loop(
+        uffd_fd: OwnedFd,
+        stop_event: EventFd,
+        mut snapshot_files: Vec<File>,
+        ranges: &[UffdRange],
+        page_size: u64,
+        ready_tx: &SyncSender<()>,
+    ) -> Result<(), io::Error> {
+        let uffd_raw_fd = uffd_fd.as_raw_fd();
+        let mut page_buf = vec![0u8; page_size as usize];
+
+        let total_pages: u64 = ranges.iter().map(|r| r.length.div_ceil(r.page_size)).sum();
+        let mut pages_served: u64 = 0;
+
+        const EVENT_STOP: u64 = 0;
+        const EVENT_UFFD: u64 = 1;
+
+        let epoll_fd = epoll::create(true).map_err(io::Error::other)?;
+        // SAFETY: epoll_fd is valid and owned by this scope.
+        let _epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            stop_event.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EVENT_STOP),
+        )
+        .map_err(io::Error::other)?;
+
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            uffd_raw_fd,
+            epoll::Event::new(epoll::Events::EPOLLIN | epoll::Events::EPOLLHUP, EVENT_UFFD),
+        )
+        .map_err(io::Error::other)?;
+
+        ready_tx.send(()).ok();
+
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+        loop {
+            let num_events = match epoll::wait(epoll_fd, -1, &mut events) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+
+            let mut got_uffd_data = false;
+            for event in events.iter().take(num_events) {
+                let token = event.data;
+                let evt_flags = event.events;
+
+                if token == EVENT_STOP {
+                    stop_event.read().ok();
+                    info!("UFFD handler: received stop event, exiting");
+                    return Ok(());
+                }
+
+                if token == EVENT_UFFD
+                    && (evt_flags & epoll::Events::EPOLLHUP.bits()) != 0
+                    && (evt_flags & epoll::Events::EPOLLIN.bits()) == 0
+                {
+                    info!("UFFD handler: fd closed (EPOLLHUP), exiting");
+                    return Ok(());
+                }
+
+                if token == EVENT_UFFD && (evt_flags & epoll::Events::EPOLLIN.bits()) != 0 {
+                    got_uffd_data = true;
+                }
+            }
+
+            if !got_uffd_data {
+                continue;
+            }
+
+            // SAFETY: UffdMsg is a plain repr(C) struct, safe to zero-init.
+            let mut msg: uffd::UffdMsg = unsafe { std::mem::zeroed() };
+            // SAFETY: reading a uffd_msg-sized struct from the valid uffd fd.
+            let n = unsafe {
+                libc::read(
+                    uffd_raw_fd,
+                    (&raw mut msg).cast(),
+                    std::mem::size_of::<uffd::UffdMsg>(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                info!("UFFD handler: EOF on fd, exiting");
+                return Ok(());
+            }
+            if n as usize != std::mem::size_of::<uffd::UffdMsg>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Short read from userfaultfd",
+                ));
+            }
+
+            if msg.event != crate::userfaultfd::UFFD_EVENT_PAGEFAULT {
+                continue;
+            }
+
+            let fault_addr = msg.pf_address;
+
+            let mut served = false;
+            for range in ranges {
+                // Round down to the page boundary containing the faulted address.
+                let page_addr = fault_addr & !(range.page_size - 1);
+                if page_addr >= range.host_addr && page_addr < range.host_addr + range.length {
+                    let offset_in_range = page_addr - range.host_addr;
+                    let file_pos = range.file_offset + offset_in_range;
+
+                    let snapshot_file = &mut snapshot_files[range.file_index];
+
+                    snapshot_file.seek(SeekFrom::Start(file_pos))?;
+                    snapshot_file.read_exact(&mut page_buf[..range.page_size as usize])?;
+
+                    loop {
+                        match uffd::copy(
+                            uffd_fd.as_fd(),
+                            page_addr,
+                            page_buf.as_ptr(),
+                            range.page_size,
+                        ) {
+                            Ok(()) => {
+                                pages_served += 1;
+                                break;
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                                if let Err(e) =
+                                    uffd::wake(uffd_fd.as_fd(), page_addr, range.page_size)
+                                {
+                                    warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
+                                }
+                                break;
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                                // The kernel can report a transient EAGAIN while the fault
+                                // is being resolved; yield and retry instead of aborting restore.
+                                thread::yield_now();
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    served = true;
+                    break;
+                }
+            }
+
+            if !served {
+                return Err(io::Error::other(format!(
+                    "UFFD handler: fault at {fault_addr:#x} does not belong to any registered range",
+                )));
+            }
+
+            if pages_served == total_pages {
+                info!("UFFD handler: all {pages_served} pages served, exiting");
+                return Ok(());
+            }
+        }
+    }
+
+    fn validate_memory_config(
+        config: &MemoryConfig,
+        user_provided_zones: bool,
+    ) -> Result<(u64, Vec<MemoryZoneConfig>, bool), Error> {
+        let mut allow_mem_hotplug = false;
+
+        if user_provided_zones {
+            if config.zones.is_none() {
+                error!(
+                    "User defined memory regions must be provided if the \
+                    memory size is 0"
+                );
+                return Err(Error::MissingMemoryZones);
+            }
+
+            // Safe to unwrap as we checked right above there were some
+            // regions.
+            let zones = config.zones.clone().unwrap();
+            if zones.is_empty() {
+                return Err(Error::MissingMemoryZones);
+            }
+
+            let mut total_ram_size: u64 = 0;
+            for zone in zones.iter() {
+                total_ram_size += zone.size;
+
+                if zone.shared && zone.file.is_some() && zone.host_numa_node.is_some() {
+                    error!(
+                        "Invalid to set host NUMA policy for a memory zone \
+                        backed by a regular file and mapped as 'shared'"
+                    );
+                    return Err(Error::InvalidSharedMemoryZoneWithHostNuma);
+                }
+
+                if zone.hotplug_size.is_some() && config.hotplug_method == HotplugMethod::Acpi {
+                    error!("Invalid to set ACPI hotplug method for memory zones");
+                    return Err(Error::InvalidHotplugMethodWithMemoryZones);
+                }
+
+                if let Some(hotplugged_size) = zone.hotplugged_size {
+                    if let Some(hotplug_size) = zone.hotplug_size {
+                        if hotplugged_size > hotplug_size {
+                            error!(
+                                "'hotplugged_size' {hotplugged_size} can't be bigger than \
+                                'hotplug_size' {hotplug_size}",
+                            );
+                            return Err(Error::InvalidMemoryParameters);
+                        }
+                    } else {
+                        error!(
+                            "Invalid to define 'hotplugged_size' when there is\
+                            no 'hotplug_size' for a memory zone"
+                        );
+                        return Err(Error::InvalidMemoryParameters);
+                    }
+                    if config.hotplug_method == HotplugMethod::Acpi {
+                        error!(
+                            "Invalid to define 'hotplugged_size' with hotplug \
+                            method 'acpi'"
+                        );
+                        return Err(Error::InvalidMemoryParameters);
+                    }
+                }
+            }
+
+            Ok((total_ram_size, zones, allow_mem_hotplug))
+        } else {
+            if config.zones.is_some() {
+                error!(
+                    "User defined memory regions can't be provided if the \
+                    memory size is not 0"
+                );
+                return Err(Error::InvalidMemoryParameters);
+            }
+
+            if config.hotplug_size.is_some() {
+                allow_mem_hotplug = true;
+            }
+
+            if let Some(hotplugged_size) = config.hotplugged_size {
+                if let Some(hotplug_size) = config.hotplug_size {
+                    if hotplugged_size > hotplug_size {
+                        error!(
+                            "'hotplugged_size' {hotplugged_size} can't be bigger than \
+                            'hotplug_size' {hotplug_size}",
+                        );
+                        return Err(Error::InvalidMemoryParameters);
+                    }
+                } else {
+                    error!(
+                        "Invalid to define 'hotplugged_size' when there is\
+                        no 'hotplug_size'"
+                    );
+                    return Err(Error::InvalidMemoryParameters);
+                }
+                if config.hotplug_method == HotplugMethod::Acpi {
+                    error!(
+                        "Invalid to define 'hotplugged_size' with hotplug \
+                        method 'acpi'"
+                    );
+                    return Err(Error::InvalidMemoryParameters);
+                }
+            }
+
+            // Create a single zone from the global memory config. This lets
+            // us reuse the codepath for user defined memory zones.
+            let zones = vec![MemoryZoneConfig {
+                id: String::from(DEFAULT_MEMORY_ZONE),
+                size: config.size,
+                file: None,
+                shared: config.shared,
+                hugepages: config.hugepages,
+                hugepage_size: config.hugepage_size,
+                host_numa_node: None,
+                hotplug_size: config.hotplug_size,
+                hotplugged_size: config.hotplugged_size,
+                prefault: config.prefault,
+                mergeable: config.mergeable,
+            }];
+
+            Ok((config.size, zones, allow_mem_hotplug))
+        }
+    }
+
+    pub fn allocate_address_space(&mut self) -> Result<(), Error> {
+        let mut list = Vec::new();
+
+        for (zone_id, memory_zone) in self.memory_zones.iter() {
+            let mut regions: Vec<(Arc<vm_memory::GuestRegionMmap<AtomicBitmap>>, bool)> =
+                memory_zone
+                    .regions()
+                    .iter()
+                    .map(|r| (r.clone(), false))
+                    .collect();
+
+            if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
+                regions.push((virtio_mem_zone.region().clone(), true));
+            }
+
+            list.push((zone_id.clone(), regions, memory_zone.mergeable));
+        }
+
+        for (zone_id, regions, zone_mergeable) in list {
+            for (region, virtio_mem) in regions {
+                // SAFETY: guaranteed by GuestRegionMmap invariants
+                let slot = unsafe {
+                    self.create_userspace_mapping(
+                        region.start_addr().raw_value(),
+                        region.len().try_into().unwrap(),
+                        region.as_ptr(),
+                        zone_mergeable,
+                        false,
+                        self.log_dirty,
+                    )
+                }?;
+
+                let file_offset = if let Some(file_offset) = region.file_offset() {
+                    file_offset.start()
+                } else {
+                    0
+                };
+
+                self.guest_ram_mappings.push(GuestRamMapping {
+                    gpa: region.start_addr().raw_value(),
+                    size: region.len(),
+                    slot,
+                    zone_id: zone_id.clone(),
+                    virtio_mem,
+                    file_offset,
+                });
+                self.ram_allocator
+                    .allocate(Some(region.start_addr()), region.len(), None)
+                    .ok_or(Error::MemoryRangeAllocation)?;
+            }
+        }
+
+        // Allocate SubRegion and Reserved address ranges.
+        for region in self.arch_mem_regions.iter() {
+            if region.r_type == RegionType::Ram {
+                // Ignore the RAM type since ranges have already been allocated
+                // based on the GuestMemory regions.
+                continue;
+            }
+            self.ram_allocator
+                .allocate(
+                    Some(GuestAddress(region.base)),
+                    region.size as GuestUsize,
+                    None,
+                )
+                .ok_or(Error::MemoryRangeAllocation)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    pub fn add_uefi_flash(&mut self) -> Result<(), Error> {
+        // The UEFI binary requires a flash device at address 0.
+        // 4 MiB memory is mapped to simulate the flash.
+        let uefi_mem_slot = self.allocate_memory_slot();
+        let uefi_region = GuestRegionMmap::new(
+            MmapRegion::new(arch::layout::UEFI_SIZE as usize).unwrap(),
+            arch::layout::UEFI_START,
+        )
+        .unwrap();
+        const _: () = assert!(core::mem::size_of::<usize>() == core::mem::size_of::<u64>());
+
+        // SAFETY: guaranteed by GuestRegionMmap
+        unsafe {
+            self.vm
+                .create_user_memory_region(
+                    uefi_mem_slot,
+                    uefi_region.start_addr().raw_value(),
+                    uefi_region.len() as usize,
+                    uefi_region.as_ptr(),
+                    false,
+                    false,
+                )
+                .map_err(Error::CreateUefiFlash)?;
+        }
+        let uefi_flash =
+            GuestMemoryAtomic::new(GuestMemoryMmap::from_regions(vec![uefi_region]).unwrap());
+
+        self.uefi_flash = Some(uefi_flash);
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        vm: Arc<dyn hypervisor::Vm>,
+        config: &MemoryConfig,
+        prefault: Option<bool>,
+        phys_bits: u8,
+        #[cfg(feature = "tdx")] tdx_enabled: bool,
+        restore_data: Option<&MemoryManagerSnapshotData>,
+        existing_memory_files: HashMap<u32, File>,
+        snap_file: Option<File>,
+    ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        trace_scoped!("MemoryManager::new");
+
+        let user_provided_zones = config.size == 0;
+
+        let mmio_address_space_size = mmio_address_space_size(phys_bits);
+        debug_assert_eq!(
+            (((mmio_address_space_size) >> 16) << 16),
+            mmio_address_space_size
+        );
+        let start_of_platform_device_area =
+            GuestAddress(mmio_address_space_size - PLATFORM_DEVICE_AREA_SIZE);
+        let end_of_device_area = start_of_platform_device_area.unchecked_sub(1);
+
+        let (ram_size, zones, allow_mem_hotplug) =
+            Self::validate_memory_config(config, user_provided_zones)?;
+
+        let (
+            start_of_device_area,
+            boot_ram,
+            current_ram,
+            arch_mem_regions,
+            memory_zones,
+            guest_memory,
+            boot_guest_memory,
+            hotplug_slots,
+            next_memory_slot,
+            selected_slot,
+            next_hotplug_slot,
+        ) = if let Some(data) = restore_data {
+            let (regions, memory_zones) = Self::restore_memory_regions_and_zones(
+                &data.guest_ram_mappings,
+                &data.memory_ranges,
+                &zones,
+                prefault,
+                existing_memory_files,
+                snap_file,
+                config.thp,
+            )?;
+            let guest_memory =
+                GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestRegionCollection)?;
+            let boot_guest_memory = guest_memory.clone();
+            (
+                GuestAddress(data.start_of_device_area),
+                data.boot_ram,
+                data.current_ram,
+                data.arch_mem_regions.clone(),
+                memory_zones,
+                guest_memory,
+                boot_guest_memory,
+                data.hotplug_slots.clone(),
+                data.next_memory_slot,
+                data.selected_slot,
+                data.next_hotplug_slot,
+            )
+        } else {
+            // Init guest memory
+            let arch_mem_regions = arch::arch_memory_regions();
+
+            let ram_regions: Vec<(GuestAddress, usize)> = arch_mem_regions
+                .iter()
+                .filter(|r| r.2 == RegionType::Ram)
+                .map(|r| (r.0, r.1))
+                .collect();
+
+            let arch_mem_regions: Vec<ArchMemRegion> = arch_mem_regions
+                .iter()
+                .map(|(a, b, c)| ArchMemRegion {
+                    base: a.0,
+                    size: *b,
+                    r_type: *c,
+                })
+                .collect();
+
+            let (mem_regions, mut memory_zones) =
+                Self::create_memory_regions_from_zones(&ram_regions, &zones, prefault, config.thp)?;
+
+            let mut guest_memory = GuestMemoryMmap::from_arc_regions(mem_regions)
+                .map_err(Error::GuestRegionCollection)?;
+
+            let boot_guest_memory = guest_memory.clone();
+
+            let mut start_of_device_area =
+                MemoryManager::start_addr(guest_memory.last_addr(), allow_mem_hotplug)?;
+
+            // Update list of memory zones for resize.
+            for zone in zones.iter() {
+                if let Some(memory_zone) = memory_zones.get_mut(&zone.id) {
+                    if let Some(hotplug_size) = zone.hotplug_size {
+                        if hotplug_size == 0 {
+                            error!("'hotplug_size' can't be 0");
+                            return Err(Error::InvalidHotplugSize);
+                        }
+
+                        if !user_provided_zones && config.hotplug_method == HotplugMethod::Acpi {
+                            start_of_device_area = start_of_device_area
+                                .checked_add(hotplug_size)
+                                .ok_or(Error::GuestAddressOverFlow)?;
+                        } else {
+                            // Alignment must be "natural" i.e. same as size of block
+                            let start_addr = GuestAddress(
+                                start_of_device_area
+                                    .0
+                                    .div_ceil(virtio_devices::VIRTIO_MEM_ALIGN_SIZE)
+                                    * virtio_devices::VIRTIO_MEM_ALIGN_SIZE,
+                            );
+
+                            // When `prefault` is set by vm_restore, memory manager
+                            // will create ram region with `prefault` option in
+                            // restore config rather than same option in zone
+                            let region = MemoryManager::create_ram_region(
+                                &None,
+                                0,
+                                start_addr,
+                                hotplug_size as usize,
+                                prefault.unwrap_or(zone.prefault),
+                                zone.shared,
+                                zone.hugepages,
+                                zone.hugepage_size,
+                                zone.host_numa_node,
+                                None,
+                                None,
+                                0,
+                                config.thp,
+                            )?;
+
+                            guest_memory = guest_memory
+                                .insert_region(Arc::clone(&region))
+                                .map_err(Error::GuestRegionCollection)?;
+
+                            let hotplugged_size = zone.hotplugged_size.unwrap_or(0);
+                            let region_size = region.len();
+                            memory_zone.virtio_mem_zone = Some(VirtioMemZone {
+                                region,
+                                virtio_device: None,
+                                hotplugged_size,
+                                hugepages: zone.hugepages,
+                                blocks_state: Arc::new(Mutex::new(BlocksState::new(region_size))),
+                            });
+
+                            start_of_device_area = start_addr
+                                .checked_add(hotplug_size)
+                                .ok_or(Error::GuestAddressOverFlow)?;
+                        }
+                    }
+                } else {
+                    return Err(Error::MissingZoneIdentifier);
+                }
+            }
+
+            let mut hotplug_slots = Vec::with_capacity(HOTPLUG_COUNT);
+            hotplug_slots.resize_with(HOTPLUG_COUNT, HotPlugState::default);
+
+            (
+                start_of_device_area,
+                ram_size,
+                ram_size,
+                arch_mem_regions,
+                memory_zones,
+                guest_memory,
+                boot_guest_memory,
+                hotplug_slots,
+                0,
+                0,
+                0,
+            )
+        };
+
+        let guest_memory = GuestMemoryAtomic::new(guest_memory);
+
+        let allocator = Arc::new(Mutex::new(
+            SystemAllocator::new(
+                GuestAddress(0),
+                1 << 16,
+                start_of_platform_device_area,
+                PLATFORM_DEVICE_AREA_SIZE,
+                #[cfg(target_arch = "x86_64")]
+                &[GsiApic::new(
+                    X86_64_IRQ_BASE,
+                    ioapic::NUM_IOAPIC_PINS as u32 - X86_64_IRQ_BASE,
+                )],
+            )
+            .ok_or(Error::CreateSystemAllocator)?,
+        ));
+
+        #[cfg(not(feature = "tdx"))]
+        let dynamic = true;
+        #[cfg(feature = "tdx")]
+        let dynamic = !tdx_enabled;
+
+        let acpi_address = if dynamic
+            && config.hotplug_method == HotplugMethod::Acpi
+            && (config.hotplug_size.unwrap_or_default() > 0)
+        {
+            Some(
+                allocator
+                    .lock()
+                    .unwrap()
+                    .allocate_platform_mmio_addresses(None, MEMORY_MANAGER_ACPI_SIZE as u64, None)
+                    .ok_or(Error::AllocateMmioAddress)?,
+            )
+        } else {
+            None
+        };
+
+        // The start of device area and RAM area are placed next to each other.
+        let end_of_ram_area = start_of_device_area.unchecked_sub(1);
+        let ram_allocator = AddressAllocator::new(GuestAddress(0), start_of_device_area.0).unwrap();
+
+        #[allow(unused_mut)]
+        let mut memory_manager = MemoryManager {
+            boot_guest_memory,
+            guest_memory,
+            next_memory_slot: Arc::new(AtomicU32::new(next_memory_slot)),
+            memory_slot_free_list: Arc::new(Mutex::new(Vec::new())),
+            start_of_device_area,
+            end_of_device_area,
+            end_of_ram_area,
+            vm,
+            hotplug_slots,
+            selected_slot,
+            mergeable: config.mergeable,
+            allocator,
+            hotplug_method: config.hotplug_method,
+            boot_ram,
+            current_ram,
+            next_hotplug_slot,
+            shared: config.shared,
+            hugepages: config.hugepages,
+            hugepage_size: config.hugepage_size,
+            prefault: config.prefault,
+            user_provided_zones,
+            snapshot_memory_ranges: MemoryRangeTable::default(),
+            memory_zones,
+            guest_ram_mappings: Vec::new(),
+            uffd_handler: None,
+            acpi_address,
+            log_dirty: dynamic, // Cannot log dirty pages on a TD
+            arch_mem_regions,
+            ram_allocator,
+            dynamic,
+            dirty_log: config.dirty_log,
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            uefi_flash: None,
+            thp: config.thp,
+        };
+
+        Ok(Arc::new(Mutex::new(memory_manager)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_from_snapshot(
+        snapshot: &Snapshot,
+        vm: Arc<dyn hypervisor::Vm>,
+        config: &MemoryConfig,
+        source_url: Option<&str>,
+        prefault: bool,
+        memory_restore_mode: MemoryRestoreMode,
+        phys_bits: u8,
+        exit_evt: &EventFd,
+    ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        if let Some(source_url) = source_url {
+            let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+            memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+
+            let fast_restore = Self::support_fast_restore_check(config);
+            let memory_file = if fast_restore {
+                info!("restore non-shared map, speed up restore by share map memory file");
+                Some(
+                    OpenOptions::new()
+                        .read(true)
+                        .open(memory_file_path.clone())
+                        .map_err(Error::SnapshotOpen)?,
+                )
+            } else {
+                None
+            };
+
+            let mem_snapshot: MemoryManagerSnapshotData =
+                snapshot.to_state().map_err(Error::Restore)?;
+
+            let mm = MemoryManager::new(
+                vm,
+                config,
+                Some(prefault),
+                phys_bits,
+                #[cfg(feature = "tdx")]
+                false,
+                Some(&mem_snapshot),
+                Default::default(),
+                memory_file,
+            )?;
+
+            if !fast_restore {
+                info!("restore shared map, fall back to slow restore");
+                if memory_restore_mode == MemoryRestoreMode::OnDemand {
+                    mm.lock().unwrap().restore_by_uffd(
+                        source_url,
+                        &mem_snapshot.memory_ranges,
+                        exit_evt,
+                    )?;
+                } else {
+                    mm.lock()
+                        .unwrap()
+                        .fill_saved_regions(source_url, &mem_snapshot.memory_ranges)?;
+                }
+            }
+
+            Ok(mm)
+        } else {
+            Err(Error::RestoreMissingSourceUrl)
+        }
+    }
+
+    fn support_fast_restore_check(config: &MemoryConfig) -> bool {
+        !config.exist_shared() && !config.has_hotplug_virtio_mem()
+    }
+
+    fn memfd_create(name: &ffi::CStr, flags: u32) -> Result<RawFd, io::Error> {
+        // SAFETY: FFI call with correct arguments
+        let res = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };
+
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(res as RawFd)
+        }
+    }
+
+    fn mbind(
+        addr: *mut u8,
+        len: u64,
+        mode: u32,
+        nodemask: &[u64],
+        maxnode: u64,
+        flags: u32,
+    ) -> Result<(), io::Error> {
+        // SAFETY: FFI call with correct arguments
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_mbind,
+                addr.cast::<libc::c_void>(),
+                len,
+                mode,
+                nodemask.as_ptr(),
+                maxnode,
+                flags,
+            )
+        };
+
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn create_anonymous_file(
+        size: usize,
+        hugepages: bool,
+        hugepage_size: Option<u64>,
+    ) -> Result<FileOffset, Error> {
+        let fd = Self::memfd_create(
+            &ffi::CString::new("ch_ram").unwrap(),
+            libc::MFD_CLOEXEC
+                | if hugepages {
+                    libc::MFD_HUGETLB
+                        | if let Some(hugepage_size) = hugepage_size {
+                            /*
+                             * From the Linux kernel:
+                             * Several system calls take a flag to request "hugetlb" huge pages.
+                             * Without further specification, these system calls will use the
+                             * system's default huge page size.  If a system supports multiple
+                             * huge page sizes, the desired huge page size can be specified in
+                             * bits [26:31] of the flag arguments.  The value in these 6 bits
+                             * will encode the log2 of the huge page size.
+                             */
+
+                            hugepage_size.trailing_zeros() << 26
+                        } else {
+                            // Use the system default huge page size
+                            0
+                        }
+                } else {
+                    0
+                },
+        )
+        .map_err(Error::SharedFileCreate)?;
+
+        // SAFETY: fd is valid
+        let f = unsafe { File::from_raw_fd(fd) };
+        f.set_len(size as u64).map_err(Error::SharedFileSetLen)?;
+
+        Ok(FileOffset::new(f, 0))
+    }
+
+    fn open_backing_file(
+        backing_file: &PathBuf,
+        file_offset: u64,
+        shared: bool,
+    ) -> Result<FileOffset, Error> {
+        if backing_file.is_dir() {
+            Err(Error::DirectoryAsBackingFileForMemory)
+        } else {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(shared)
+                .open(backing_file)
+                .map_err(Error::SharedFileCreate)?;
+
+            Ok(FileOffset::new(f, file_offset))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_ram_region_raw(
+        backing_file: &Option<PathBuf>,
+        file_offset: u64,
+        size: usize,
+        prefault: bool,
+        shared: bool,
+        hugepages: bool,
+        hugepage_size: Option<u64>,
+        host_numa_node: Option<u32>,
+        existing_memory_file: Option<File>,
+        snap_file: Option<File>,
+        snap_offset: u64,
+        thp: bool,
+    ) -> Result<MmapRegion<AtomicBitmap>, Error> {
+        let mut mmap_flags = libc::MAP_NORESERVE;
+
+        // The duplication of mmap_flags ORing here is unfortunate but it also makes
+        // the complexity of the handling clear.
+        let fo = if let Some(f) = snap_file {
+            mmap_flags |= libc::MAP_PRIVATE;
+            Some(FileOffset::new(f, snap_offset))
+        } else if let Some(f) = existing_memory_file {
+            // It must be MAP_SHARED as we wouldn't already have an FD
+            mmap_flags |= libc::MAP_SHARED;
+            Some(FileOffset::new(f, file_offset))
+        } else if let Some(backing_file) = backing_file {
+            if shared {
+                mmap_flags |= libc::MAP_SHARED;
+            } else {
+                mmap_flags |= libc::MAP_PRIVATE;
+            }
+            Some(Self::open_backing_file(backing_file, file_offset, shared)?)
+        } else if shared || hugepages {
+            // For hugepages we must also MAP_SHARED otherwise we will trigger #4805
+            // because the MAP_PRIVATE will trigger CoW against the backing file with
+            // the VFIO pinning
+            mmap_flags |= libc::MAP_SHARED;
+            Some(Self::create_anonymous_file(size, hugepages, hugepage_size)?)
+        } else {
+            mmap_flags |= libc::MAP_PRIVATE;
+            Some(Self::create_anonymous_file(size, hugepages, hugepage_size)?)
+        };
+
+        let region = MmapRegion::build(fo, size, libc::PROT_READ | libc::PROT_WRITE, mmap_flags)
+            .map_err(Error::GuestMemoryRegion)?;
+
+        // Apply NUMA policy if needed.
+        if let Some(node) = host_numa_node {
+            let addr = region.as_ptr();
+            let len = region.size() as u64;
+            let mode = MPOL_BIND;
+            let mut nodemask: Vec<u64> = Vec::new();
+            let flags = MPOL_MF_STRICT | MPOL_MF_MOVE;
+
+            // Linux is kind of buggy in the way it interprets maxnode as it
+            // will cut off the last node. That's why we have to add 1 to what
+            // we would consider as the proper maxnode value.
+            let maxnode = node as u64 + 1 + 1;
+
+            // Allocate the right size for the vector.
+            nodemask.resize((node as usize / 64) + 1, 0);
+
+            // Fill the global bitmask through the nodemask vector.
+            let idx = (node / 64) as usize;
+            let shift = node % 64;
+            nodemask[idx] |= 1u64 << shift;
+
+            // Policies are enforced by using MPOL_MF_MOVE flag as it will
+            // force the kernel to move all pages that might have been already
+            // allocated to the proper set of NUMA nodes. MPOL_MF_STRICT is
+            // used to throw an error if MPOL_MF_MOVE didn't succeed.
+            // MPOL_BIND is the selected mode as it specifies a strict policy
+            // that restricts memory allocation to the nodes specified in the
+            // nodemask.
+            Self::mbind(addr, len, mode, &nodemask, maxnode, flags)
+                .map_err(Error::ApplyNumaPolicy)?;
+        }
+
+        // Prefault the region if needed, in parallel.
+        if prefault {
+            let page_size =
+                Self::get_prefault_align_size(backing_file, hugepages, hugepage_size)? as usize;
+
+            if !is_aligned(size, page_size) {
+                warn!("Prefaulting memory size {size} misaligned with page size {page_size}");
+            }
+
+            let num_pages = size / page_size;
+
+            let num_threads = Self::get_prefault_num_threads(page_size, num_pages);
+
+            let pages_per_thread = num_pages / num_threads;
+            let remainder = num_pages % num_threads;
+
+            let barrier = Arc::new(Barrier::new(num_threads));
+            thread::scope(|s| {
+                let r = &region;
+                for i in 0..num_threads {
+                    let barrier = Arc::clone(&barrier);
+                    s.spawn(move || {
+                        // Wait until all threads have been spawned to avoid contention
+                        // over mmap_sem between thread stack allocation and page faulting.
+                        barrier.wait();
+                        let pages = pages_per_thread + if i < remainder { 1 } else { 0 };
+                        let offset =
+                            page_size * ((i * pages_per_thread) + std::cmp::min(i, remainder));
+                        // SAFETY: FFI call with correct arguments
+                        let ret = unsafe {
+                            let addr = r.as_ptr().add(offset);
+                            libc::madvise(addr.cast(), pages * page_size, libc::MADV_POPULATE_WRITE)
+                        };
+                        if ret != 0 {
+                            let e = io::Error::last_os_error();
+                            warn!("Failed to prefault pages: {e}");
+                        }
+                    });
+                }
+            });
+        }
+
+        info!(
+            "RAM region mapping at 0x{:x} (size = 0x{:x})",
+            region.as_ptr() as u64,
+            size
+        );
+
+        if thp && !hugepages {
+            // SAFETY: FFI call with correct arguments
+            let ret = unsafe { libc::madvise(region.as_ptr().cast(), size, libc::MADV_HUGEPAGE) };
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+                warn!("Failed to mark pages as THP eligible: {e}");
+            } else {
+                debug!("Successfully marked pages as THP eligible");
+            }
+        }
+
+        Ok(region)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_ram_region(
+        backing_file: &Option<PathBuf>,
+        file_offset: u64,
+        start_addr: GuestAddress,
+        size: usize,
+        prefault: bool,
+        shared: bool,
+        hugepages: bool,
+        hugepage_size: Option<u64>,
+        host_numa_node: Option<u32>,
+        existing_memory_file: Option<File>,
+        snap_file: Option<File>,
+        snap_offset: u64,
+        thp: bool,
+    ) -> Result<Arc<GuestRegionMmap>, Error> {
+        let r = Self::create_ram_region_raw(
+            backing_file,
+            file_offset,
+            size,
+            prefault,
+            shared,
+            hugepages,
+            hugepage_size,
+            host_numa_node,
+            existing_memory_file,
+            snap_file,
+            snap_offset,
+            thp,
+        )?;
+
+        Ok(Arc::new(GuestRegionMmap::new(r, start_addr).ok_or(
+            Error::GuestMemory(MmapError::InvalidGuestAddress(start_addr)),
+        )?))
+    }
+
+    // Duplicate of `memory_zone_get_align_size` that does not require a `zone`
+    fn get_prefault_align_size(
+        backing_file: &Option<PathBuf>,
+        hugepages: bool,
+        hugepage_size: Option<u64>,
+    ) -> Result<u64, Error> {
+        // SAFETY: FFI call. Trivially safe.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        match (hugepages, hugepage_size, backing_file) {
+            (false, _, _) => Ok(page_size),
+            (true, Some(hugepage_size), _) => Ok(hugepage_size),
+            (true, None, _) => {
+                // There are two scenarios here:
+                //  - `hugepages` is enabled but `hugepage_size` is not specified:
+                //     Call `statfs` for `/dev/hugepages` for getting the default size of hugepage
+                //  - The backing file is specified:
+                //     Call `statfs` for the file and get its `f_bsize`.  If the value is larger than the page
+                //     size of normal page, just use the `f_bsize` because the file is in a hugetlbfs.  If the
+                //     value is less than or equal to the page size, just use the page size.
+                let path = backing_file
+                    .as_ref()
+                    .map_or(Ok("/dev/hugepages"), |pathbuf| {
+                        pathbuf.to_str().ok_or(Error::InvalidMemoryParameters)
+                    })?;
+                let align_size = std::cmp::max(page_size, statfs_get_bsize(path)?);
+                Ok(align_size)
+            }
+        }
+    }
+
+    fn get_prefault_num_threads(page_size: usize, num_pages: usize) -> usize {
+        let mut n: usize = 1;
+
+        // Do not create more threads than processors available.
+        // SAFETY: FFI call. Trivially safe.
+        let procs = unsafe { libc::sysconf(_SC_NPROCESSORS_ONLN) };
+        if procs > 0 {
+            n = std::cmp::min(procs as usize, MAX_PREFAULT_THREAD_COUNT);
+        }
+
+        // Do not create more threads than pages being allocated.
+        n = std::cmp::min(n, num_pages);
+
+        // Do not create threads to allocate less than 64 MiB of memory.
+        n = std::cmp::min(
+            n,
+            std::cmp::max(1, page_size * num_pages / (64 * (1 << 26))),
+        );
+
+        n
+    }
+
+    // Update the GuestMemoryMmap with the new range
+    fn add_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
+        let guest_memory = self
+            .guest_memory
+            .memory()
+            .insert_region(region)
+            .map_err(Error::GuestRegionCollection)?;
+        self.guest_memory.lock().unwrap().replace(guest_memory);
+
+        Ok(())
+    }
+
+    //
+    // Calculate the start address of an area next to RAM.
+    //
+    // If memory hotplug is allowed, the start address needs to be aligned
+    // (rounded-up) to 128MiB boundary.
+    // If memory hotplug is not allowed, there is no alignment required.
+    // And it must also start at the 64bit start.
+    fn start_addr(mem_end: GuestAddress, allow_mem_hotplug: bool) -> Result<GuestAddress, Error> {
+        let mut start_addr = if allow_mem_hotplug {
+            GuestAddress(mem_end.0 | ((128 << 20) - 1))
+        } else {
+            mem_end
+        };
+
+        start_addr = start_addr
+            .checked_add(1)
+            .ok_or(Error::GuestAddressOverFlow)?;
+
+        #[cfg(not(target_arch = "riscv64"))]
+        if mem_end < arch::layout::MEM_32BIT_RESERVED_START {
+            return Ok(arch::layout::RAM_64BIT_START);
+        }
+
+        Ok(start_addr)
+    }
+
+    pub fn add_ram_region(
+        &mut self,
+        start_addr: GuestAddress,
+        size: usize,
+    ) -> Result<Arc<GuestRegionMmap>, Error> {
+        // Allocate memory for the region
+        let region = MemoryManager::create_ram_region(
+            &None,
+            0,
+            start_addr,
+            size,
+            self.prefault,
+            self.shared,
+            self.hugepages,
+            self.hugepage_size,
+            None,
+            None,
+            None,
+            0,
+            self.thp,
+        )?;
+
+        // Map it into the guest
+        // SAFETY: guaranteed by GuestMmapRegion invariants
+        let slot = unsafe {
+            self.create_userspace_mapping(
+                region.start_addr().0,
+                region.len().try_into().unwrap(),
+                region.as_ptr(),
+                self.memory_zones
+                    .get(DEFAULT_MEMORY_ZONE)
+                    .map_or(self.mergeable, |z| z.mergeable),
+                false,
+                self.log_dirty,
+            )
+        }?;
+        self.guest_ram_mappings.push(GuestRamMapping {
+            gpa: region.start_addr().raw_value(),
+            size: region.len(),
+            slot,
+            zone_id: DEFAULT_MEMORY_ZONE.to_string(),
+            virtio_mem: false,
+            file_offset: 0,
+        });
+
+        self.add_region(Arc::clone(&region))?;
+
+        Ok(region)
+    }
+
+    fn hotplug_ram_region(&mut self, size: usize) -> Result<Arc<GuestRegionMmap>, Error> {
+        info!("Hotplugging new RAM: {size}");
+
+        // Check that there is a free slot
+        if self.next_hotplug_slot >= HOTPLUG_COUNT {
+            return Err(Error::NoSlotAvailable);
+        }
+
+        // "Inserted" DIMM must have a size that is a multiple of 128MiB
+        if !size.is_multiple_of(128 << 20) {
+            return Err(Error::InvalidSize);
+        }
+
+        let start_addr = MemoryManager::start_addr(self.guest_memory.memory().last_addr(), true)?;
+
+        if start_addr
+            .checked_add((size - 1).try_into().unwrap())
+            .unwrap()
+            > self.end_of_ram_area
+        {
+            return Err(Error::InsufficientHotplugRam);
+        }
+
+        let region = self.add_ram_region(start_addr, size)?;
+
+        // Add region to the list of regions associated with the default
+        // memory zone.
+        if let Some(memory_zone) = self.memory_zones.get_mut(DEFAULT_MEMORY_ZONE) {
+            memory_zone.regions.push(Arc::clone(&region));
+        }
+
+        // Tell the allocator
+        self.ram_allocator
+            .allocate(Some(start_addr), size as GuestUsize, None)
+            .ok_or(Error::MemoryRangeAllocation)?;
+
+        // Update the slot so that it can be queried via the I/O port
+        let slot = &mut self.hotplug_slots[self.next_hotplug_slot];
+        slot.active = true;
+        slot.inserting = true;
+        slot.base = region.start_addr().0;
+        slot.length = region.len();
+
+        self.next_hotplug_slot += 1;
+
+        Ok(region)
+    }
+
+    pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+        self.guest_memory.clone()
+    }
+
+    pub fn boot_guest_memory(&self) -> GuestMemoryMmap {
+        self.boot_guest_memory.clone()
+    }
+
+    pub fn allocator(&self) -> Arc<Mutex<SystemAllocator>> {
+        self.allocator.clone()
+    }
+
+    pub fn start_of_device_area(&self) -> GuestAddress {
+        self.start_of_device_area
+    }
+
+    pub fn end_of_device_area(&self) -> GuestAddress {
+        self.end_of_device_area
+    }
+
+    pub fn memory_slot_allocator(&mut self) -> MemorySlotAllocator {
+        let memory_slot_free_list = Arc::clone(&self.memory_slot_free_list);
+        let next_memory_slot = Arc::clone(&self.next_memory_slot);
+        MemorySlotAllocator::new(next_memory_slot, memory_slot_free_list)
+    }
+
+    pub fn allocate_memory_slot(&mut self) -> u32 {
+        self.memory_slot_allocator().next_memory_slot()
+    }
+
+    /// # Safety
+    ///
+    /// `userspace_addr` and `memory_size` must be and remain valid
+    /// until `remove_userspace_mapping` is called.
+    pub unsafe fn create_userspace_mapping(
+        &mut self,
+        guest_phys_addr: u64,
+        memory_size: usize,
+        userspace_addr: *mut u8,
+        mergeable: bool,
+        readonly: bool,
+        log_dirty: bool,
+    ) -> Result<u32, Error> {
+        let slot = self.allocate_memory_slot();
+
+        info!(
+            "Creating userspace mapping: {guest_phys_addr:x} -> {userspace_addr_:x} {memory_size:x}, slot {slot}",
+            userspace_addr_ = userspace_addr as u64
+        );
+
+        // SAFETY: caller promises parameters are correct.
+        unsafe {
+            self.vm
+                .create_user_memory_region(
+                    slot,
+                    guest_phys_addr,
+                    memory_size,
+                    userspace_addr,
+                    readonly,
+                    log_dirty,
+                )
+                .map_err(Error::CreateUserMemoryRegion)?;
+        }
+
+        // SAFETY: the address and size are valid since the
+        // mmap succeeded.
+        let ret = unsafe {
+            libc::madvise(
+                userspace_addr.cast(),
+                memory_size as libc::size_t,
+                libc::MADV_DONTDUMP,
+            )
+        };
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            warn!("Failed to mark mapping as MADV_DONTDUMP: {e}");
+        }
+
+        // Mark the pages as mergeable if explicitly asked for.
+        if mergeable {
+            // SAFETY: the address and size are valid since the
+            // mmap succeeded.
+            let ret = unsafe {
+                libc::madvise(
+                    userspace_addr.cast(),
+                    memory_size as libc::size_t,
+                    libc::MADV_MERGEABLE,
+                )
+            };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                // Safe to unwrap because the error is constructed with
+                // last_os_error(), which ensures the output will be Some().
+                let errno = err.raw_os_error().unwrap();
+                if errno == libc::EINVAL {
+                    warn!("kernel not configured with CONFIG_KSM");
+                } else {
+                    warn!("madvise error: {err}");
+                }
+                warn!("failed to mark pages as mergeable");
+            }
+        }
+
+        info!(
+            "Created userspace mapping: {guest_phys_addr:x} -> {userspace_addr_:x} {memory_size:x}",
+            userspace_addr_ = userspace_addr as u64
+        );
+
+        Ok(slot)
+    }
+
+    /// # Safety
+    ///
+    /// `userspace_addr` and `memory_size` must have previously been passed
+    /// to `create_userspace_mapping`.
+    ///
+    /// # Errors
+    ///
+    /// If this function fails there is no way to clean up resources and you
+    /// should probably crash the process.
+    pub unsafe fn remove_userspace_mapping(
+        &mut self,
+        guest_phys_addr: u64,
+        memory_size: usize,
+        userspace_addr: *mut u8,
+        mergeable: bool,
+        slot: u32,
+    ) -> Result<(), Error> {
+        // SAFETY: Caller promises parameters are correct.
+        unsafe {
+            self.vm
+                .remove_user_memory_region(
+                    slot,
+                    guest_phys_addr,
+                    memory_size,
+                    userspace_addr,
+                    false, /* readonly -- don't care */
+                    false, /* log dirty */
+                )
+                .map_err(Error::RemoveUserMemoryRegion)?;
+        }
+
+        // Mark the pages as unmergeable if there were previously marked as
+        // mergeable.
+        if mergeable {
+            // SAFETY: the address and size are valid as the region was
+            // previously advised.
+            let ret = unsafe {
+                libc::madvise(
+                    userspace_addr.cast(),
+                    memory_size as libc::size_t,
+                    libc::MADV_UNMERGEABLE,
+                )
+            };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                // Safe to unwrap because the error is constructed with
+                // last_os_error(), which ensures the output will be Some().
+                let errno = err.raw_os_error().unwrap();
+                if errno == libc::EINVAL {
+                    warn!("kernel not configured with CONFIG_KSM");
+                } else {
+                    warn!("madvise error: {err}");
+                }
+                warn!("failed to mark pages as unmergeable");
+            }
+        }
+
+        info!(
+            "Removed userspace mapping: {guest_phys_addr:x} -> {userspace_addr_:x} {memory_size:x}",
+            userspace_addr_ = userspace_addr as u64
+        );
+
+        Ok(())
+    }
+
+    pub fn virtio_mem_resize(&mut self, id: &str, size: u64) -> Result<(), Error> {
+        if let Some(memory_zone) = self.memory_zones.get_mut(id) {
+            if let Some(virtio_mem_zone) = &mut memory_zone.virtio_mem_zone {
+                if let Some(virtio_mem_device) = virtio_mem_zone.virtio_device.as_ref() {
+                    virtio_mem_device
+                        .lock()
+                        .unwrap()
+                        .resize(size)
+                        .map_err(Error::VirtioMemResizeFail)?;
+                }
+
+                // Keep the hotplugged_size up to date.
+                virtio_mem_zone.hotplugged_size = size;
+            } else {
+                error!("Failed resizing virtio-mem region: No virtio-mem handler");
+                return Err(Error::MissingVirtioMemHandler);
+            }
+
+            return Ok(());
+        }
+
+        error!("Failed resizing virtio-mem region: Unknown memory zone");
+        Err(Error::UnknownMemoryZone)
+    }
+
+    /// In case this function resulted in adding a new memory region to the
+    /// guest memory, the new region is returned to the caller. The virtio-mem
+    /// use case never adds a new region as the whole hotpluggable memory has
+    /// already been allocated at boot time.
+    pub fn resize(&mut self, desired_ram: u64) -> Result<Option<Arc<GuestRegionMmap>>, Error> {
+        if self.user_provided_zones {
+            error!(
+                "Not allowed to resize guest memory when backed with user \
+                defined memory zones."
+            );
+            return Err(Error::InvalidResizeWithMemoryZones);
+        }
+
+        let mut region: Option<Arc<GuestRegionMmap>> = None;
+        match self.hotplug_method {
+            HotplugMethod::VirtioMem => {
+                if desired_ram >= self.boot_ram {
+                    if !self.dynamic {
+                        return Ok(region);
+                    }
+
+                    self.virtio_mem_resize(DEFAULT_MEMORY_ZONE, desired_ram - self.boot_ram)?;
+                    self.current_ram = desired_ram;
+                }
+            }
+            HotplugMethod::Acpi => {
+                if desired_ram > self.current_ram {
+                    if !self.dynamic {
+                        return Ok(region);
+                    }
+
+                    region =
+                        Some(self.hotplug_ram_region((desired_ram - self.current_ram) as usize)?);
+                    self.current_ram = desired_ram;
+                }
+            }
+        }
+        Ok(region)
+    }
+
+    pub fn resize_zone(&mut self, id: &str, virtio_mem_size: u64) -> Result<(), Error> {
+        if !self.user_provided_zones {
+            error!(
+                "Not allowed to resize guest memory zone when no zone is \
+                defined."
+            );
+            return Err(Error::ResizeZone);
+        }
+
+        self.virtio_mem_resize(id, virtio_mem_size)
+    }
+
+    pub fn is_hardlink(f: &File) -> bool {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: FFI call with correct arguments
+        let ret = unsafe { libc::fstat(f.as_raw_fd(), stat.as_mut_ptr()) };
+        if ret != 0 {
+            error!("Couldn't fstat the backing file");
+            return false;
+        }
+
+        // SAFETY: stat is valid
+        unsafe { (*stat.as_ptr()).st_nlink as usize > 0 }
+    }
+
+    pub fn virtio_mem_plugged_size(&self) -> u64 {
+        self.memory_zones
+            .values()
+            .filter_map(|zone| {
+                zone.virtio_mem_zone
+                    .as_ref()?
+                    .virtio_device
+                    .as_ref()
+                    .map(|dev| dev.lock().unwrap().plugged_size())
+            })
+            .sum()
+    }
+
+    pub fn memory_zones(&self) -> &MemoryZones {
+        &self.memory_zones
+    }
+
+    pub fn memory_zones_mut(&mut self) -> &mut MemoryZones {
+        &mut self.memory_zones
+    }
+
+    pub fn memory_range_table(
+        &self,
+        snapshot: bool,
+    ) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        let mut table = MemoryRangeTable::default();
+
+        for memory_zone in self.memory_zones.values() {
+            if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
+                table.extend(virtio_mem_zone.plugged_ranges());
+            }
+
+            for region in memory_zone.regions() {
+                if snapshot
+                    && let Some(file_offset) = region.file_offset()
+                    && (region.flags() & libc::MAP_SHARED == libc::MAP_SHARED)
+                    && Self::is_hardlink(file_offset.file())
+                {
+                    // In this very specific case, we know the memory
+                    // region is backed by a file on the host filesystem
+                    // that can be accessed by the user, and additionally
+                    // the mapping is shared, which means that modifications
+                    // to the content are written to the actual file.
+                    // When meeting these conditions, we can skip the
+                    // copy of the memory content for this specific region,
+                    // as we can assume the user will have it saved through
+                    // the backing file already.
+                    continue;
+                }
+
+                table.push(MemoryRange {
+                    gpa: region.start_addr().raw_value(),
+                    length: region.len(),
+                });
+            }
+        }
+
+        Ok(table)
+    }
+
+    pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
+        MemoryManagerSnapshotData {
+            memory_ranges: self.snapshot_memory_ranges.clone(),
+            guest_ram_mappings: self.guest_ram_mappings.clone(),
+            start_of_device_area: self.start_of_device_area.0,
+            boot_ram: self.boot_ram,
+            current_ram: self.current_ram,
+            arch_mem_regions: self.arch_mem_regions.clone(),
+            hotplug_slots: self.hotplug_slots.clone(),
+            next_memory_slot: self.next_memory_slot.load(Ordering::SeqCst),
+            selected_slot: self.selected_slot,
+            next_hotplug_slot: self.next_hotplug_slot,
+        }
+    }
+
+    pub fn memory_slot_fds(&self) -> HashMap<u32, RawFd> {
+        let mut memory_slot_fds = HashMap::new();
+        for guest_ram_mapping in &self.guest_ram_mappings {
+            let slot = guest_ram_mapping.slot;
+            let guest_memory = self.guest_memory.memory();
+            let file = guest_memory
+                .find_region(GuestAddress(guest_ram_mapping.gpa))
+                .unwrap()
+                .file_offset()
+                .unwrap()
+                .file();
+            memory_slot_fds.insert(slot, file.as_raw_fd());
+        }
+        memory_slot_fds
+    }
+
+    pub fn acpi_address(&self) -> Option<GuestAddress> {
+        self.acpi_address
+    }
+
+    pub fn num_guest_ram_mappings(&self) -> u32 {
+        self.guest_ram_mappings.len() as u32
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    pub fn uefi_flash(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+        self.uefi_flash.as_ref().unwrap().clone()
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+    pub fn coredump_memory_regions(&self, mem_offset: u64) -> CoredumpMemoryRegions {
+        let mut mapping_sorted_by_gpa = self.guest_ram_mappings.clone();
+        mapping_sorted_by_gpa.sort_by_key(|m| m.gpa);
+
+        let mut mem_offset_in_elf = mem_offset;
+        let mut ram_maps = BTreeMap::new();
+        for mapping in mapping_sorted_by_gpa.iter() {
+            ram_maps.insert(
+                mapping.gpa,
+                CoredumpMemoryRegion {
+                    mem_offset_in_elf,
+                    mem_size: mapping.size,
+                },
+            );
+            mem_offset_in_elf += mapping.size;
+        }
+
+        CoredumpMemoryRegions { ram_maps }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+    pub fn coredump_iterate_save_mem(
+        &mut self,
+        dump_state: &DumpState,
+    ) -> std::result::Result<(), GuestDebuggableError> {
+        let snapshot_memory_ranges = self
+            .memory_range_table(false)
+            .map_err(|e| GuestDebuggableError::Coredump(e.into()))?;
+
+        if snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        let coredump_file = dump_state.file.as_ref().unwrap();
+
+        let guest_memory = self.guest_memory.memory();
+        let mut total_bytes: u64 = 0;
+
+        for range in snapshot_memory_ranges.regions() {
+            let mut offset: u64 = 0;
+            loop {
+                let bytes_written = guest_memory
+                    .write_volatile_to(
+                        GuestAddress(range.gpa + offset),
+                        &mut coredump_file.as_fd(),
+                        (range.length - offset) as usize,
+                    )
+                    .map_err(|e| GuestDebuggableError::Coredump(e.into()))?;
+                offset += bytes_written as u64;
+                total_bytes += bytes_written as u64;
+
+                if offset == range.length {
+                    break;
+                }
+            }
+        }
+
+        debug!("coredump total bytes {total_bytes}");
+        Ok(())
+    }
+
+    pub fn init_dirty_log(&mut self) -> result::Result<(), MigratableError> {
+        if self.dirty_log {
+            self.start_dirty_log()?;
+        }
+
+        Ok(())
+    }
+}
+
+struct MemoryNotify {
+    slot_id: usize,
+}
+
+impl Aml for MemoryNotify {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        let object = aml::Path::new(&format!("M{:03}", self.slot_id));
+        aml::If::new(
+            &aml::Equal::new(&aml::Arg(0), &self.slot_id),
+            vec![&aml::Notify::new(&object, &aml::Arg(1))],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
+struct MemorySlot {
+    slot_id: usize,
+}
+
+impl Aml for MemorySlot {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        aml::Device::new(
+            format!("M{:03}", self.slot_id).as_str().into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C80")),
+                &aml::Name::new("_UID".into(), &self.slot_id),
+                /*
+                _STA return value:
+                Bit [0] – Set if the device is present.
+                Bit [1] – Set if the device is enabled and decoding its resources.
+                Bit [2] – Set if the device should be shown in the UI.
+                Bit [3] – Set if the device is functioning properly (cleared if device failed its diagnostics).
+                Bit [4] – Set if the battery is present.
+                Bits [31:5] – Reserved (must be cleared).
+                */
+                &aml::Method::new(
+                    "_STA".into(),
+                    0,
+                    false,
+                    // Call into MSTA method which will interrogate device
+                    vec![&aml::Return::new(&aml::MethodCall::new(
+                        "MSTA".into(),
+                        vec![&self.slot_id],
+                    ))],
+                ),
+                // Get details of memory
+                &aml::Method::new(
+                    "_CRS".into(),
+                    0,
+                    false,
+                    // Call into MCRS which provides actual memory details
+                    vec![&aml::Return::new(&aml::MethodCall::new(
+                        "MCRS".into(),
+                        vec![&self.slot_id],
+                    ))],
+                ),
+            ],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
+struct MemorySlots {
+    slots: usize,
+}
+
+impl Aml for MemorySlots {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        for slot_id in 0..self.slots {
+            MemorySlot { slot_id }.to_aml_bytes(sink);
+        }
+    }
+}
+
+struct MemoryMethods {
+    slots: usize,
+}
+
+impl Aml for MemoryMethods {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        // Add "MTFY" notification method
+        let mut memory_notifies = Vec::new();
+        for slot_id in 0..self.slots {
+            memory_notifies.push(MemoryNotify { slot_id });
+        }
+
+        let mut memory_notifies_refs: Vec<&dyn Aml> = Vec::new();
+        for memory_notifier in memory_notifies.iter() {
+            memory_notifies_refs.push(memory_notifier);
+        }
+
+        aml::Method::new("MTFY".into(), 2, true, memory_notifies_refs).to_aml_bytes(sink);
+
+        // MSCN method
+        aml::Method::new(
+            "MSCN".into(),
+            0,
+            true,
+            vec![
+                // Take lock defined above
+                &aml::Acquire::new("MLCK".into(), 0xffff),
+                &aml::Store::new(&aml::Local(0), &aml::ZERO),
+                &aml::While::new(
+                    &aml::LessThan::new(&aml::Local(0), &self.slots),
+                    vec![
+                        // Write slot number (in first argument) to I/O port via field
+                        &aml::Store::new(&aml::Path::new("\\_SB_.MHPC.MSEL"), &aml::Local(0)),
+                        // Check if MINS bit is set (inserting)
+                        &aml::If::new(
+                            &aml::Equal::new(&aml::Path::new("\\_SB_.MHPC.MINS"), &aml::ONE),
+                            // Notify device if it is
+                            vec![
+                                &aml::MethodCall::new(
+                                    "MTFY".into(),
+                                    vec![&aml::Local(0), &aml::ONE],
+                                ),
+                                // Reset MINS bit
+                                &aml::Store::new(&aml::Path::new("\\_SB_.MHPC.MINS"), &aml::ONE),
+                            ],
+                        ),
+                        // Check if MRMV bit is set
+                        &aml::If::new(
+                            &aml::Equal::new(&aml::Path::new("\\_SB_.MHPC.MRMV"), &aml::ONE),
+                            // Notify device if it is (with the eject constant 0x3)
+                            vec![
+                                &aml::MethodCall::new("MTFY".into(), vec![&aml::Local(0), &3u8]),
+                                // Reset MRMV bit
+                                &aml::Store::new(&aml::Path::new("\\_SB_.MHPC.MRMV"), &aml::ONE),
+                            ],
+                        ),
+                        &aml::Add::new(&aml::Local(0), &aml::Local(0), &aml::ONE),
+                    ],
+                ),
+                // Release lock
+                &aml::Release::new("MLCK".into()),
+            ],
+        )
+        .to_aml_bytes(sink);
+
+        // Memory status method
+        aml::Method::new(
+            "MSTA".into(),
+            1,
+            true,
+            vec![
+                // Take lock defined above
+                &aml::Acquire::new("MLCK".into(), 0xffff),
+                // Write slot number (in first argument) to I/O port via field
+                &aml::Store::new(&aml::Path::new("\\_SB_.MHPC.MSEL"), &aml::Arg(0)),
+                &aml::Store::new(&aml::Local(0), &aml::ZERO),
+                // Check if MEN_ bit is set, if so make the local variable 0xf (see _STA for details of meaning)
+                &aml::If::new(
+                    &aml::Equal::new(&aml::Path::new("\\_SB_.MHPC.MEN_"), &aml::ONE),
+                    vec![&aml::Store::new(&aml::Local(0), &0xfu8)],
+                ),
+                // Release lock
+                &aml::Release::new("MLCK".into()),
+                // Return 0 or 0xf
+                &aml::Return::new(&aml::Local(0)),
+            ],
+        )
+        .to_aml_bytes(sink);
+
+        // Memory range method
+        aml::Method::new(
+            "MCRS".into(),
+            1,
+            true,
+            vec![
+                // Take lock defined above
+                &aml::Acquire::new("MLCK".into(), 0xffff),
+                // Write slot number (in first argument) to I/O port via field
+                &aml::Store::new(&aml::Path::new("\\_SB_.MHPC.MSEL"), &aml::Arg(0)),
+                &aml::Name::new(
+                    "MR64".into(),
+                    &aml::ResourceTemplate::new(vec![&aml::AddressSpace::new_memory(
+                        aml::AddressSpaceCacheable::Cacheable,
+                        true,
+                        0x0000_0000_0000_0000u64,
+                        0xFFFF_FFFF_FFFF_FFFEu64,
+                        None,
+                    )]),
+                ),
+                &aml::CreateQWordField::new(
+                    &aml::Path::new("MINL"),
+                    &aml::Path::new("MR64"),
+                    &14usize,
+                ),
+                &aml::CreateDWordField::new(
+                    &aml::Path::new("MINH"),
+                    &aml::Path::new("MR64"),
+                    &18usize,
+                ),
+                &aml::CreateQWordField::new(
+                    &aml::Path::new("MAXL"),
+                    &aml::Path::new("MR64"),
+                    &22usize,
+                ),
+                &aml::CreateDWordField::new(
+                    &aml::Path::new("MAXH"),
+                    &aml::Path::new("MR64"),
+                    &26usize,
+                ),
+                &aml::CreateQWordField::new(
+                    &aml::Path::new("LENL"),
+                    &aml::Path::new("MR64"),
+                    &38usize,
+                ),
+                &aml::CreateDWordField::new(
+                    &aml::Path::new("LENH"),
+                    &aml::Path::new("MR64"),
+                    &42usize,
+                ),
+                &aml::Store::new(&aml::Path::new("MINL"), &aml::Path::new("\\_SB_.MHPC.MHBL")),
+                &aml::Store::new(&aml::Path::new("MINH"), &aml::Path::new("\\_SB_.MHPC.MHBH")),
+                &aml::Store::new(&aml::Path::new("LENL"), &aml::Path::new("\\_SB_.MHPC.MHLL")),
+                &aml::Store::new(&aml::Path::new("LENH"), &aml::Path::new("\\_SB_.MHPC.MHLH")),
+                &aml::Add::new(
+                    &aml::Path::new("MAXL"),
+                    &aml::Path::new("MINL"),
+                    &aml::Path::new("LENL"),
+                ),
+                &aml::Add::new(
+                    &aml::Path::new("MAXH"),
+                    &aml::Path::new("MINH"),
+                    &aml::Path::new("LENH"),
+                ),
+                &aml::If::new(
+                    &aml::LessThan::new(&aml::Path::new("MAXL"), &aml::Path::new("MINL")),
+                    vec![&aml::Add::new(
+                        &aml::Path::new("MAXH"),
+                        &aml::ONE,
+                        &aml::Path::new("MAXH"),
+                    )],
+                ),
+                &aml::Subtract::new(&aml::Path::new("MAXL"), &aml::Path::new("MAXL"), &aml::ONE),
+                // Release lock
+                &aml::Release::new("MLCK".into()),
+                &aml::Return::new(&aml::Path::new("MR64")),
+            ],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
+impl Aml for MemoryManager {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        if let Some(acpi_address) = self.acpi_address {
+            // Memory Hotplug Controller
+            aml::Device::new(
+                "_SB_.MHPC".into(),
+                vec![
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
+                    &aml::Name::new("_UID".into(), &"Memory Hotplug Controller"),
+                    // Mutex to protect concurrent access as we write to choose slot and then read back status
+                    &aml::Mutex::new("MLCK".into(), 0),
+                    &aml::Name::new(
+                        "_CRS".into(),
+                        &aml::ResourceTemplate::new(vec![&aml::AddressSpace::new_memory(
+                            aml::AddressSpaceCacheable::NotCacheable,
+                            true,
+                            acpi_address.0,
+                            acpi_address.0 + MEMORY_MANAGER_ACPI_SIZE as u64 - 1,
+                            None,
+                        )]),
+                    ),
+                    // OpRegion and Fields map MMIO range into individual field values
+                    &aml::OpRegion::new(
+                        "MHPR".into(),
+                        aml::OpRegionSpace::SystemMemory,
+                        &(acpi_address.0 as usize),
+                        &MEMORY_MANAGER_ACPI_SIZE,
+                    ),
+                    &aml::Field::new(
+                        "MHPR".into(),
+                        aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
+                        aml::FieldUpdateRule::Preserve,
+                        vec![
+                            aml::FieldEntry::Named(*b"MHBL", 32), // Base (low 4 bytes)
+                            aml::FieldEntry::Named(*b"MHBH", 32), // Base (high 4 bytes)
+                            aml::FieldEntry::Named(*b"MHLL", 32), // Length (low 4 bytes)
+                            aml::FieldEntry::Named(*b"MHLH", 32), // Length (high 4 bytes)
+                        ],
+                    ),
+                    &aml::Field::new(
+                        "MHPR".into(),
+                        aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
+                        aml::FieldUpdateRule::Preserve,
+                        vec![
+                            aml::FieldEntry::Reserved(128),
+                            aml::FieldEntry::Named(*b"MHPX", 32), // PXM
+                        ],
+                    ),
+                    &aml::Field::new(
+                        "MHPR".into(),
+                        aml::FieldAccessType::Byte,
+                        aml::FieldLockRule::NoLock,
+                        aml::FieldUpdateRule::WriteAsZeroes,
+                        vec![
+                            aml::FieldEntry::Reserved(160),
+                            aml::FieldEntry::Named(*b"MEN_", 1), // Enabled
+                            aml::FieldEntry::Named(*b"MINS", 1), // Inserting
+                            aml::FieldEntry::Named(*b"MRMV", 1), // Removing
+                            aml::FieldEntry::Named(*b"MEJ0", 1), // Ejecting
+                        ],
+                    ),
+                    &aml::Field::new(
+                        "MHPR".into(),
+                        aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
+                        aml::FieldUpdateRule::Preserve,
+                        vec![
+                            aml::FieldEntry::Named(*b"MSEL", 32), // Selector
+                            aml::FieldEntry::Named(*b"MOEV", 32), // Event
+                            aml::FieldEntry::Named(*b"MOSC", 32), // OSC
+                        ],
+                    ),
+                    &MemoryMethods {
+                        slots: self.hotplug_slots.len(),
+                    },
+                    &MemorySlots {
+                        slots: self.hotplug_slots.len(),
+                    },
+                ],
+            )
+            .to_aml_bytes(sink);
+        } else {
+            aml::Device::new(
+                "_SB_.MHPC".into(),
+                vec![
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
+                    &aml::Name::new("_UID".into(), &"Memory Hotplug Controller"),
+                    // Empty MSCN for GED
+                    &aml::Method::new("MSCN".into(), 0, true, vec![]),
+                ],
+            )
+            .to_aml_bytes(sink);
+        }
+    }
+}
+
+impl Pausable for MemoryManager {}
+
+impl Drop for MemoryManager {
+    fn drop(&mut self) {
+        self.stop_uffd_handler();
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MemoryManagerSnapshotData {
+    memory_ranges: MemoryRangeTable,
+    guest_ram_mappings: Vec<GuestRamMapping>,
+    start_of_device_area: u64,
+    boot_ram: u64,
+    current_ram: u64,
+    arch_mem_regions: Vec<ArchMemRegion>,
+    hotplug_slots: Vec<HotPlugState>,
+    next_memory_slot: u32,
+    selected_slot: usize,
+    next_hotplug_slot: usize,
+}
+
+impl Snapshottable for MemoryManager {
+    fn id(&self) -> String {
+        MEMORY_MANAGER_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        let memory_ranges = self.memory_range_table(true)?;
+
+        // Store locally this list of ranges as it will be used through the
+        // Transportable::send() implementation. The point is to avoid the
+        // duplication of code regarding the creation of the path for each
+        // region. The 'snapshot' step creates the list of memory regions,
+        // including information about the need to copy a memory region or
+        // not. This saves the 'send' step having to go through the same
+        // process, and instead it can directly proceed with storing the
+        // memory range content for the ranges requiring it.
+        self.snapshot_memory_ranges = memory_ranges;
+
+        Ok(Snapshot::from_data(SnapshotData::new_from_state(
+            &self.snapshot_data(),
+        )?))
+    }
+}
+
+/// Write a single guest RAM region to the snapshot file at `dst_offset`,
+/// streaming populated extents via `SEEK_DATA` / `SEEK_HOLE` on the
+/// backing fd. `set_len(total)` must have been called on `dst` by the
+/// caller. Returns `Ok(true)` if the region was written sparsely, or
+/// `Ok(false)` if `SEEK_HOLE` is unsupported on the source fd (caller
+/// should fall back to dense write).
+fn write_region_sparse(
+    src: &File,
+    src_offset: u64,
+    dst: &File,
+    dst_offset: u64,
+    len: u64,
+) -> io::Result<bool> {
+    let src_fd = src.as_fd();
+    let end = src_offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
+
+    // First call to next_data_extent doubles as a SEEK_HOLE-support probe:
+    // a non-ENXIO error means the filesystem doesn't support sparse-seek;
+    // tell the caller to use the dense path instead.
+    let mut next = match next_data_extent(src_fd, src_offset, end) {
+        Ok(opt) => opt,
+        Err(_) => return Ok(false),
+    };
+
+    const CHUNK: usize = 1 << 20;
+    let mut buf = vec![0u8; CHUNK];
+
+    while let Some((data_off, ext_len)) = next {
+        debug_assert!(data_off >= src_offset);
+        let in_region = data_off
+            .checked_sub(src_offset)
+            .expect("extent precedes src_offset");
+        let mut written = 0u64;
+        while written < ext_len {
+            let this = ((ext_len - written) as usize).min(CHUNK);
+            let slice = &mut buf[..this];
+            let read = src.read_at(slice, data_off + written)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read_at returned 0 inside data extent",
+                ));
+            }
+            let mut wrote_total = 0;
+            while wrote_total < read {
+                let n = dst.write_at(
+                    &slice[wrote_total..read],
+                    dst_offset + in_region + written + wrote_total as u64,
+                )?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write_at returned 0",
+                    ));
+                }
+                wrote_total += n;
+            }
+            written += read as u64;
+        }
+        // Subsequent next_data_extent failures are real I/O errors, not
+        // unsupported-FS, since the first probe succeeded.
+        next = next_data_extent(src_fd, data_off + ext_len, end)?;
+    }
+    Ok(true)
+}
+
+impl Transportable for MemoryManager {
+    fn send(
+        &self,
+        _snapshot: &Snapshot,
+        destination_url: &str,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        if !self.dirty_log {
+            info!("Saving full guest memory to snapshot image file.");
+            let mut memory_file_path = url_to_path(destination_url)?;
+            memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+
+            let mut memory_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&memory_file_path)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+            let total_len: u64 = self
+                .snapshot_memory_ranges
+                .regions()
+                .iter()
+                .map(|r| r.length)
+                .sum();
+
+            // Pre-size the file so per-region write_at lands at the dense-layout
+            // offset. On filesystems that support sparse files unwritten bytes
+            // become real holes; on others the kernel zero-fills the allocation,
+            // which is still byte-correct. If extending the file is not
+            // supported by the destination filesystem (some FUSE backends
+            // reject ftruncate-extend with EOPNOTSUPP), fall back to the dense
+            // write path which never writes past the growing EOF.
+            let sparse_layout = memory_file.set_len(total_len).is_ok();
+
+            let guest_memory = self.guest_memory.memory();
+            let mut file_cursor: u64 = 0;
+
+            for range in self.snapshot_memory_ranges.regions() {
+                let mut wrote_sparse = false;
+                if sparse_layout
+                    && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
+                    && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
+                    && let Some(file_offset) = region.file_offset()
+                {
+                    let region_base = region.start_addr().raw_value();
+                    let in_fd_off = file_offset.start()
+                        + range
+                            .gpa
+                            .checked_sub(region_base)
+                            .expect("range outside its region");
+                    wrote_sparse = write_region_sparse(
+                        file_offset.file(),
+                        in_fd_off,
+                        &memory_file,
+                        file_cursor,
+                        range.length,
+                    )
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                }
+
+                if !wrote_sparse {
+                    // Dense fallback: anonymous mmap or hugetlbfs (no
+                    // SEEK_HOLE). Match the dense layout by seeking to
+                    // file_cursor and streaming bytes via the existing
+                    // volatile copy.
+                    memory_file
+                        .seek(SeekFrom::Start(file_cursor))
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    let mut offset: u64 = 0;
+                    // Manual partial-write loop preserves the workaround for
+                    // https://github.com/rust-vmm/vm-memory/issues/174
+                    loop {
+                        let bytes_written = guest_memory
+                            .write_volatile_to(
+                                GuestAddress(range.gpa + offset),
+                                &mut memory_file,
+                                (range.length - offset) as usize,
+                            )
+                            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                        offset += bytes_written as u64;
+                        if offset == range.length {
+                            break;
+                        }
+                    }
+                }
+
+                file_cursor += range.length;
+            }
+
+            debug_assert_eq!(file_cursor, total_len);
+        } else if self.snapshot_memory_ranges.regions().len() > 1 {
+            info!("Saving dirty guest memory to snapshot image files, one file per memory range.");
+
+            let guest_memory = self.guest_memory.memory();
+            let mut all_sub_regions = Vec::new();
+
+            for (range_idx, range) in self.snapshot_memory_ranges.regions().iter().enumerate() {
+                // Find the corresponding guest memory region
+                let region = match guest_memory.find_region(GuestAddress(range.gpa)) {
+                    Some(r) => {
+                        assert_eq!(r.start_addr().raw_value(), range.gpa);
+                        assert_eq!(r.len(), range.length);
+                        r
+                    }
+                    None => {
+                        return Err(MigratableError::MigrateSend(anyhow!(
+                            "Error finding 'guest memory region' with address {:x}",
+                            range.gpa
+                        )));
+                    }
+                };
+
+                // Get and reset the VMM dirty bitmap
+                let vmm_dirty_bitmap = (**region).bitmap().get_and_reset();
+
+                // Find the guest RAM mapping slot
+                let slot = match self.guest_ram_mappings.iter()
+                    .find(|map| map.gpa == range.gpa && map.size == range.length) {
+                        Some(map) => map.slot,
+                        None => {
+                            return Err(MigratableError::MigrateSend(anyhow!(
+                                "Error finding 'guest ram mapping' with address {:x}",
+                                range.gpa
+                            )));
+                        }
+                    };
+
+                // Retrieve the VM dirty bitmap
+                let vm_dirty_bitmap = self.vm.get_dirty_log(slot, range.gpa, range.length)
+                    .map_err(|e| MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e)))?;
+
+                // Combine the two dirty bitmaps
+                let dirty_bitmap: Vec<u64> = vm_dirty_bitmap.iter()
+                    .zip(vmm_dirty_bitmap.iter())
+                    .map(|(vm_bit, vmm_bit)| vm_bit | vmm_bit)
+                    .collect();
+
+                // Generate sub memory regions from the combined dirty bitmap
+                let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
+                let sub_regions = sub_table.regions();
+
+                if !sub_regions.is_empty() {
+                    // Collect all sub regions for later saving the combined dirty log
+                    all_sub_regions.extend(sub_regions.iter().cloned());
+
+                    // Construct the file path for this memory range's dirty pages
+                    let mut mem_file_path = url_to_path(destination_url)?;
+                    mem_file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, range_idx));
+
+                    // Open the file, create new
+                    let mut mem_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&mem_file_path)
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                    // Write all dirty pages of the sub regions into the file
+                    for sub_region in sub_regions {
+                        let mut offset = 0;
+                        while offset < sub_region.length {
+                            let bytes_written = guest_memory.write_volatile_to(
+                                GuestAddress(sub_region.gpa + offset),
+                                &mut mem_file,
+                                (sub_region.length - offset) as usize,
+                            ).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                            offset += bytes_written as u64;
+                        }
+                    }
+                }
+            }
+
+            // After processing all ranges, save the combined dirty log file
+            if !all_sub_regions.is_empty() {
+                let combined_table = MemoryRangeTable::new(all_sub_regions);
+
+                let mut dirty_log_path = url_to_path(destination_url)?;
+                dirty_log_path.push(DIRTY_LOG_FILENAME);
+
+                let mut dirty_log_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&dirty_log_path)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                let dirty_log_bytes = serde_json::to_vec(&combined_table)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                dirty_log_file.write_all(&dirty_log_bytes)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            }
+        } else {
+            info!("Saving dirty guest memory to snapshot image file.");
+            let guest_memory = self.guest_memory.memory();
+            let length = guest_memory.iter().map(|region| region.len()).sum::<u64>() / SNAPSHOT_FILENUM;
+            for range in self.snapshot_memory_ranges.regions() {
+                let vmm_dirty_bitmap = match self
+                    .guest_memory
+                    .memory()
+                    .find_region(GuestAddress(range.gpa))
+                {
+                    Some(region) => {
+                        assert!(region.start_addr().raw_value() == range.gpa);
+                        assert!(region.len() == range.length);
+                        (**region).bitmap().get_and_reset()
+                    }
+                    None => {
+                        return Err(MigratableError::MigrateSend(anyhow!(
+                            "Error finding 'guest memory region' with address {:x}",
+                            range.gpa
+                        )))
+                    }
+                };
+
+                let slot = match self
+                    .guest_ram_mappings
+                    .iter()
+                    .find(|map| map.gpa == range.gpa && map.size == range.length)
+                {
+                    Some(map) => map.slot,
+                    None => {
+                        return Err(MigratableError::MigrateSend(anyhow!(
+                            "Error finding 'guest ram mapping' with address {:x}",
+                            range.gpa
+                        )))
+                    }
+                };
+
+                let vm_dirty_bitmap = self
+                    .vm
+                    .get_dirty_log(slot, range.gpa, range.length)
+                    .map_err(|e| {
+                        MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e))
+                    })?;
+
+                let dirty_bitmap: Vec<u64> = vm_dirty_bitmap
+                    .iter()
+                    .zip(vmm_dirty_bitmap.iter())
+                    .map(|(x, y)| x | y)
+                    .collect();
+
+                let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
+
+                if !sub_table.regions().is_empty() {
+                    // save dirty bitmap to dirty-log
+                    let mut dirty_log_path = url_to_path(destination_url)?;
+                    dirty_log_path.push(DIRTY_LOG_FILENAME);
+
+                    // Create the dirty log file
+                    let mut dirty_log_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(dirty_log_path)
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                    // Serialize and write the dirty log
+                    let dirty_log =
+                        serde_json::to_vec(&sub_table).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                    dirty_log_file
+                        .write(&dirty_log)
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    for i in 0..SNAPSHOT_FILENUM {
+                        let mut memory_file_path = url_to_path(destination_url)?;
+                        memory_file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, i));
+
+                        // Create the snapshot file for the entire memory
+                        let mut memory_file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .truncate(true)
+                            .open(memory_file_path)
+                            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                        for r in sub_table.regions() {
+                            // Skip regions outside our current partition
+                            let partition_start = range.gpa + length * i;
+                            let partition_end = range.gpa + length * (i + 1);
+
+                            if r.gpa + r.length <= partition_start || r.gpa >= partition_end {
+                                continue;
+                            }
+
+                            // Calculate write parameters based on region position
+                            let (write_gpa, write_len, file_offset) = if r.gpa > partition_start && r.gpa + r.length < partition_end {
+                                // Region fully contained within partition
+                                (r.gpa, r.length, r.gpa - partition_start)
+                            } else if r.gpa > partition_start {
+                                // Region overlaps end of partition
+                                (r.gpa, partition_end - r.gpa, r.gpa - partition_start)
+                            } else if r.gpa + r.length < partition_end {
+                                // Region overlaps start of partition
+                                (partition_start, r.gpa + r.length - partition_start, 0)
+                            } else {
+                                // Region spans entire partition
+                                (partition_start, length, 0)
+                            };
+                            if file_offset != 0 {
+                                memory_file
+                                    .seek(SeekFrom::Start(file_offset))
+                                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                            }
+
+                            let mut offset: u64 = 0;
+                            // Here we are manually handling the retry in case we can't read
+                            // the whole region at once because we can't use the implementation
+                            // from vm-memory::GuestMemory of write_all_to() as it is not
+                            // following the correct behavior. For more info about this issue
+                            // see: https://github.com/rust-vmm/vm-memory/issues/174
+                            loop {
+                                let bytes_written = guest_memory
+                                    .write_volatile_to(
+                                        GuestAddress(write_gpa + offset),
+                                        &mut memory_file,
+                                        (write_len - offset) as usize,
+                                    )
+                                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                                offset += bytes_written as u64;
+
+                                if offset == write_len {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Migratable for MemoryManager {
+    // Start the dirty log in the hypervisor (kvm/mshv).
+    // Also, reset the dirty bitmap logged by the vmm.
+    // Just before we do a bulk copy we want to start/clear the dirty log so that
+    // pages touched during our bulk copy are tracked.
+    fn start_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
+        self.vm.start_dirty_log().map_err(|e| {
+            MigratableError::MigrateSend(anyhow!("Error starting VM dirty log {e}"))
+        })?;
+
+        for r in self.guest_memory.memory().iter() {
+            (**r).bitmap().reset();
+        }
+
+        Ok(())
+    }
+
+    fn stop_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
+        self.vm.stop_dirty_log().map_err(|e| {
+            MigratableError::MigrateSend(anyhow!("Error stopping VM dirty log {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    // Generate a table for the pages that are dirty. The dirty pages are collapsed
+    // together in the table if they are contiguous.
+    fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        let mut table = MemoryRangeTable::default();
+        for r in &self.guest_ram_mappings {
+            let vm_dirty_bitmap = self.vm.get_dirty_log(r.slot, r.gpa, r.size).map_err(|e| {
+                MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {e}"))
+            })?;
+            let vmm_dirty_bitmap = match self.guest_memory.memory().find_region(GuestAddress(r.gpa))
+            {
+                Some(region) => {
+                    assert!(region.start_addr().raw_value() == r.gpa);
+                    assert!(region.len() == r.size);
+                    (**region).bitmap().get_and_reset()
+                }
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest memory region' with address {:x}",
+                        r.gpa
+                    )));
+                }
+            };
+
+            let dirty_bitmap = vm_dirty_bitmap
+                .iter()
+                .zip(vmm_dirty_bitmap.iter())
+                .map(|(x, y)| x | y);
+
+            let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, r.gpa, 4096);
+
+            if sub_table.regions().is_empty() {
+                debug!("Dirty Memory Range Table is empty");
+            } else {
+                debug!("Dirty Memory Range Table:");
+                for range in sub_table.regions() {
+                    debug!("GPA: {:x} size: {} (KiB)", range.gpa, range.length / 1024);
+                }
+            }
+
+            table.extend(sub_table);
+        }
+        Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use std::io::Write;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+    use std::os::unix::fs::FileExt;
+
+    use super::{next_data_extent, write_region_sparse};
+
+    fn make_memfd(size: u64) -> std::fs::File {
+        // SAFETY: memfd_create is a self-contained syscall; we own the
+        // returned fd.
+        let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c"sparse-test".as_ptr(), 0u32) };
+        assert!(fd >= 0, "memfd_create failed");
+        // SAFETY: memfd_create returned a valid fd that we now own; wrap it
+        // in File so it is closed on drop.
+        let f = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        f.set_len(size).unwrap();
+        f
+    }
+
+    fn collect_extents(
+        fd: BorrowedFd<'_>,
+        start: u64,
+        end: u64,
+    ) -> std::io::Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        let mut cursor = start;
+        while let Some((off, len)) = next_data_extent(fd, cursor, end)? {
+            out.push((off, len));
+            cursor = off + len;
+        }
+        Ok(out)
+    }
+
+    /// Punch an explicit hole into `f`. Tests use this instead of relying on
+    /// "didn't write here" to mean "is a hole": modern shmem/tmpfs may
+    /// allocate a multi-page folio on the first write and report the whole
+    /// folio as data, so per-page hole tracking after a partial write is
+    /// not portable. `fallocate(PUNCH_HOLE)` is the explicit "deallocate
+    /// these pages" syscall and is honored on every Linux filesystem we
+    /// run tests on (tmpfs, ext4, xfs, btrfs).
+    fn punch_hole(f: &std::fs::File, off: u64, len: u64) {
+        // SAFETY: FFI call; f is a valid open fd for the duration of the
+        // call.
+        let r = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                off as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        assert_eq!(
+            r,
+            0,
+            "fallocate PUNCH_HOLE off={off} len={len}: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+
+    /// Build a file with a deterministic sparse layout: write each `(off,
+    /// len, byte)` data extent, then punch every gap into a real hole.
+    /// The resulting `SEEK_DATA`/`SEEK_HOLE` extents match `data` exactly,
+    /// regardless of folio/THP allocation policy on the backing FS.
+    fn sparse_layout(f: &std::fs::File, total: u64, data: &[(u64, u64, u8)]) {
+        f.set_len(total).unwrap();
+        for &(off, len, byte) in data {
+            f.write_all_at(&vec![byte; len as usize], off).unwrap();
+        }
+        let mut sorted: Vec<(u64, u64)> = data.iter().map(|&(o, l, _)| (o, l)).collect();
+        sorted.sort_unstable();
+        let mut cursor = 0u64;
+        for (off, len) in sorted {
+            assert!(off >= cursor, "overlapping data extents");
+            if off > cursor {
+                punch_hole(f, cursor, off - cursor);
+            }
+            cursor = off + len;
+        }
+        if cursor < total {
+            punch_hole(f, cursor, total - cursor);
+        }
+    }
+
+    #[test]
+    fn empty_memfd_has_no_data_extents() {
+        let f = make_memfd(4096 * 16);
+        let extents = collect_extents(f.as_fd(), 0, 4096 * 16).unwrap();
+        assert!(extents.is_empty(), "got {extents:?}");
+    }
+
+    #[test]
+    fn written_pages_show_as_data_extents() {
+        let f = make_memfd(0);
+        sparse_layout(
+            &f,
+            4096 * 16,
+            &[(4096 * 2, 4096, 0xAB), (4096 * 5, 4096 * 2, 0xCD)],
+        );
+        let extents = collect_extents(f.as_fd(), 0, 4096 * 16).unwrap();
+        assert_eq!(extents, vec![(4096 * 2, 4096), (4096 * 5, 4096 * 2)]);
+    }
+
+    #[test]
+    fn enumeration_respects_window() {
+        let f = make_memfd(4096 * 16);
+        // Fully populate the file, then leave it as one big data extent.
+        f.write_all_at(&vec![0xEEu8; 4096 * 16], 0).unwrap();
+        let extents = collect_extents(f.as_fd(), 4096 * 4, 4096 * 8).unwrap();
+        assert_eq!(extents, vec![(4096 * 4, 4096 * 4)]);
+    }
+
+    #[test]
+    fn dense_file_yields_single_extent() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0xEEu8; 4096 * 8]).unwrap();
+        let f = tmp.reopen().unwrap();
+        let extents = collect_extents(f.as_fd(), 0, 4096 * 8).unwrap();
+        assert_eq!(extents, vec![(0, 4096 * 8)]);
+    }
+
+    #[test]
+    fn sparse_file_yields_extents_at_written_positions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let f = tmp.reopen().unwrap();
+        sparse_layout(&f, 4096 * 16, &[(4096 * 4, 4096 * 2, 0x55)]);
+        let extents = collect_extents(f.as_fd(), 0, 4096 * 16).unwrap();
+        assert_eq!(extents, vec![(4096 * 4, 4096 * 2)]);
+    }
+
+    #[test]
+    fn single_extent_at_zero_offset() {
+        let src = make_memfd(0);
+        sparse_layout(&src, 4096 * 16, &[(4096 * 3, 4096 * 2, 0x42)]);
+
+        // Pre-fill dst with a sentinel byte so we can verify that
+        // write_region_sparse only wrote where the source had data: any
+        // byte outside the source-data extent must remain the sentinel.
+        // This is FS-independent (does not depend on whether the dst
+        // filesystem reports holes after a partial write).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        dst.write_all_at(&vec![0xFE; 4096 * 16], 0).unwrap();
+
+        let used = write_region_sparse(&src, 0, &dst, 0, 4096 * 16).unwrap();
+        assert!(used);
+
+        let buf = std::fs::read(tmp.path()).unwrap();
+        assert!(buf[..4096 * 3].iter().all(|&b| b == 0xFE));
+        assert!(buf[4096 * 3..4096 * 5].iter().all(|&b| b == 0x42));
+        assert!(buf[4096 * 5..].iter().all(|&b| b == 0xFE));
+    }
+
+    #[test]
+    fn two_regions_in_same_destination_file_at_dst_offset() {
+        let src_a = make_memfd(0);
+        sparse_layout(&src_a, 4096 * 16, &[(4096, 4096 * 2, 0xAA)]);
+        let src_b = make_memfd(0);
+        sparse_layout(&src_b, 4096 * 16, &[(4096 * 5, 4096 * 3, 0xBB)]);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        sparse_layout(&dst, 4096 * 32, &[]);
+
+        let _ = write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
+        let _ = write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
+
+        let buf = std::fs::read(tmp.path()).unwrap();
+        assert!(buf[..4096].iter().all(|&b| b == 0));
+        assert!(buf[4096..4096 * 3].iter().all(|&b| b == 0xAA));
+        assert!(buf[4096 * 3..4096 * 16].iter().all(|&b| b == 0));
+        assert!(buf[4096 * 16..4096 * 21].iter().all(|&b| b == 0));
+        assert!(buf[4096 * 21..4096 * 24].iter().all(|&b| b == 0xBB));
+        assert!(buf[4096 * 24..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn extent_at_non_zero_src_offset() {
+        let src = make_memfd(0);
+        sparse_layout(&src, 4096 * 32, &[(4096 * 20, 4096 * 2, 0x77)]);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        sparse_layout(&dst, 4096 * 16, &[]);
+
+        let used = write_region_sparse(&src, 4096 * 16, &dst, 0, 4096 * 16).unwrap();
+        assert!(used);
+
+        let buf = std::fs::read(tmp.path()).unwrap();
+        assert!(buf[..4096 * 4].iter().all(|&b| b == 0));
+        assert!(buf[4096 * 4..4096 * 6].iter().all(|&b| b == 0x77));
+        assert!(buf[4096 * 6..].iter().all(|&b| b == 0));
+    }
+
+    /// Round-trip: write two regions sparsely into a snapshot file, then
+    /// read them back using the same next_data_extent + read_at pattern
+    /// that fill_saved_regions uses. Verifies the restore path recovers
+    /// the original content including holes.
+    #[test]
+    fn round_trip_sparse_write_then_read() {
+        let src_a = make_memfd(0);
+        sparse_layout(&src_a, 4096 * 16, &[(4096 * 2, 4096 * 3, 0xAA)]);
+
+        let src_b = make_memfd(0);
+        sparse_layout(&src_b, 4096 * 16, &[(4096 * 10, 4096 * 4, 0xBB)]);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        let total = 4096u64 * 32;
+        sparse_layout(&dst, total, &[]);
+
+        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
+        write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
+
+        // Read back using next_data_extent + read_at, mirroring
+        // fill_saved_regions's sparse restore path.
+        let snap = tmp.reopen().unwrap();
+        let regions: Vec<(u64, u64)> = vec![(0, 4096 * 16), (4096 * 16, 4096 * 16)];
+        let mut restored = vec![0u8; total as usize];
+
+        for &(file_cursor, region_len) in &regions {
+            let end = file_cursor + region_len;
+            let mut cursor = file_cursor;
+            while let Some((data_off, ext_len)) =
+                next_data_extent(snap.as_fd(), cursor, end).unwrap()
+            {
+                let in_region = (data_off - file_cursor) as usize;
+                let dst_start = file_cursor as usize + in_region;
+                snap.read_at(
+                    &mut restored[dst_start..dst_start + ext_len as usize],
+                    data_off,
+                )
+                .unwrap();
+                cursor = data_off + ext_len;
+            }
+        }
+
+        // Verify content matches a dense read.
+        let dense = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(restored, dense);
+
+        // Verify the actual data landed in the right places.
+        assert!(restored[..4096 * 2].iter().all(|&b| b == 0));
+        assert!(restored[4096 * 2..4096 * 5].iter().all(|&b| b == 0xAA));
+        assert!(restored[4096 * 5..4096 * 26].iter().all(|&b| b == 0));
+        assert!(restored[4096 * 26..4096 * 30].iter().all(|&b| b == 0xBB));
+        assert!(restored[4096 * 30..].iter().all(|&b| b == 0));
+    }
+}

@@ -11,6 +11,7 @@ COMPONENTS += agent
 COMPONENTS += dragonball
 COMPONENTS += runtime
 COMPONENTS += runtime-rs
+COMPONENTS += cloud-hypervisor
 
 # List of available tools
 TOOLS =

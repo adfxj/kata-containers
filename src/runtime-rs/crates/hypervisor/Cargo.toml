@@ -1,5 +1,5 @@
 [package]
-name = "hypervisor"
+name = "kata-hypervisor"
 version = "0.1.0"
 authors = { workspace = true }
 edition = { workspace = true }
@@ -43,7 +43,6 @@ kata-types = { workspace = true }
 logging = { workspace = true }
 protocols = { workspace = true, features = ["async"] }
 persist = { workspace = true }
-ch-config = { workspace = true, optional = true }
 tests_utils = { workspace = true }
 
 # Dependencies that only exist to support hypervisors which upstream only
@@ -80,11 +79,22 @@ dragonball = { workspace = true, features = [
     "host-device",
 ], optional = true }
 
-[features]
-default = ["cloud-hypervisor"]
+vmm = { workspace = true, features = [
+    "dbus_api",
+    "dhat-heap",
+    "fw_cfg",
+    "guest_debug",
+    "io_uring",
+    "kvm",
+    "pvmemcontrol",
+    "sev_snp",
+    "tdx",
+    "tracing",
+], optional = true}
 
+[features]
 dragonball = ["dep:dragonball"]
-cloud-hypervisor = ["ch-config"]
+cloud-hypervisor = ["dep:vmm"]
 
 [dev-dependencies]
 serial_test = "2.0.0"

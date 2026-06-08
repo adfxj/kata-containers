@@ -47,7 +47,7 @@ rtnetlink = "0.21"
 
 # Local dependencies
 agent = { workspace = true }
-hypervisor = { workspace = true }
+kata-hypervisor = { workspace = true }
 kata-types = { workspace = true }
 kata-sys-util = { workspace = true }
 logging = { workspace = true }
