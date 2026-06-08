@@ -98,6 +98,7 @@ cpu_features = "@CPUFEATURES@"
 # > 0 <= number of physical cores --> will be set to the specified number
 # > number of physical cores      --> will be set to the actual number of physical cores
 default_vcpus = @DEFAULTVCPUS_NV@
+fixed_vcpus = @DEFFIXEDVCPUS_NV@
 
 # Default maximum number of vCPUs per SB/VM:
 # unspecified or == 0             --> will be set to the actual number of physical cores or to the maximum number
@@ -141,6 +142,7 @@ reclaim_guest_freed_memory = false
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFAULTMEMORY_NV@
+fixed_memory = @DEFFIXEDMEMSZ_NV@
 #
 # Default memory slots per SB/VM.
 # If unspecified then it will be set @DEFMEMSLOTS@.

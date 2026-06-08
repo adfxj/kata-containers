@@ -640,6 +640,13 @@ pub struct CpuInfo {
     /// - `> number of physical cores`: Set to actual number of physical cores
     #[serde(default)]
     pub default_vcpus: f32,
+    /// Fixed vCPU overhead to be added when sandbox/container CPU limits are provided.
+    ///
+    /// This value is used by runtime-rs static sandbox sizing as:
+    /// - if no CPU limits are provided: use `default_vcpus`
+    /// - if CPU limits are provided: use `fixed_vcpus + workload_vcpus`
+    #[serde(default)]
+    pub fixed_vcpus: f32,
 
     /// Default maximum number of vCPUs per SB/VM:
     /// - Unspecified or `0`: Set to actual number of physical cores or
@@ -689,6 +696,12 @@ impl CpuInfo {
             return Err(std::io::Error::other(format!(
                 "The default_vcpus({}) is greater than default_maxvcpus({})",
                 self.default_vcpus, self.default_maxvcpus,
+            )));
+        }
+        if self.fixed_vcpus > self.default_vcpus {
+            return Err(std::io::Error::other(format!(
+                "The fixed_vcpus({}) is greater than default_vcpus({})",
+                self.fixed_vcpus, self.default_vcpus,
             )));
         }
         Ok(())
@@ -972,6 +985,14 @@ pub struct MemoryInfo {
     /// Default memory size in MiB for SB/VM.
     #[serde(default)]
     pub default_memory: u32,
+    /// Fixed memory overhead in MiB to be added when sandbox/container memory
+    /// limits are provided.
+    ///
+    /// This value is used by runtime-rs static sandbox sizing as:
+    /// - if no memory limits are provided: use `default_memory`
+    /// - if memory limits are provided: use `fixed_memory + workload_memory`
+    #[serde(default)]
+    pub fixed_memory: u32,
 
     /// Default maximum memory in MiB per SB/VM:
     /// - Unspecified or `0`: Set to actual physical RAM
@@ -1216,6 +1237,12 @@ impl MemoryInfo {
             return Err(std::io::Error::other(
                 "Configured memory slots for guest VM are zero",
             ));
+        }
+        if self.fixed_memory > self.default_memory {
+            return Err(std::io::Error::other(format!(
+                "Configured fixed memory for guest VM ({}) exceeds default_memory ({})",
+                self.fixed_memory, self.default_memory
+            )));
         }
 
         Ok(())
@@ -1990,11 +2017,13 @@ mod tests {
                 input: &mut CpuInfo {
                     cpu_features: "".to_string(),
                     default_vcpus: 0.0,
+                    fixed_vcpus: 0.0,
                     default_maxvcpus: 0,
                 },
                 output: CpuInfo {
                     cpu_features: "".to_string(),
                     default_vcpus,
+                    fixed_vcpus: 0.0,
                     default_maxvcpus: node_cpus as u32,
                 },
             },
@@ -2003,11 +2032,13 @@ mod tests {
                 input: &mut CpuInfo {
                     cpu_features: "a,b,c".to_string(),
                     default_vcpus: 9999999.0,
+                    fixed_vcpus: 0.0,
                     default_maxvcpus: 9999999,
                 },
                 output: CpuInfo {
                     cpu_features: "a,b,c".to_string(),
                     default_vcpus: node_cpus,
+                    fixed_vcpus: 0.0,
                     default_maxvcpus: node_cpus as u32,
                 },
             },
@@ -2016,12 +2047,29 @@ mod tests {
                 input: &mut CpuInfo {
                     cpu_features: "a, b ,c".to_string(),
                     default_vcpus: -1.0,
+                    fixed_vcpus: 0.0,
                     default_maxvcpus: 1,
                 },
                 output: CpuInfo {
                     cpu_features: "a,b,c".to_string(),
                     default_vcpus: 1.0,
+                    fixed_vcpus: 0.0,
                     default_maxvcpus: 1,
+                },
+            },
+            TestData {
+                desc: "fixed_vcpus explicitly set keeps value",
+                input: &mut CpuInfo {
+                    cpu_features: "x, y".to_string(),
+                    default_vcpus: 0.0,
+                    fixed_vcpus: 0.5,
+                    default_maxvcpus: 2,
+                },
+                output: CpuInfo {
+                    cpu_features: "x,y".to_string(),
+                    default_vcpus,
+                    fixed_vcpus: 0.5,
+                    default_maxvcpus: 2,
                 },
             },
         ];
@@ -2045,7 +2093,28 @@ mod tests {
                 "test[{}] default_maxvcpus",
                 tc.desc
             );
+            assert_eq!(
+                tc.input.fixed_vcpus, tc.output.fixed_vcpus,
+                "test[{}] fixed_vcpus",
+                tc.desc
+            );
         }
+    }
+
+    #[test]
+    fn test_memory_info_adjust_config_keeps_explicit_fixed_memory() {
+        let mut mem = MemoryInfo {
+            default_memory: 1024,
+            fixed_memory: 512,
+            default_maxmemory: 4096,
+            ..Default::default()
+        };
+
+        mem.adjust_config().unwrap();
+
+        assert_eq!(mem.fixed_memory, 512);
+        assert_eq!(mem.default_memory, 1024);
+        assert_eq!(mem.default_maxmemory, 4096);
     }
 
     #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
