@@ -8,7 +8,9 @@ extern crate procfs;
 use prometheus::{Encoder, Gauge, GaugeVec, IntCounter, Opts, Registry, TextEncoder};
 
 use anyhow::{anyhow, Result};
+use nix::sys::statfs;
 use slog::warn;
+use std::io::BufRead;
 use std::sync::Mutex;
 use tracing::instrument;
 
@@ -73,6 +75,12 @@ lazy_static! {
 
     static ref GUEST_MEMINFO: GaugeVec =
     GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"meminfo"), "Statistics about memory usage in the system."), &["item"]).unwrap();
+
+    static ref GUEST_FILESYSTEM_BYTES: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"filesystem_bytes"), "Guest filesystem space usage in bytes."), &["mount","device","item"]).unwrap();
+
+    static ref GUEST_FILESYSTEM_INODES: GaugeVec =
+    GaugeVec::new(Opts::new(format!("{}_{}",NAMESPACE_KATA_GUEST,"filesystem_inodes"), "Guest filesystem inode usage."), &["mount","device","item"]).unwrap();
 }
 
 #[instrument]
@@ -125,6 +133,8 @@ fn register_metrics() -> Result<()> {
     REGISTRY.register(Box::new(GUEST_NETDEV_STAT.clone()))?;
     REGISTRY.register(Box::new(GUEST_DISKSTAT.clone()))?;
     REGISTRY.register(Box::new(GUEST_MEMINFO.clone()))?;
+    REGISTRY.register(Box::new(GUEST_FILESYSTEM_BYTES.clone()))?;
+    REGISTRY.register(Box::new(GUEST_FILESYSTEM_INODES.clone()))?;
 
     Ok(())
 }
@@ -264,6 +274,121 @@ fn update_guest_metrics() {
         }
         Ok(meminfo) => {
             set_gauge_vec_meminfo(&GUEST_MEMINFO, &meminfo);
+        }
+    }
+
+    // get filesystem space usage via statfs
+    update_guest_filesystem_metrics();
+}
+
+fn unescape_mount_path(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let rest = &chars.as_str()[..3.min(chars.as_str().len())];
+            match rest {
+                "040" => {
+                    result.push(' ');
+                    let _ = chars.nth(2);
+                }
+                "011" => {
+                    result.push('\t');
+                    let _ = chars.nth(2);
+                }
+                "012" => {
+                    result.push('\n');
+                    let _ = chars.nth(2);
+                }
+                "134" => {
+                    result.push('\\');
+                    let _ = chars.nth(2);
+                }
+                _ => result.push(c),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+#[instrument]
+fn update_guest_filesystem_metrics() {
+    const REAL_FS_TYPES: &[&str] = &["ext4", "xfs", "btrfs", "vfat", "overlay"];
+
+    let file = match std::fs::File::open("/proc/mounts") {
+        Ok(f) => f,
+        Err(e) => {
+            info!(sl(), "failed to open /proc/mounts: {:?}", e);
+            return;
+        }
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut seen_devices = std::collections::HashSet::new();
+
+    for line in reader.lines().map_while(|line| line.ok()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+
+        let device = fields[0];
+        let mount_point = unescape_mount_path(fields[1]);
+        let fstype = fields[2];
+
+        if !REAL_FS_TYPES.contains(&fstype) {
+            continue;
+        }
+
+        // Skip read-only filesystems (usage never changes at runtime)
+        if fields.len() >= 4 && (fields[3] == "ro" || fields[3].starts_with("ro,")) {
+            continue;
+        }
+
+        if !seen_devices.insert(device.to_string()) {
+            continue;
+        }
+
+        let device_name = device.rsplit('/').next().unwrap_or(device);
+
+        match statfs::statfs(mount_point.as_str()) {
+            Ok(stat) => {
+                let block_size = stat.block_size() as u64;
+                let total = stat.blocks() * block_size;
+                let available = stat.blocks_available() * block_size;
+                let used = total - (stat.blocks_free() * block_size);
+
+                let mp = mount_point.as_str();
+
+                GUEST_FILESYSTEM_BYTES
+                    .with_label_values(&[mp, device_name, "total"])
+                    .set(total as f64);
+                GUEST_FILESYSTEM_BYTES
+                    .with_label_values(&[mp, device_name, "used"])
+                    .set(used as f64);
+                GUEST_FILESYSTEM_BYTES
+                    .with_label_values(&[mp, device_name, "available"])
+                    .set(available as f64);
+
+                let inodes_total = stat.files();
+                let inodes_free = stat.files_free();
+                let inodes_used = inodes_total - inodes_free;
+
+                GUEST_FILESYSTEM_INODES
+                    .with_label_values(&[mp, device_name, "total"])
+                    .set(inodes_total as f64);
+                GUEST_FILESYSTEM_INODES
+                    .with_label_values(&[mp, device_name, "used"])
+                    .set(inodes_used as f64);
+                GUEST_FILESYSTEM_INODES
+                    .with_label_values(&[mp, device_name, "available"])
+                    .set(inodes_free as f64);
+            }
+            Err(e) => {
+                info!(sl(), "statfs failed for {}: {:?}", mount_point, e);
+            }
         }
     }
 }
