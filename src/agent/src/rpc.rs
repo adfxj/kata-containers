@@ -505,8 +505,11 @@ impl AgentService {
             }
         };
 
-        if eid.is_empty() {
-            // eid is empty, signal all the remaining processes in the container cgroup
+        if eid.is_empty() && sig == libc::SIGKILL {
+            // we are signaling the init process (eid is empty),
+            // and the container is being forcefully stopped (we are sending a SIGKILL),
+            // so we signal all the remaining processes in the container cgroup
+            // to ensure all processes in the container are terminated
             info!(
                 sl(),
                 "signal all the remaining processes";

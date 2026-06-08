@@ -1,0 +1,24 @@
+#
+# Copyright (c) 2026 # TODO
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: graceful-termination-test
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: sigterm-trap
+    image: quay.io/prometheus/busybox:latest
+    command:
+    - "/bin/sh"
+    - "-c"
+    - |
+      echo -n 'start' > /dev/termination-log
+      trap "echo -n ', received SIGINT' >> /dev/termination-log; tail -f /dev/null & wait" SIGINT
+      trap "echo -n ', received SIGTERM' >> /dev/termination-log; tail -f /dev/null & wait" SIGTERM
+      tail -f /dev/null & wait
+      echo -n ', normal exit' >> /dev/termination-log
+  terminationGracePeriodSeconds: 1
