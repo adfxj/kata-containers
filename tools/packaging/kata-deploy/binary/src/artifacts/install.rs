@@ -118,10 +118,6 @@ pub async fn install_artifacts(config: &Config, container_runtime: &str) -> Resu
         install_custom_runtime_configs(config, container_runtime)?;
     }
 
-    if std::env::var("HOST_OS").unwrap_or_default() == "cbl-mariner" {
-        configure_mariner(config).await?;
-    }
-
     let expand_runtime_classes_for_nfd = nfd::setup_nfd_rules(config).await?;
 
     if expand_runtime_classes_for_nfd {
@@ -203,6 +199,50 @@ fn write_common_drop_ins(
     Ok(())
 }
 
+fn install_default_runtime_drop_in(shim: &str, config_d_dir: &str) -> Result<()> {
+    let drop_in_source = format!("/custom-configs/dropin-{}.toml", shim);
+    let drop_in_dest = format!("{}/50-user-overrides.toml", config_d_dir);
+    reconcile_optional_drop_in(
+        Some(&drop_in_source),
+        &drop_in_dest,
+        &format!("user drop-in for shim {shim}"),
+    )
+}
+
+fn reconcile_optional_drop_in(
+    source_file: Option<&str>,
+    destination_file: &str,
+    context: &str,
+) -> Result<()> {
+    let destination_path = Path::new(destination_file);
+
+    if let Some(source_file) = source_file {
+        let source_path = Path::new(source_file);
+        if source_path.exists() {
+            info!(
+                "Copying {}: {} -> {}",
+                context, source_file, destination_file
+            );
+            fs::copy(source_path, destination_path).with_context(|| {
+                format!(
+                    "Failed to copy {} from {} to {}",
+                    context, source_file, destination_file
+                )
+            })?;
+            return Ok(());
+        }
+    }
+
+    // Reconcile upgrades/migrations: remove stale override from previous deployments.
+    if destination_path.exists() {
+        info!("Removing stale {}: {}", context, destination_file);
+        fs::remove_file(destination_path)
+            .with_context(|| format!("Failed to remove stale {}: {}", context, destination_file))?;
+    }
+
+    Ok(())
+}
+
 /// Each custom runtime gets an isolated directory under custom-runtimes/{handler}/
 /// Custom runtimes inherit the same drop-in configurations as standard runtimes
 /// (installation prefix, debug, kernel_params, and for k0s on Go/remote runtime: kubelet root) plus any user-provided overrides.
@@ -261,22 +301,14 @@ fn install_custom_runtime_configs(config: &Config, container_runtime: &str) -> R
             container_runtime,
         )?;
 
-        // Copy user-provided drop-in file if provided (at 50-overrides.toml)
-        if let Some(ref drop_in_src) = runtime.drop_in_file {
-            let drop_in_dest = format!("{}/50-overrides.toml", config_d_dir);
-
-            info!(
-                "Copying drop-in for {}: {} -> {}",
-                runtime.handler, drop_in_src, drop_in_dest
-            );
-
-            fs::copy(drop_in_src, &drop_in_dest).with_context(|| {
-                format!(
-                    "Failed to copy drop-in from {} to {}",
-                    drop_in_src, drop_in_dest
-                )
-            })?;
-        }
+        // Copy user-provided drop-in file if provided (at 50-overrides.toml).
+        // If it was removed from values in a later upgrade/migration, remove stale file.
+        let drop_in_dest = format!("{}/50-overrides.toml", config_d_dir);
+        reconcile_optional_drop_in(
+            runtime.drop_in_file.as_deref(),
+            &drop_in_dest,
+            &format!("custom runtime drop-in for {}", runtime.handler),
+        )?;
     }
 
     info!(
@@ -890,6 +922,9 @@ async fn configure_shim_config(config: &Config, shim: &str, container_runtime: &
     // Generate common drop-in files (shared with custom runtimes)
     write_common_drop_ins(config, shim, &config_d_dir, container_runtime)?;
 
+    // Apply user-provided drop-in for default runtimes, if present.
+    install_default_runtime_drop_in(shim, &config_d_dir)?;
+
     configure_hypervisor_annotations(config, shim, &kata_config_file).await?;
 
     if config
@@ -1272,65 +1307,6 @@ async fn configure_hypervisor_annotations(
 
 async fn configure_experimental_force_guest_pull(config_file: &Path) -> Result<()> {
     set_toml_bool_to_true(config_file, "runtime.experimental_force_guest_pull")
-}
-
-async fn configure_mariner(config: &Config) -> Result<()> {
-    let mariner_hypervisor_name = "clh";
-    let config_paths = [
-        format!(
-            "{}/share/defaults/kata-containers/configuration-clh.toml",
-            config.host_install_dir
-        ),
-        format!(
-            "{}/share/defaults/kata-containers/runtime-rs/configuration-clh-runtime-rs.toml",
-            config.host_install_dir
-        ),
-    ];
-
-    for config_path in config_paths {
-        let config_file = Path::new(&config_path);
-
-        if !config_file.exists() {
-            continue;
-        }
-
-        let static_resource_mgmt_path = "runtime.static_sandbox_resource_mgmt";
-        set_toml_bool_to_true(config_file, static_resource_mgmt_path)?;
-
-        let clh_path = format!("{}/bin/cloud-hypervisor-glibc", config.dest_dir);
-        let valid_paths_field =
-            format!("hypervisor.{mariner_hypervisor_name}.valid_hypervisor_paths");
-        let existing_paths = toml_utils::get_toml_array(config_file, &valid_paths_field)
-            .unwrap_or_else(|_| Vec::new());
-
-        if !existing_paths.iter().any(|p| p == &clh_path) {
-            let mut new_paths = existing_paths.clone();
-            new_paths.push(clh_path.clone());
-            log::debug!(
-                "Updating {} in {}: old={:?} new={:?}",
-                valid_paths_field,
-                config_file.display(),
-                existing_paths,
-                new_paths
-            );
-            toml_utils::set_toml_array(config_file, &valid_paths_field, &new_paths)?;
-        }
-
-        let path_field = format!("hypervisor.{mariner_hypervisor_name}.path");
-        let current_path = toml_utils::get_toml_value(config_file, &path_field).unwrap_or_default();
-        if !current_path.contains(&clh_path) {
-            log::debug!(
-                "Updating {} in {}: old=\"{}\" new=\"{}\"",
-                path_field,
-                config_file.display(),
-                current_path,
-                clh_path
-            );
-            toml_utils::set_toml_value(config_file, &path_field, &format!("\"{clh_path}\""))?;
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
