@@ -148,6 +148,8 @@ const CONSOLE_DEVICE_NAME: &str = "__console";
 const PVPANIC_DEVICE_NAME: &str = "__pvpanic";
 #[cfg(feature = "ivshmem")]
 const IVSHMEM_DEVICE_NAME: &str = "__ivshmem";
+#[cfg(target_arch = "x86_64")]
+const SYS_CTRL_DEVICE_NAME: &str = "__sys_ctrl";
 
 // Devices that the user may name and for which we generate
 // identifiers if the user doesn't give one
@@ -162,6 +164,7 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+const MAX_WORKER_THREADS: usize = 5;
 
 /// Errors associated with device manager
 #[derive(Error, Debug)]
@@ -675,6 +678,10 @@ pub enum DeviceManagerError {
     #[error("Disk resize error")]
     DiskResize(#[source] virtio_devices::block::Error),
 
+    /// Failed to set system control state.
+    #[error("Failed to set system control state")]
+    SysCtrlSetRestore(#[source] io::Error),
+
     /// Disk image type does not match expected type.
     #[error(
         "Disk image type does not match expected type: specified = {specified}, detected = {detected}"
@@ -1155,6 +1162,9 @@ pub struct DeviceManager {
     #[cfg(feature = "ivshmem")]
     // ivshmem device
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
+
+    #[cfg(target_arch = "x86_64")]
+    sys_ctrl: Option<Arc<Mutex<devices::legacy::SysCtrl>>>,
 }
 
 /// Create per-PCI-segment MMIO allocators over the range `[start, end]`.
@@ -1446,6 +1456,8 @@ impl DeviceManager {
             #[cfg(feature = "ivshmem")]
             ivshmem_device: None,
             _acpi_cpu_hotplug_controller: acpi_cpu_hotplug_controller,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: None,
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -2087,6 +2099,31 @@ impl DeviceManager {
             .io_bus
             .insert(debug_port, 0x80, 0x1)
             .map_err(DeviceManagerError::BusError)?;
+
+        // 0x0680 system control port
+        if self.config.lock().unwrap().sys_ctrl {
+            let id = String::from(SYS_CTRL_DEVICE_NAME);
+            let sys_ctrl = Arc::new(Mutex::new(devices::legacy::SysCtrl::new(
+                id.clone(),
+                state_from_id(self.snapshot.as_ref(), id.as_str())
+                    .map_err(DeviceManagerError::RestoreGetState)?,
+            )));
+            self.sys_ctrl = Some(Arc::clone(&sys_ctrl));
+            self.bus_devices
+                .push(Arc::clone(&sys_ctrl) as Arc<dyn BusDeviceSync>);
+            self.address_manager
+                .io_bus
+                .insert(
+                    sys_ctrl.clone(),
+                    0x680,
+                    0x1,
+                )
+                .map_err(DeviceManagerError::BusError)?;
+            self.device_tree
+                .lock()
+                .unwrap()
+                .insert(id.clone(), device_node!(id, sys_ctrl));
+        }
 
         Ok(())
     }
@@ -5236,6 +5273,28 @@ impl DeviceManager {
         self.device_tree.clone()
     }
 
+    pub fn sys_started(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sys_ctrl) = &self.sys_ctrl {
+            return sys_ctrl.clone().lock().unwrap().sys_started();
+        }
+
+        true
+    }
+
+    pub fn sys_restore(&mut self) -> DeviceManagerResult<()> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sys_ctrl) = &self.sys_ctrl {
+            return sys_ctrl.clone()
+                    .lock()
+                    .unwrap()
+                    .sys_restore()
+                    .map_err(DeviceManagerError::SysCtrlSetRestore);
+        }
+
+        Ok(())
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub fn notify_power_button(&self) -> DeviceManagerResult<()> {
         self.ged_notification_device
@@ -5328,6 +5387,8 @@ impl IvshmemOps for IvshmemHandler {
             None,
             None,
             None,
+            false,
+            0,
             false,
         )
         .map_err(|_| IvshmemError::CreateUserMemoryRegion)?;
@@ -5671,15 +5732,57 @@ impl Snapshottable for DeviceManager {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        let mut snapshot = Snapshot::from_data(SnapshotData::new_from_state(&self.state())?);
-
         // We aggregate all devices snapshots.
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
-            if let Some(migratable) = &device_node.migratable {
-                let mut migratable = migratable.lock().unwrap();
-                snapshot.add_snapshot(migratable.id(), migratable.snapshot()?);
+        let devices: Vec<_> = self
+            .device_tree
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, node)| node.clone())
+            .collect();
+
+        let work_thread_num = if devices.len() > MAX_WORKER_THREADS {
+            MAX_WORKER_THREADS
+        } else {
+            // always greater than 0
+            devices.len()
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(work_thread_num)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let snapshot = rt.block_on(async move {
+            let snapshot = Arc::new(tokio::sync::Mutex::new(Snapshot::from_data(
+                SnapshotData::new_from_state(&self.state())?,
+            )));
+            let mut thread_pool = vec![];
+
+            for device_node in devices.into_iter() {
+                if let Some(migratable) = device_node.migratable {
+                    let snapshot_arc = snapshot.clone();
+                    thread_pool.push(tokio::spawn(async move {
+                        let (id, snapshot_data) = {
+                            let mut migratable = migratable.lock().unwrap();
+                            (migratable.id(), migratable.snapshot()?)
+                        };
+                        snapshot_arc.lock().await.add_snapshot(id, snapshot_data);
+                        Ok(())
+                    }));
+                }
             }
-        }
+            for t in thread_pool {
+                t.await.unwrap()?;
+            }
+            if let Ok(mutex) = Arc::try_unwrap(snapshot) {
+                Ok(mutex.into_inner())
+            } else {
+                Err(MigratableError::Snapshot(anyhow!(
+                    "Could not unwrap snapshot mutex"
+                )))
+            }
+        })?;
 
         Ok(snapshot)
     }

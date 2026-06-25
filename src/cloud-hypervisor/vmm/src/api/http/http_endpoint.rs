@@ -49,7 +49,7 @@ use crate::api::{
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
     VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
     VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot, VmPatchFs,
+    VmShutdown, VmSnapshot, VmPatchFs, VmPauseToSnapshot, VmResumeFromSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -421,6 +421,7 @@ vm_action_put_handler_body!(VmAddDevice);
 vm_action_put_handler_body!(AddDisk);
 vm_action_put_handler_body!(VmAddFs);
 vm_action_put_handler_body!(VmPatchFs);
+vm_action_put_handler_body!(VmPauseToSnapshot);
 vm_action_put_handler_body!(VmAddGenericVhostUser);
 vm_action_put_handler_body!(VmAddPmem);
 vm_action_put_handler_body!(VmAddVdpa);
@@ -430,6 +431,7 @@ vm_action_put_handler_body!(VmRemoveDevice);
 vm_action_put_handler_body!(VmResizeDisk);
 vm_action_put_handler_body!(VmResizeZone);
 vm_action_put_handler_body!(VmSnapshot);
+vm_action_put_handler_body!(VmResumeFromSnapshot);
 vm_action_put_handler_body!(VmReceiveMigration);
 vm_action_put_handler_body!(VmSendMigration);
 
@@ -569,6 +571,35 @@ impl EndpointHandler for VmInfo {
                     let info_serialized = serde_json::to_string(&info).unwrap();
 
                     response.set_body(Body::new(info_serialized));
+                    response
+                }
+                Err(e) => error_response(e, StatusCode::InternalServerError),
+            },
+            _ => error_response(HttpError::BadRequest, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.wait_start handler
+pub struct VmWaitStart {}
+
+impl EndpointHandler for VmWaitStart {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Get => match crate::api::VmWaitStart
+                .send(api_notifier, api_sender, ())
+                .map_err(HttpError::ApiError)
+            {
+                Ok(wait_start) => {
+                    let mut response = Response::new(Version::Http11, StatusCode::OK);
+                    let wait_start_serialized = serde_json::to_string(&wait_start).unwrap();
+
+                    response.set_body(Body::new(wait_start_serialized));
                     response
                 }
                 Err(e) => error_response(e, StatusCode::InternalServerError),

@@ -306,6 +306,12 @@ fn get_cli_options_sorted(
             .help("Log file. Standard error is used if not specified")
             .num_args(1)
             .group("logging"),
+        Arg::new("sys-ctrl")
+            .long("sys-ctrl")
+            .help("Enable system controller")
+            .num_args(0)
+            .action(ArgAction::SetTrue)
+            .group("vm-config"),
         Arg::new("log-format")
             .long("log-format")
             .help("Log format. Available tokens: {boottime}, {wallclock}, {pid}, {tid}, {thread}, {level}, {location}, {msg}")
@@ -1016,6 +1022,7 @@ mod unit_tests {
             },
             balloon: None,
             fs: None,
+            patch_fs: None,
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
@@ -1056,6 +1063,8 @@ mod unit_tests {
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: false,
         };
 
         assert_eq!(expected_vm_config, result_vm_config);

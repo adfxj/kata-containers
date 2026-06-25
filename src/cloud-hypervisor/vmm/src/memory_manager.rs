@@ -12,8 +12,8 @@ use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{ffi, result, thread};
@@ -44,8 +44,8 @@ use vm_memory::{
 };
 use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
-    UffdError,
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotConfig, SnapshotData,
+    SnapshotType, Snapshottable, Transportable, UffdError,
 };
 use vmm_sys_util::eventfd::EventFd;
 
@@ -54,9 +54,13 @@ use crate::config::MemoryRestoreMode;
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
-use crate::migration::{recv_vm_dirty_log, url_to_path};
+use crate::migration::{recv_vm_dirty_log, url_to_path, memory_blob_to_path};
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, uffd};
+use crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon;
+use crate::soft_dirty::{
+    clear_soft_dirty, filter_memory_ranges_by_anon_and_soft_dirty, probe_soft_dirty_support,
+};
 
 /// Find the next populated (data) extent in `[cursor, end)` of `fd`,
 /// driven by `lseek(SEEK_DATA)` / `lseek(SEEK_HOLE)`. Returns
@@ -117,6 +121,115 @@ const SNAPSHOT_FILENAME: &str = "memory-ranges";
 const SNAPSHOT_FILENUM: u64 = 16;
 
 const DIRTY_LOG_FILENAME: &str = "dirty-log.json";
+
+struct MemorySnapshotFile {
+    path: PathBuf,
+    external: bool,
+}
+
+impl MemorySnapshotFile {
+    fn from_snapshot_url(
+        snapshot_url: &str,
+        memory_vol_url: Option<&str>,
+    ) -> result::Result<Self, MigratableError> {
+        if let Some(memory_vol_url) = memory_vol_url {
+            Ok(Self {
+                path: memory_blob_to_path(memory_vol_url)?,
+                external: true,
+            })
+        } else {
+            let mut path = url_to_path(snapshot_url)?;
+            path.push(SNAPSHOT_FILENAME);
+            Ok(Self {
+                path,
+                external: false,
+            })
+        }
+    }
+
+    fn open_read(&self) -> io::Result<File> {
+        OpenOptions::new().read(true).open(&self.path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn is_external(&self) -> bool {
+        self.external
+    }
+
+    fn open_read_write(&self) -> result::Result<File, MigratableError> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))
+    }
+
+    fn open_for_fresh_write(&self) -> result::Result<File, MigratableError> {
+        if self.external {
+            return self.open_read_write();
+        }
+
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))
+    }
+}
+
+#[cfg(test)]
+mod memory_snapshot_file_tests {
+    use super::{MemorySnapshotFile, SNAPSHOT_FILENAME};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ch-memory-snapshot-{}-{}", name, nanos))
+    }
+
+    #[test]
+    fn default_snapshot_target_uses_memory_ranges_file() {
+        let dir_path = unique_temp_path("dir");
+        fs::create_dir_all(&dir_path).unwrap();
+        let snapshot_url = format!("file://{}", dir_path.display());
+
+        let target = MemorySnapshotFile::from_snapshot_url(&snapshot_url, None).unwrap();
+        assert!(!target.external);
+        assert_eq!(target.path, dir_path.join(SNAPSHOT_FILENAME));
+        target.open_for_fresh_write().unwrap();
+        assert!(target.path.exists());
+
+        fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn external_snapshot_target_keeps_existing_file_intact() {
+        let file_path = unique_temp_path("external");
+        fs::write(&file_path, b"existing-memory").unwrap();
+        let original_len = fs::metadata(&file_path).unwrap().len();
+
+        let target = MemorySnapshotFile::from_snapshot_url(
+            "file:///unused",
+            Some(file_path.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(target.external);
+        target.open_for_fresh_write().unwrap();
+
+        assert_eq!(fs::metadata(&file_path).unwrap().len(), original_len);
+        fs::remove_file(file_path).unwrap();
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -264,6 +377,11 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    /// Whether the soft-dirty tracker is currently armed (i.e. the previous
+    /// snapshot cycle ended with a successful `clear_soft_dirty()`, so the
+    /// pagemap bit-55 set this cycle reflects only writes that happened
+    /// since then).
+    soft_dirty_armed: AtomicBool,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -872,6 +990,193 @@ impl MemoryManager {
         Ok((memory_regions, memory_zones))
     }
 
+    fn fill_saved_regions_full(
+        &mut self,
+        source_url: &str,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        let guest_memory = Arc::new(self.guest_memory.memory());
+        let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+        // Open (read only) the snapshot file.
+        let mut memory_file = OpenOptions::new()
+            .read(true)
+            .open(memory_file_path)
+            .map_err(Error::SnapshotOpen)?;
+
+        for range in saved_regions.regions() {
+            let mut offset: u64 = 0;
+            // Here we are manually handling the retry in case we can't write
+            // the whole region at once because we can't use the implementation
+            // from vm-memory::GuestMemory of read_exact_from() as it is not
+            // following the correct behavior. For more info about this issue
+            // see: https://github.com/rust-vmm/vm-memory/issues/174
+            loop {
+                let bytes_read = guest_memory
+                    .read_volatile_from(
+                        GuestAddress(range.gpa + offset),
+                        &mut memory_file,
+                        (range.length - offset) as usize,
+                    )
+                    .map_err(Error::SnapshotCopy)?;
+                offset += bytes_read as u64;
+
+                if offset == range.length {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fill_saved_regions_multi_range(
+        &mut self,
+        source_url: &str,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        let guest_memory = Arc::new(self.guest_memory.memory());
+        let memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+        let regions = saved_regions.regions();
+        let sub_table = recv_vm_dirty_log(source_url).map_err(Error::Restore)?;
+        let barrier = Arc::new(Barrier::new(regions.len()));
+
+        thread::scope(|s| {
+            for (idx, range) in regions.iter().enumerate() {
+                let barrier = Arc::clone(&barrier);
+                let guest_memory_clone = Arc::clone(&guest_memory);
+                let sub_table = sub_table.clone();
+                let mut base_path = memory_file_path.clone();
+
+                s.spawn(move || -> Result<(), Error> {
+                    barrier.wait();
+
+                    base_path.push(format!("{}-{}", SNAPSHOT_FILENAME, idx));
+
+                    let mut memory_file = OpenOptions::new()
+                        .read(true)
+                        .open(&base_path)
+                        .map_err(Error::SnapshotOpen)?;
+
+                    for r in sub_table.regions() {
+                        if r.gpa + r.length <= range.gpa || r.gpa >= range.gpa + range.length {
+                            continue;
+                        }
+
+                        let read_gpa = r.gpa.max(range.gpa);
+                        let read_end = (r.gpa + r.length).min(range.gpa + range.length);
+                        let read_len = read_end - read_gpa;
+
+                        let mut offset = 0;
+                        while offset < read_len {
+                            let bytes_read = guest_memory_clone
+                                .read_volatile_from(
+                                    GuestAddress(read_gpa + offset),
+                                    &mut memory_file,
+                                    (read_len - offset) as usize,
+                                )
+                                .map_err(Error::SnapshotCopy)?;
+                            offset += bytes_read as u64;
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        });
+
+        Ok(())
+    }
+
+    fn fill_saved_regions_one_range(
+        &mut self,
+        source_url: &str,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        let guest_memory = Arc::new(self.guest_memory.memory());
+        let memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+        let sub_table = recv_vm_dirty_log(source_url).map_err(Error::Restore)?;
+
+        for range in saved_regions.regions() {
+            // Here we are manually handling the retry in case we can't write
+            // the whole region at once because we can't use the implementation
+            // from vm-memory::GuestMemory of read_exact_from() as it is not
+            // following the correct behavior. For more info about this issue
+            // see: https://github.com/rust-vmm/vm-memory/issues/174
+            let barrier = Arc::new(Barrier::new(SNAPSHOT_FILENUM as usize));
+
+            thread::scope(|s| {
+                for i in 0..SNAPSHOT_FILENUM {
+                    let barrier = Arc::clone(&barrier);
+                    let mut file_path_clone = memory_file_path.clone();
+                    let guest_memory_clone = Arc::clone(&guest_memory);
+                    let sub_table_clone = sub_table.clone();
+
+                    s.spawn(move || -> Result<(), Error> {
+                        // Wait until all threads have been spawned to avoid contention
+                        // over mmap_sem between thread stack allocation and page faulting.
+                        barrier.wait();
+                        // Open (read only) the snapshot file.
+                        file_path_clone.push(format!("{}-{}", SNAPSHOT_FILENAME, i));
+                        let mut memory_file = OpenOptions::new()
+                            .read(true)
+                            .open(file_path_clone)
+                            .map_err(Error::SnapshotOpen)?;
+
+                        let length = range.length / SNAPSHOT_FILENUM;
+                        for r in sub_table_clone.regions() {
+                            // Skip regions outside our current partition
+                            let partition_start = range.gpa + length * i;
+                            let partition_end = range.gpa + length * (i + 1);
+
+                            if r.gpa + r.length <= partition_start || r.gpa >= partition_end {
+                                continue;
+                            }
+
+                            // Calculate write parameters based on region position
+                            let (write_gpa, write_len, file_offset) = if r.gpa > partition_start && r.gpa + r.length < partition_end {
+                                // Region fully contained within partition
+                                (r.gpa, r.length, r.gpa - partition_start)
+                            } else if r.gpa > partition_start {
+                                // Region overlaps end of partition
+                                (r.gpa, partition_end - r.gpa, r.gpa - partition_start)
+                            } else if r.gpa + r.length < partition_end {
+                                // Region overlaps start of partition
+                                (partition_start, r.gpa + r.length - partition_start, 0)
+                            } else {
+                                // Region spans entire partition
+                                (partition_start, length, 0)
+                            };
+                            if file_offset != 0 {
+                                memory_file
+                                    .seek(SeekFrom::Start(file_offset))
+                                    .map_err(|e| Error::SeekMemoryFile(e.into()))?;
+                            }
+
+                            let mut offset: u64 = 0;
+                            loop {
+                                let bytes_read = guest_memory_clone
+                                    .read_volatile_from(
+                                        GuestAddress(write_gpa + offset),
+                                        &mut memory_file,
+                                        (write_len - offset) as usize,
+                                    )
+                                    .map_err(Error::SnapshotCopy)?;
+                                offset += bytes_read as u64;
+
+                                if offset == write_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            });
+        }
+
+        Ok(())
+    }
+
     fn fill_saved_regions(
         &mut self,
         source_url: &str,
@@ -883,166 +1188,13 @@ impl MemoryManager {
 
         let mut dirty_log_file_path = url_to_path(source_url).map_err(Error::Restore)?;
         dirty_log_file_path.push(String::from(DIRTY_LOG_FILENAME));
-        let memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
-        let guest_memory = Arc::new(self.guest_memory.memory());
 
         if !dirty_log_file_path.exists() {
-            let mut file_path_clone = memory_file_path.clone();
-            file_path_clone.push(String::from(SNAPSHOT_FILENAME));
-            // Open (read only) the snapshot file.
-            let mut memory_file = OpenOptions::new()
-                .read(true)
-                .open(file_path_clone)
-                .map_err(Error::SnapshotOpen)?;
-
-            for range in saved_regions.regions() {
-                let mut offset: u64 = 0;
-                // Here we are manually handling the retry in case we can't write
-                // the whole region at once because we can't use the implementation
-                // from vm-memory::GuestMemory of read_exact_from() as it is not
-                // following the correct behavior. For more info about this issue
-                // see: https://github.com/rust-vmm/vm-memory/issues/174
-                loop {
-                    let bytes_read = guest_memory
-                        .read_volatile_from(
-                            GuestAddress(range.gpa + offset),
-                            &mut memory_file,
-                            (range.length - offset) as usize,
-                        )
-                        .map_err(Error::SnapshotCopy)?;
-                    offset += bytes_read as u64;
-
-                    if offset == range.length {
-                        break;
-                    }
-                }
-            }
+            self.fill_saved_regions_full(source_url, saved_regions)?;
         } else if saved_regions.regions().len() > 1 {
-            let regions = saved_regions.regions();
-            let sub_table = recv_vm_dirty_log(source_url).map_err(Error::Restore)?;
-            let barrier = Arc::new(Barrier::new(regions.len()));
-
-            thread::scope(|s| {
-                for (idx, range) in regions.iter().enumerate() {
-                    let barrier = Arc::clone(&barrier);
-                    let guest_memory_clone = Arc::clone(&guest_memory);
-                    let sub_table = sub_table.clone();
-                    let mut base_path = memory_file_path.clone();
-
-                    s.spawn(move || -> Result<(), Error> {
-                        barrier.wait();
-
-                        base_path.push(format!("{}-{}", SNAPSHOT_FILENAME, idx));
-
-                        let mut memory_file = OpenOptions::new()
-                            .read(true)
-                            .open(&base_path)
-                            .map_err(Error::SnapshotOpen)?;
-
-                        for r in sub_table.regions() {
-                            if r.gpa + r.length <= range.gpa || r.gpa >= range.gpa + range.length {
-                                continue;
-                            }
-
-                            let read_gpa = r.gpa.max(range.gpa);
-                            let read_end = (r.gpa + r.length).min(range.gpa + range.length);
-                            let read_len = read_end - read_gpa;
-
-                            let mut offset = 0;
-                            while offset < read_len {
-                                let bytes_read = guest_memory_clone
-                                    .read_volatile_from(
-                                        GuestAddress(read_gpa + offset),
-                                        &mut memory_file,
-                                        (read_len - offset) as usize,
-                                    )
-                                    .map_err(Error::SnapshotCopy)?;
-                                offset += bytes_read as u64;
-                            }
-                        }
-                        Ok(())
-                    });
-                }
-            });
+            self.fill_saved_regions_multi_range(source_url, saved_regions)?;
         } else {
-            let sub_table = recv_vm_dirty_log(source_url).map_err(Error::Restore)?;
-            for range in saved_regions.regions() {
-                // Here we are manually handling the retry in case we can't write
-                // the whole region at once because we can't use the implementation
-                // from vm-memory::GuestMemory of read_exact_from() as it is not
-                // following the correct behavior. For more info about this issue
-                // see: https://github.com/rust-vmm/vm-memory/issues/174
-                let barrier = Arc::new(Barrier::new(SNAPSHOT_FILENUM as usize));
-
-                thread::scope(|s| {
-                    for i in 0..SNAPSHOT_FILENUM {
-                        let barrier = Arc::clone(&barrier);
-                        let mut file_path_clone = memory_file_path.clone();
-                        let guest_memory_clone = Arc::clone(&guest_memory);
-                        let sub_table_clone = sub_table.clone();
-
-                        s.spawn(move || -> Result<(), Error> {
-                            // Wait until all threads have been spawned to avoid contention
-                            // over mmap_sem between thread stack allocation and page faulting.
-                            barrier.wait();
-                            // Open (read only) the snapshot file.
-                            file_path_clone.push(format!("{}-{}", SNAPSHOT_FILENAME, i));
-                            let mut memory_file = OpenOptions::new()
-                                .read(true)
-                                .open(file_path_clone)
-                                .map_err(Error::SnapshotOpen)?;
-
-                            let length = range.length / SNAPSHOT_FILENUM;
-                            for r in sub_table_clone.regions() {
-                                // Skip regions outside our current partition
-                                let partition_start = range.gpa + length * i;
-                                let partition_end = range.gpa + length * (i + 1);
-
-                                if r.gpa + r.length <= partition_start || r.gpa >= partition_end {
-                                    continue;
-                                }
-
-                                // Calculate write parameters based on region position
-                                let (write_gpa, write_len, file_offset) = if r.gpa > partition_start && r.gpa + r.length < partition_end {
-                                    // Region fully contained within partition
-                                    (r.gpa, r.length, r.gpa - partition_start)
-                                } else if r.gpa > partition_start {
-                                    // Region overlaps end of partition
-                                    (r.gpa, partition_end - r.gpa, r.gpa - partition_start)
-                                } else if r.gpa + r.length < partition_end {
-                                    // Region overlaps start of partition
-                                    (partition_start, r.gpa + r.length - partition_start, 0)
-                                } else {
-                                    // Region spans entire partition
-                                    (partition_start, length, 0)
-                                };
-                                if file_offset != 0 {
-                                    memory_file
-                                        .seek(SeekFrom::Start(file_offset))
-                                        .map_err(|e| Error::SeekMemoryFile(e.into()))?;
-                                }
-
-                                let mut offset: u64 = 0;
-                                loop {
-                                    let bytes_read = guest_memory_clone
-                                        .read_volatile_from(
-                                            GuestAddress(write_gpa + offset),
-                                            &mut memory_file,
-                                            (write_len - offset) as usize,
-                                        )
-                                        .map_err(Error::SnapshotCopy)?;
-                                    offset += bytes_read as u64;
-
-                                    if offset == write_len {
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(())
-                        });
-                    }
-                });
-            }
+            self.fill_saved_regions_one_range(source_url, saved_regions)?;
         }
 
         Ok(())
@@ -1993,6 +2145,7 @@ impl MemoryManager {
             prefault: config.prefault,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            soft_dirty_armed: AtomicBool::new(false),
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
@@ -2020,18 +2173,22 @@ impl MemoryManager {
         memory_restore_mode: MemoryRestoreMode,
         phys_bits: u8,
         exit_evt: &EventFd,
+        memory_vol_url: Option<&str>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
-            let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
-            memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+            let memory_file_target =
+                MemorySnapshotFile::from_snapshot_url(source_url, memory_vol_url)
+                    .map_err(Error::Restore)?;
 
-            let fast_restore = Self::support_fast_restore_check(config);
+            let mut dirty_log_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+            dirty_log_file_path.push(String::from(DIRTY_LOG_FILENAME));
+
+            let fast_restore = Self::support_fast_restore_check(config, dirty_log_file_path);
             let memory_file = if fast_restore {
                 info!("restore non-shared map, speed up restore by share map memory file");
                 Some(
-                    OpenOptions::new()
-                        .read(true)
-                        .open(memory_file_path.clone())
+                    memory_file_target
+                        .open_read()
                         .map_err(Error::SnapshotOpen)?,
                 )
             } else {
@@ -2074,8 +2231,8 @@ impl MemoryManager {
         }
     }
 
-    fn support_fast_restore_check(config: &MemoryConfig) -> bool {
-        !config.exist_shared() && !config.has_hotplug_virtio_mem()
+    fn support_fast_restore_check(config: &MemoryConfig, dirty_log_file_path: PathBuf) -> bool {
+        !dirty_log_file_path.exists() && !config.exist_shared() && !config.has_hotplug_virtio_mem()
     }
 
     fn memfd_create(name: &ffi::CStr, flags: u32) -> Result<RawFd, io::Error> {
@@ -2978,6 +3135,746 @@ impl MemoryManager {
 
         Ok(())
     }
+
+    pub fn save_range_to_file(
+        &self,
+        mut memory_file: &File,
+        range: &MemoryRange,
+        file_offset: u64,
+    ) -> result::Result<(), MigratableError> {
+        let guest_memory = self.guest_memory.memory();
+        let mut offset: u64 = 0;
+
+        if file_offset != 0 {
+            memory_file
+                .seek(SeekFrom::Start(file_offset))
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        }
+        // Here we are manually handling the retry in case we can't read
+        // the whole region at once because we can't use the implementation
+        // from vm-memory::GuestMemory of write_all_to() as it is not
+        // following the correct behavior. For more info about this issue
+        // see: https://github.com/rust-vmm/vm-memory/issues/174
+        loop {
+            let bytes_written = guest_memory
+                .write_volatile_to(
+                    GuestAddress(range.gpa + offset),
+                    &mut memory_file.as_fd(),
+                    (range.length - offset) as usize,
+                )
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            offset += bytes_written as u64;
+
+            if offset == range.length {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save a pagemap_anon incremental snapshot.
+    ///
+    /// This method creates a full snapshot by merging the base snapshot with
+    /// pagemap_anon-filtered anonymous pages (CoW pages) from current VM memory.
+    /// Only pages that Guest actually wrote to (triggering Copy-on-Write from
+    /// the MAP_PRIVATE mmap) are saved from guest memory; non-anonymous pages
+    /// When a base snapshot exists at the destination, the file is opened in
+    /// read-write mode and only the anonymous (CoW) pages are overwritten;
+    /// non-anonymous regions keep their original content from the base.
+    ///
+    /// When no base snapshot exists (cold start), a new file is created and
+    /// only anonymous pages are written; non-anonymous regions are left as
+    /// holes (zeros) in the pre-allocated file.
+    ///
+    /// The resulting snapshot file is in the same format as a regular full
+    /// snapshot and can be restored without any special handling.
+    fn send_pagemap_anon_memory(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        let guest_memory = self.guest_memory.memory();
+
+        // Use pagemap + kpageflags to filter memory ranges, keeping only anonymous pages (CoW)
+        let (filtered_ranges, stats) =
+            filter_memory_ranges_by_pagemap_anon(&guest_memory, &self.snapshot_memory_ranges)
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!(
+                        "Failed to filter memory with pagemap_anon: {}",
+                        e
+                    ))
+                })?;
+
+        info!(
+            "PagemapAnon snapshot: total={} bytes ({} pages), anon={} bytes ({} pages), savings={:.1}%",
+            stats.total_bytes,
+            stats.total_pages,
+            stats.saved_bytes,
+            stats.anon_pages,
+            stats.savings_percentage()
+        );
+
+        let memory_file_target =
+            MemorySnapshotFile::from_snapshot_url(destination_url, memory_vol_url.as_deref())?;
+        if !memory_file_target.path().exists() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Base snapshot file not found at {:?}, incremental (pagemap_anon) snapshot requires an existing base file",
+                memory_file_target.path()
+            )));
+        }
+
+        info!(
+            "Base snapshot found at {:?}, overwriting anonymous pages in-place",
+            memory_file_target.path()
+        );
+        let memory_file = memory_file_target.open_read_write()?;
+
+        // Build a GPA-to-file-offset mapping for calculating offsets.
+        let mut gpa_to_file_offset: Vec<(u64, u64, u64)> = Vec::new();
+        let mut offset = 0_u64;
+        for range in self.snapshot_memory_ranges.regions() {
+            gpa_to_file_offset.push((range.gpa, range.length, offset));
+            offset += range.length;
+        }
+
+        // Write only anonymous pages to the snapshot file.
+        // With a base, non-anon regions already have the correct content.
+        // Without a base, non-anon regions are zeros (sparse holes).
+        for range in filtered_ranges.regions() {
+            let file_off =
+                Self::calculate_file_offset_for_gpa(range.gpa, range.length, &gpa_to_file_offset)?;
+            self.save_range_to_file(&memory_file, range, file_off)?;
+        }
+
+        info!(
+            "PagemapAnon snapshot saved: {} anon bytes written to {:?}",
+            stats.saved_bytes,
+            memory_file_target.path()
+        );
+        Ok(())
+    }
+
+    /// Save a soft-dirty incremental snapshot.
+    ///
+    /// This method writes a delta snapshot containing only the pages that
+    /// must change in the destination snapshot file. We compute that set as
+    /// the **intersection** of:
+    ///   * pagemap_anon (Copy-on-Written pages — only these can ever differ
+    ///     from the base snapshot file the guest was restored from), and
+    ///   * `/proc/self/pagemap` bit 55 (pages written since the previous
+    ///     `clear_soft_dirty()`).
+    ///
+    /// To remain compatible with the rest of the VMM (snapshot consumers
+    /// expect a self-contained, full-size memory image at the destination),
+    /// the resulting file is **not** a raw delta. We prepare a base image
+    /// at the destination and then overwrite only the filtered pages on
+    /// top.
+    ///
+    /// Lazy probe / arm:
+    /// Soft-dirty tracking is **not** probed nor armed at boot or restore
+    /// time anymore — `clear_refs(4)` walks every PTE under mmap_lock and
+    /// is the dominant pause-time cost on multi-GiB guests. Instead, the
+    /// very first call to this method:
+    ///   1. Tries `probe_soft_dirty_support()` (which itself performs the
+    ///      initial `clear_soft_dirty()` and arms tracking on success).
+    ///   2. Writes a snapshot using the pagemap_anon set (every CoW page),
+    ///      because there is no prior soft-dirty window to take an
+    ///      intersection against.
+    ///   3. Sets `soft_dirty_armed = true` only on probe success.
+    ///
+    /// Subsequent calls (with `soft_dirty_armed == true`) take the
+    /// anon ∩ soft-dirty intersection, write only the changed CoW pages,
+    /// and re-arm via `clear_soft_dirty()` for the next cycle.
+    ///
+    /// Degradation: if `probe_soft_dirty_support()` returns false (kernel
+    /// without `CONFIG_MEM_SOFT_DIRTY=y`), or any `clear_soft_dirty()`
+    /// call fails at runtime, this method silently falls back to the
+    /// pagemap_anon path and leaves `soft_dirty_armed` at false so the
+    /// next cycle retries. The fallback is logged but not surfaced as
+    /// an error to the caller.
+    fn send_soft_dirty_memory(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        if self.snapshot_memory_ranges.is_empty() {
+            return Ok(());
+        }
+
+        // First-time path (or any time we are not currently armed): we
+        // cannot trust the soft-dirty bitmap because there is no prior
+        // `clear_soft_dirty()` to anchor the window, so write the full
+        // anon-page set. Then try to arm tracking for the next cycle.
+        if !self.soft_dirty_armed.load(Ordering::Acquire) {
+            info!(
+                "Soft-dirty: tracker not yet armed, writing full anon-page snapshot \
+                 and attempting to arm soft-dirty for the next cycle"
+            );
+
+            // Write a full anon-page (pagemap_anon) snapshot. This already
+            // matches what `send_pagemap_anon_memory` does and it produces
+            // a self-contained snapshot file.
+            self.send_pagemap_anon_memory(destination_url, memory_vol_url)?;
+
+            // Probe + arm. `probe_soft_dirty_support()` writes "4" to
+            // /proc/self/clear_refs, which both detects kernel support
+            // (returns false on EINVAL when CONFIG_MEM_SOFT_DIRTY=n) and,
+            // on success, clears every PTE's bit 55 — which is exactly
+            // the "arm" operation for the next snapshot window.
+            if probe_soft_dirty_support() {
+                self.soft_dirty_armed.store(true, Ordering::Release);
+                info!("Soft-dirty: tracker armed for next snapshot cycle");
+            } else {
+                debug!(
+                    "Soft-dirty: kernel does not support CONFIG_MEM_SOFT_DIRTY, \
+                     subsequent snapshots will keep using the anon-page path"
+                );
+            }
+
+            return Ok(());
+        }
+
+        // Steady-state path: the tracker has been armed by a previous
+        // call, so pagemap bit 55 reflects only writes that happened in
+        // this window. Filter pages by anon ∩ soft-dirty to get the
+        // minimal set that has actually changed since the last snapshot.
+        let memory_file_target =
+            MemorySnapshotFile::from_snapshot_url(destination_url, memory_vol_url.as_deref())?;
+
+        let guest_memory = self.guest_memory.memory();
+        let (filtered_ranges, stats) = filter_memory_ranges_by_anon_and_soft_dirty(
+            &guest_memory,
+            &self.snapshot_memory_ranges,
+        )
+        .map_err(|e| {
+            MigratableError::MigrateSend(anyhow!(
+                "Failed to filter memory with anon ∩ soft-dirty: {}",
+                e
+            ))
+        })?;
+
+        info!(
+            "Soft-dirty snapshot (anon ∩ soft-dirty): total={} bytes ({} pages), \
+             dirty={} bytes ({} pages), savings={:.1}%",
+            stats.total_bytes,
+            stats.total_pages,
+            stats.saved_bytes,
+            stats.dirty_pages,
+            stats.savings_percentage()
+        );
+
+        // Prepare the destination file. The previous snapshot already
+        // contains every still-clean page; we just overlay the changed
+        // ones in place. The base file is mandatory here: if it doesn't
+        // exist, a soft-dirty (delta) snapshot is meaningless because
+        // there is no full image to overlay onto. Refuse the request and
+        // let the caller take a Full snapshot first.
+        if !memory_file_target.path().exists() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Base snapshot file not found at {:?}, soft-dirty snapshot requires \
+                 an existing base file; take a full snapshot first",
+                memory_file_target.path()
+            )));
+        }
+        let memory_file = memory_file_target.open_read_write()?;
+
+        // Build a GPA-to-file-offset mapping for calculating offsets.
+        let mut gpa_to_file_offset: Vec<(u64, u64, u64)> = Vec::new();
+        let mut offset = 0_u64;
+        for range in self.snapshot_memory_ranges.regions() {
+            gpa_to_file_offset.push((range.gpa, range.length, offset));
+            offset += range.length;
+        }
+
+        // Overlay only the filtered (anon ∩ soft-dirty) pages.
+        for range in filtered_ranges.regions() {
+            let file_off =
+                Self::calculate_file_offset_for_gpa(range.gpa, range.length, &gpa_to_file_offset)?;
+            self.save_range_to_file(&memory_file, range, file_off)?;
+        }
+        info!(
+            "Soft-dirty snapshot saved: {} dirty bytes written to {:?}",
+            stats.saved_bytes,
+            memory_file_target.path()
+        );
+
+        // Re-arm tracking for the next cycle.
+        if let Err(e) = clear_soft_dirty() {
+            warn!(
+                "Soft-dirty: clear_soft_dirty() failed after writing delta ({}), \
+                 disarming; the next snapshot will fall back to the full \
+                 anon-page path and try to re-arm",
+                e
+            );
+            self.soft_dirty_armed.store(false, Ordering::Release);
+        }
+
+        Ok(())
+    }
+
+    /// Calculate the file offset for a given GPA within the snapshot file.
+    ///
+    /// The snapshot file stores memory regions sequentially. This method finds
+    /// which region contains the given GPA and computes the corresponding
+    /// file offset.
+    fn calculate_file_offset_for_gpa(
+        gpa: u64,
+        length: u64,
+        gpa_to_file_offset: &[(u64, u64, u64)],
+    ) -> result::Result<u64, MigratableError> {
+        for &(region_gpa, region_length, file_offset) in gpa_to_file_offset {
+            if gpa >= region_gpa && gpa + length <= region_gpa + region_length {
+                return Ok(file_offset + (gpa - region_gpa));
+            }
+        }
+        Err(MigratableError::MigrateSend(anyhow!(
+            "Could not find file offset for GPA 0x{:x} (length {})",
+            gpa,
+            length
+        )))
+    }
+
+    fn send_dirty_log_one_range(
+        &self,
+        destination_url: &str,
+    ) -> result::Result<(), MigratableError> {
+        let guest_memory = self.guest_memory.memory();
+        let length = guest_memory.iter().map(|region| region.len()).sum::<u64>() / SNAPSHOT_FILENUM;
+
+        info!("Saving dirty guest memory to snapshot image file.");
+
+        for range in self.snapshot_memory_ranges.regions() {
+            let vmm_dirty_bitmap = match self
+                .guest_memory
+                .memory()
+                .find_region(GuestAddress(range.gpa))
+            {
+                Some(region) => {
+                    assert!(region.start_addr().raw_value() == range.gpa);
+                    assert!(region.len() == range.length);
+                    (**region).bitmap().get_and_reset()
+                }
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest memory region' with address {:x}",
+                        range.gpa
+                    )))
+                }
+            };
+
+            let slot = match self
+                .guest_ram_mappings
+                .iter()
+                .find(|map| map.gpa == range.gpa && map.size == range.length)
+            {
+                Some(map) => map.slot,
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest ram mapping' with address {:x}",
+                        range.gpa
+                    )))
+                }
+            };
+
+            let vm_dirty_bitmap = self
+                .vm
+                .get_dirty_log(slot, range.gpa, range.length)
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e))
+                })?;
+
+            let dirty_bitmap: Vec<u64> = vm_dirty_bitmap
+                .iter()
+                .zip(vmm_dirty_bitmap.iter())
+                .map(|(x, y)| x | y)
+                .collect();
+
+            let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
+
+            if !sub_table.regions().is_empty() {
+                // save dirty bitmap to dirty-log
+                let mut dirty_log_path = url_to_path(destination_url)?;
+                dirty_log_path.push(DIRTY_LOG_FILENAME);
+
+                // Create the dirty log file
+                let mut dirty_log_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(dirty_log_path)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                // Serialize and write the dirty log
+                let dirty_log =
+                    serde_json::to_vec(&sub_table).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                dirty_log_file
+                    .write(&dirty_log)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                for i in 0..SNAPSHOT_FILENUM {
+                    let mut memory_file_path = url_to_path(destination_url)?;
+                    memory_file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, i));
+
+                    // Create the snapshot file for the entire memory
+                    let mut memory_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .truncate(true)
+                        .open(memory_file_path)
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                    for r in sub_table.regions() {
+                        // Skip regions outside our current partition
+                        let partition_start = range.gpa + length * i;
+                        let partition_end = range.gpa + length * (i + 1);
+
+                        if r.gpa + r.length <= partition_start || r.gpa >= partition_end {
+                            continue;
+                        }
+
+                        // Calculate write parameters based on region position
+                        let (write_gpa, write_len, file_offset) = if r.gpa > partition_start && r.gpa + r.length < partition_end {
+                            // Region fully contained within partition
+                            (r.gpa, r.length, r.gpa - partition_start)
+                        } else if r.gpa > partition_start {
+                            // Region overlaps end of partition
+                            (r.gpa, partition_end - r.gpa, r.gpa - partition_start)
+                        } else if r.gpa + r.length < partition_end {
+                            // Region overlaps start of partition
+                            (partition_start, r.gpa + r.length - partition_start, 0)
+                        } else {
+                            // Region spans entire partition
+                            (partition_start, length, 0)
+                        };
+                        if file_offset != 0 {
+                            memory_file
+                                .seek(SeekFrom::Start(file_offset))
+                                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                        }
+
+                        let mut offset: u64 = 0;
+                        // Here we are manually handling the retry in case we can't read
+                        // the whole region at once because we can't use the implementation
+                        // from vm-memory::GuestMemory of write_all_to() as it is not
+                        // following the correct behavior. For more info about this issue
+                        // see: https://github.com/rust-vmm/vm-memory/issues/174
+                        loop {
+                            let bytes_written = guest_memory
+                                .write_volatile_to(
+                                    GuestAddress(write_gpa + offset),
+                                    &mut memory_file,
+                                    (write_len - offset) as usize,
+                                )
+                                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                            offset += bytes_written as u64;
+
+                            if offset == write_len {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn send_dirty_log_multi_range(
+        &self,
+        destination_url: &str,
+    ) -> result::Result<(), MigratableError> {
+        let guest_memory = self.guest_memory.memory();
+        let mut all_sub_regions = Vec::new();
+
+        info!("Saving dirty guest memory to snapshot image files, one file per memory range.");
+
+        for (range_idx, range) in self.snapshot_memory_ranges.regions().iter().enumerate() {
+            // Find the corresponding guest memory region
+            let region = match guest_memory.find_region(GuestAddress(range.gpa)) {
+                Some(r) => {
+                    assert_eq!(r.start_addr().raw_value(), range.gpa);
+                    assert_eq!(r.len(), range.length);
+                    r
+                }
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest memory region' with address {:x}",
+                        range.gpa
+                    )));
+                }
+            };
+
+            // Get and reset the VMM dirty bitmap
+            let vmm_dirty_bitmap = (**region).bitmap().get_and_reset();
+
+            // Find the guest RAM mapping slot
+            let slot = match self.guest_ram_mappings.iter()
+                .find(|map| map.gpa == range.gpa && map.size == range.length) {
+                    Some(map) => map.slot,
+                    None => {
+                        return Err(MigratableError::MigrateSend(anyhow!(
+                            "Error finding 'guest ram mapping' with address {:x}",
+                            range.gpa
+                        )));
+                    }
+                };
+
+            // Retrieve the VM dirty bitmap
+            let vm_dirty_bitmap = self.vm.get_dirty_log(slot, range.gpa, range.length)
+                .map_err(|e| MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e)))?;
+
+            // Combine the two dirty bitmaps
+            let dirty_bitmap: Vec<u64> = vm_dirty_bitmap.iter()
+                .zip(vmm_dirty_bitmap.iter())
+                .map(|(vm_bit, vmm_bit)| vm_bit | vmm_bit)
+                .collect();
+
+            // Generate sub memory regions from the combined dirty bitmap
+            let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
+            let sub_regions = sub_table.regions();
+
+            if !sub_regions.is_empty() {
+                // Collect all sub regions for later saving the combined dirty log
+                all_sub_regions.extend(sub_regions.iter().cloned());
+
+                // Construct the file path for this memory range's dirty pages
+                let mut mem_file_path = url_to_path(destination_url)?;
+                mem_file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, range_idx));
+
+                // Open the file, create new
+                let mut mem_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&mem_file_path)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                // Write all dirty pages of the sub regions into the file
+                for sub_region in sub_regions {
+                    let mut offset = 0;
+                    while offset < sub_region.length {
+                        let bytes_written = guest_memory.write_volatile_to(
+                            GuestAddress(sub_region.gpa + offset),
+                            &mut mem_file,
+                            (sub_region.length - offset) as usize,
+                        ).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                        offset += bytes_written as u64;
+                    }
+                }
+            }
+        }
+
+        // After processing all ranges, save the combined dirty log file
+        if !all_sub_regions.is_empty() {
+            let combined_table = MemoryRangeTable::new(all_sub_regions);
+
+            let mut dirty_log_path = url_to_path(destination_url)?;
+            dirty_log_path.push(DIRTY_LOG_FILENAME);
+
+            let mut dirty_log_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&dirty_log_path)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+            let dirty_log_bytes = serde_json::to_vec(&combined_table)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+            dirty_log_file.write_all(&dirty_log_bytes)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        }
+
+        Ok(())
+    }
+
+    fn send_full(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        let memory_file_target = MemorySnapshotFile::from_snapshot_url(
+            destination_url,
+            memory_vol_url.as_deref(),
+        )?;
+
+        info!("Saving full guest memory to snapshot image file.");
+
+        let mut memory_file = memory_file_target.open_for_fresh_write()?;
+
+        let total_len: u64 = self
+            .snapshot_memory_ranges
+            .regions()
+            .iter()
+            .map(|r| r.length)
+            .sum();
+
+        // Pre-size the file so per-region write_at lands at the dense-layout
+        // offset. On filesystems that support sparse files unwritten bytes
+        // become real holes; on others the kernel zero-fills the allocation,
+        // which is still byte-correct. If extending the file is not
+        // supported by the destination filesystem (some FUSE backends
+        // reject ftruncate-extend with EOPNOTSUPP), fall back to the dense
+        // write path which never writes past the growing EOF.
+        let sparse_layout = if memory_file_target.is_external() {
+            true
+        } else {
+            memory_file.set_len(total_len).is_ok()
+        };
+
+        let guest_memory = self.guest_memory.memory();
+        let mut file_cursor: u64 = 0;
+
+        for range in self.snapshot_memory_ranges.regions() {
+            let mut wrote_sparse = false;
+            if sparse_layout
+                && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
+                && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
+                && let Some(file_offset) = region.file_offset()
+            {
+                let region_base = region.start_addr().raw_value();
+                let in_fd_off = file_offset.start()
+                    + range
+                        .gpa
+                        .checked_sub(region_base)
+                        .expect("range outside its region");
+                wrote_sparse = write_region_sparse(
+                    file_offset.file(),
+                    in_fd_off,
+                    &memory_file,
+                    file_cursor,
+                    range.length,
+                )
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            }
+
+            if !wrote_sparse {
+                // Dense fallback: anonymous mmap or hugetlbfs (no
+                // SEEK_HOLE). Match the dense layout by seeking to
+                // file_cursor and streaming bytes via the existing
+                // volatile copy.
+                memory_file
+                    .seek(SeekFrom::Start(file_cursor))
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                let mut offset: u64 = 0;
+                // Manual partial-write loop preserves the workaround for
+                // https://github.com/rust-vmm/vm-memory/issues/174
+                loop {
+                    let bytes_written = guest_memory
+                        .write_volatile_to(
+                            GuestAddress(range.gpa + offset),
+                            &mut memory_file,
+                            (range.length - offset) as usize,
+                        )
+                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                    offset += bytes_written as u64;
+                    if offset == range.length {
+                        break;
+                    }
+                }
+            }
+
+            file_cursor += range.length;
+        }
+
+        debug_assert_eq!(file_cursor, total_len);
+
+        Ok(())
+    }
+
+    fn send_full_dirty_log(
+        &self,
+        destination_url: &str,
+        memory_vol_url: &Option<String>,
+    ) -> result::Result<(), MigratableError> {
+        let memory_file_target = MemorySnapshotFile::from_snapshot_url(
+            destination_url,
+            memory_vol_url.as_deref(),
+        )?;
+        let memory_file = memory_file_target.open_for_fresh_write()?;
+
+        info!("Saving dirty guest memory to snapshot image file.");
+
+        let total_size: u64 = self
+            .snapshot_memory_ranges
+            .regions()
+            .iter()
+            .map(|r| r.length)
+            .sum();
+        if !memory_file_target.is_external() {
+            memory_file
+                .set_len(total_size)
+                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        }
+
+        let mut offset = 0_u64;
+        for range in self.snapshot_memory_ranges.regions() {
+            let vmm_dirty_bitmap = match self
+                .guest_memory
+                .memory()
+                .find_region(GuestAddress(range.gpa))
+            {
+                Some(region) => {
+                    assert!(region.start_addr().raw_value() == range.gpa);
+                    assert!(region.len() == range.length);
+                    (**region).bitmap().get_and_reset()
+                }
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest memory region' with address {:x}",
+                        range.gpa
+                    )))
+                }
+            };
+
+            let slot = match self
+                .guest_ram_mappings
+                .iter()
+                .find(|map| map.gpa == range.gpa && map.size == range.length)
+            {
+                Some(map) => map.slot,
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest ram mapping' with address {:x}",
+                        range.gpa
+                    )))
+                }
+            };
+
+            let vm_dirty_bitmap = self
+                .vm
+                .get_dirty_log(slot, range.gpa, range.length)
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e))
+                })?;
+
+            let dirty_bitmap: Vec<u64> = vm_dirty_bitmap
+                .iter()
+                .zip(vmm_dirty_bitmap.iter())
+                .map(|(x, y)| x | y)
+                .collect();
+
+            let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
+
+            if !sub_table.regions().is_empty() {
+                for r in sub_table.regions() {
+                    self.save_range_to_file(&memory_file, r, r.gpa - range.gpa + offset)?;
+                }
+            }
+
+            // Move to next range.
+            offset += range.length;
+        }
+
+        Ok(())
+    }
 }
 
 struct MemoryNotify {
@@ -3441,336 +4338,32 @@ impl Transportable for MemoryManager {
     fn send(
         &self,
         _snapshot: &Snapshot,
-        destination_url: &str,
+        config: &SnapshotConfig,
     ) -> result::Result<(), MigratableError> {
         if self.snapshot_memory_ranges.is_empty() {
             return Ok(());
         }
 
+        let destination_url = &config.destination_url;
+
         if !self.dirty_log {
-            info!("Saving full guest memory to snapshot image file.");
-            let mut memory_file_path = url_to_path(destination_url)?;
-            memory_file_path.push(String::from(SNAPSHOT_FILENAME));
-
-            let mut memory_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&memory_file_path)
-                .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-            let total_len: u64 = self
-                .snapshot_memory_ranges
-                .regions()
-                .iter()
-                .map(|r| r.length)
-                .sum();
-
-            // Pre-size the file so per-region write_at lands at the dense-layout
-            // offset. On filesystems that support sparse files unwritten bytes
-            // become real holes; on others the kernel zero-fills the allocation,
-            // which is still byte-correct. If extending the file is not
-            // supported by the destination filesystem (some FUSE backends
-            // reject ftruncate-extend with EOPNOTSUPP), fall back to the dense
-            // write path which never writes past the growing EOF.
-            let sparse_layout = memory_file.set_len(total_len).is_ok();
-
-            let guest_memory = self.guest_memory.memory();
-            let mut file_cursor: u64 = 0;
-
-            for range in self.snapshot_memory_ranges.regions() {
-                let mut wrote_sparse = false;
-                if sparse_layout
-                    && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
-                    && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
-                    && let Some(file_offset) = region.file_offset()
-                {
-                    let region_base = region.start_addr().raw_value();
-                    let in_fd_off = file_offset.start()
-                        + range
-                            .gpa
-                            .checked_sub(region_base)
-                            .expect("range outside its region");
-                    wrote_sparse = write_region_sparse(
-                        file_offset.file(),
-                        in_fd_off,
-                        &memory_file,
-                        file_cursor,
-                        range.length,
-                    )
-                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+            match config.snapshot_type {
+                SnapshotType::Incremental => {
+                self.send_pagemap_anon_memory(destination_url, &config.memory_vol_url)?;
                 }
-
-                if !wrote_sparse {
-                    // Dense fallback: anonymous mmap or hugetlbfs (no
-                    // SEEK_HOLE). Match the dense layout by seeking to
-                    // file_cursor and streaming bytes via the existing
-                    // volatile copy.
-                    memory_file
-                        .seek(SeekFrom::Start(file_cursor))
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                    let mut offset: u64 = 0;
-                    // Manual partial-write loop preserves the workaround for
-                    // https://github.com/rust-vmm/vm-memory/issues/174
-                    loop {
-                        let bytes_written = guest_memory
-                            .write_volatile_to(
-                                GuestAddress(range.gpa + offset),
-                                &mut memory_file,
-                                (range.length - offset) as usize,
-                            )
-                            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                        offset += bytes_written as u64;
-                        if offset == range.length {
-                            break;
-                        }
-                    }
+                SnapshotType::SoftDirty => {
+                    self.send_soft_dirty_memory(destination_url, &config.memory_vol_url)?;
                 }
-
-                file_cursor += range.length;
+                SnapshotType::Full => {
+                    self.send_full(destination_url, &config.memory_vol_url)?;
+                }
             }
-
-            debug_assert_eq!(file_cursor, total_len);
+        } else if !config.multi_snapshot || config.memory_vol_url.is_some() {
+            self.send_full_dirty_log(destination_url, &config.memory_vol_url)?;
         } else if self.snapshot_memory_ranges.regions().len() > 1 {
-            info!("Saving dirty guest memory to snapshot image files, one file per memory range.");
-
-            let guest_memory = self.guest_memory.memory();
-            let mut all_sub_regions = Vec::new();
-
-            for (range_idx, range) in self.snapshot_memory_ranges.regions().iter().enumerate() {
-                // Find the corresponding guest memory region
-                let region = match guest_memory.find_region(GuestAddress(range.gpa)) {
-                    Some(r) => {
-                        assert_eq!(r.start_addr().raw_value(), range.gpa);
-                        assert_eq!(r.len(), range.length);
-                        r
-                    }
-                    None => {
-                        return Err(MigratableError::MigrateSend(anyhow!(
-                            "Error finding 'guest memory region' with address {:x}",
-                            range.gpa
-                        )));
-                    }
-                };
-
-                // Get and reset the VMM dirty bitmap
-                let vmm_dirty_bitmap = (**region).bitmap().get_and_reset();
-
-                // Find the guest RAM mapping slot
-                let slot = match self.guest_ram_mappings.iter()
-                    .find(|map| map.gpa == range.gpa && map.size == range.length) {
-                        Some(map) => map.slot,
-                        None => {
-                            return Err(MigratableError::MigrateSend(anyhow!(
-                                "Error finding 'guest ram mapping' with address {:x}",
-                                range.gpa
-                            )));
-                        }
-                    };
-
-                // Retrieve the VM dirty bitmap
-                let vm_dirty_bitmap = self.vm.get_dirty_log(slot, range.gpa, range.length)
-                    .map_err(|e| MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e)))?;
-
-                // Combine the two dirty bitmaps
-                let dirty_bitmap: Vec<u64> = vm_dirty_bitmap.iter()
-                    .zip(vmm_dirty_bitmap.iter())
-                    .map(|(vm_bit, vmm_bit)| vm_bit | vmm_bit)
-                    .collect();
-
-                // Generate sub memory regions from the combined dirty bitmap
-                let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
-                let sub_regions = sub_table.regions();
-
-                if !sub_regions.is_empty() {
-                    // Collect all sub regions for later saving the combined dirty log
-                    all_sub_regions.extend(sub_regions.iter().cloned());
-
-                    // Construct the file path for this memory range's dirty pages
-                    let mut mem_file_path = url_to_path(destination_url)?;
-                    mem_file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, range_idx));
-
-                    // Open the file, create new
-                    let mut mem_file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .open(&mem_file_path)
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-                    // Write all dirty pages of the sub regions into the file
-                    for sub_region in sub_regions {
-                        let mut offset = 0;
-                        while offset < sub_region.length {
-                            let bytes_written = guest_memory.write_volatile_to(
-                                GuestAddress(sub_region.gpa + offset),
-                                &mut mem_file,
-                                (sub_region.length - offset) as usize,
-                            ).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                            offset += bytes_written as u64;
-                        }
-                    }
-                }
-            }
-
-            // After processing all ranges, save the combined dirty log file
-            if !all_sub_regions.is_empty() {
-                let combined_table = MemoryRangeTable::new(all_sub_regions);
-
-                let mut dirty_log_path = url_to_path(destination_url)?;
-                dirty_log_path.push(DIRTY_LOG_FILENAME);
-
-                let mut dirty_log_file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&dirty_log_path)
-                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-                let dirty_log_bytes = serde_json::to_vec(&combined_table)
-                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-                dirty_log_file.write_all(&dirty_log_bytes)
-                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-            }
+            self.send_dirty_log_multi_range(destination_url)?;
         } else {
-            info!("Saving dirty guest memory to snapshot image file.");
-            let guest_memory = self.guest_memory.memory();
-            let length = guest_memory.iter().map(|region| region.len()).sum::<u64>() / SNAPSHOT_FILENUM;
-            for range in self.snapshot_memory_ranges.regions() {
-                let vmm_dirty_bitmap = match self
-                    .guest_memory
-                    .memory()
-                    .find_region(GuestAddress(range.gpa))
-                {
-                    Some(region) => {
-                        assert!(region.start_addr().raw_value() == range.gpa);
-                        assert!(region.len() == range.length);
-                        (**region).bitmap().get_and_reset()
-                    }
-                    None => {
-                        return Err(MigratableError::MigrateSend(anyhow!(
-                            "Error finding 'guest memory region' with address {:x}",
-                            range.gpa
-                        )))
-                    }
-                };
-
-                let slot = match self
-                    .guest_ram_mappings
-                    .iter()
-                    .find(|map| map.gpa == range.gpa && map.size == range.length)
-                {
-                    Some(map) => map.slot,
-                    None => {
-                        return Err(MigratableError::MigrateSend(anyhow!(
-                            "Error finding 'guest ram mapping' with address {:x}",
-                            range.gpa
-                        )))
-                    }
-                };
-
-                let vm_dirty_bitmap = self
-                    .vm
-                    .get_dirty_log(slot, range.gpa, range.length)
-                    .map_err(|e| {
-                        MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e))
-                    })?;
-
-                let dirty_bitmap: Vec<u64> = vm_dirty_bitmap
-                    .iter()
-                    .zip(vmm_dirty_bitmap.iter())
-                    .map(|(x, y)| x | y)
-                    .collect();
-
-                let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
-
-                if !sub_table.regions().is_empty() {
-                    // save dirty bitmap to dirty-log
-                    let mut dirty_log_path = url_to_path(destination_url)?;
-                    dirty_log_path.push(DIRTY_LOG_FILENAME);
-
-                    // Create the dirty log file
-                    let mut dirty_log_file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .open(dirty_log_path)
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-                    // Serialize and write the dirty log
-                    let dirty_log =
-                        serde_json::to_vec(&sub_table).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-                    dirty_log_file
-                        .write(&dirty_log)
-                        .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                    for i in 0..SNAPSHOT_FILENUM {
-                        let mut memory_file_path = url_to_path(destination_url)?;
-                        memory_file_path.push(format!("{}-{}", SNAPSHOT_FILENAME, i));
-
-                        // Create the snapshot file for the entire memory
-                        let mut memory_file = OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create_new(true)
-                            .truncate(true)
-                            .open(memory_file_path)
-                            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-
-                        for r in sub_table.regions() {
-                            // Skip regions outside our current partition
-                            let partition_start = range.gpa + length * i;
-                            let partition_end = range.gpa + length * (i + 1);
-
-                            if r.gpa + r.length <= partition_start || r.gpa >= partition_end {
-                                continue;
-                            }
-
-                            // Calculate write parameters based on region position
-                            let (write_gpa, write_len, file_offset) = if r.gpa > partition_start && r.gpa + r.length < partition_end {
-                                // Region fully contained within partition
-                                (r.gpa, r.length, r.gpa - partition_start)
-                            } else if r.gpa > partition_start {
-                                // Region overlaps end of partition
-                                (r.gpa, partition_end - r.gpa, r.gpa - partition_start)
-                            } else if r.gpa + r.length < partition_end {
-                                // Region overlaps start of partition
-                                (partition_start, r.gpa + r.length - partition_start, 0)
-                            } else {
-                                // Region spans entire partition
-                                (partition_start, length, 0)
-                            };
-                            if file_offset != 0 {
-                                memory_file
-                                    .seek(SeekFrom::Start(file_offset))
-                                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                            }
-
-                            let mut offset: u64 = 0;
-                            // Here we are manually handling the retry in case we can't read
-                            // the whole region at once because we can't use the implementation
-                            // from vm-memory::GuestMemory of write_all_to() as it is not
-                            // following the correct behavior. For more info about this issue
-                            // see: https://github.com/rust-vmm/vm-memory/issues/174
-                            loop {
-                                let bytes_written = guest_memory
-                                    .write_volatile_to(
-                                        GuestAddress(write_gpa + offset),
-                                        &mut memory_file,
-                                        (write_len - offset) as usize,
-                                    )
-                                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-                                offset += bytes_written as u64;
-
-                                if offset == write_len {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            self.send_dirty_log_one_range(destination_url)?;
         }
 
         Ok(())

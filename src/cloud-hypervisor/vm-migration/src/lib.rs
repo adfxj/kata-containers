@@ -143,6 +143,76 @@ impl SnapshotData {
     }
 }
 
+/// The type of snapshot to create
+#[derive(Clone, Copy, Deserialize, Serialize, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotType {
+    /// Full snapshot - saves complete VM memory
+    #[default]
+    Full,
+    /// Incremental snapshot - only saves CoW anonymous pages via pagemap + kpageflags
+    Incremental,
+    /// Soft-dirty snapshot - only saves pages written since the previous
+    /// soft-dirty snapshot (true delta), via /proc/self/clear_refs +
+    /// /proc/self/pagemap bit 55. Requires CONFIG_MEM_SOFT_DIRTY=y; on
+    /// kernels without this support the runtime silently falls back to the
+    /// `Incremental` (pagemap_anon) path.
+    #[serde(rename = "soft-dirty")]
+    SoftDirty,
+}
+
+impl std::fmt::Display for SnapshotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotType::Full => write!(f, "full"),
+            SnapshotType::Incremental => write!(f, "incremental"),
+            SnapshotType::SoftDirty => write!(f, "soft-dirty"),
+        }
+    }
+}
+
+impl std::str::FromStr for SnapshotType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "full" => Ok(SnapshotType::Full),
+            "incremental" => Ok(SnapshotType::Incremental),
+            "soft-dirty" => Ok(SnapshotType::SoftDirty),
+            _ => Err(format!(
+                "Invalid snapshot type: '{s}'. Valid values are 'full', 'incremental' or 'soft-dirty'"
+            )),
+        }
+    }
+}
+
+/// Metadata associated with a snapshot
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct SnapshotMetadata {
+    /// The type of snapshot
+    #[serde(default)]
+    pub snapshot_type: SnapshotType,
+}
+
+/// Configuration for creating a snapshot
+#[derive(Clone, Default, Deserialize, Serialize, Debug)]
+pub struct SnapshotConfig {
+    /// The snapshot destination URL
+    pub destination_url: String,
+    /// The type of snapshot to create (full or incremental)
+    #[serde(default)]
+    pub snapshot_type: SnapshotType,
+    /// Optional existing memory blob path for storing memory range data on a
+    /// separate volume.
+    /// Accepts either an absolute path like `/dev/vdb` or a `file:///dev/vdb`
+    /// URL. Other JSON data (config, state) is still saved to destination_url.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_vol_url: Option<String>,
+    /// Whether to create a multi-snapshot.
+    #[serde(default)]
+    pub multi_snapshot: bool,
+}
+
 /// Data structure to describe snapshot data
 ///
 /// A Snapshottable component's snapshot is a tree of snapshots, where leaves
@@ -164,6 +234,10 @@ pub struct Snapshot {
     /// The Snapshottable component's snapshot data.
     /// A map of snapshot sections, indexed by the section ids.
     pub snapshot_data: Option<SnapshotData>,
+
+    /// Optional metadata about the snapshot (e.g. snapshot type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SnapshotMetadata>,
 }
 
 impl Snapshot {
@@ -242,7 +316,7 @@ pub trait Transportable: Pausable + Snapshottable {
     fn send(
         &self,
         _snapshot: &Snapshot,
-        _destination_url: &str,
+        _config: &SnapshotConfig,
     ) -> std::result::Result<(), MigratableError> {
         Ok(())
     }

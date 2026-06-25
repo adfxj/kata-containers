@@ -27,10 +27,15 @@ use vmm::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VsockConfig,
 };
+use vmm::{SnapshotConfig, SnapshotType};
 #[cfg(feature = "dbus_api")]
 use zbus::{proxy, zvariant::Optional};
 
 type ApiResult = Result<(), Error>;
+
+const MEMORY_VOL_URL_HELP: &str =
+    "Optional existing memory blob path for storing memory range data on a separate volume \
+     (for example /dev/vdb or file:///dev/vdb)";
 
 #[derive(Error, Debug)]
 enum Error {
@@ -91,7 +96,6 @@ trait DBusApi1 {
     fn vm_add_device(&self, device_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_disk(&self, disk_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_fs(&self, fs_config: &str) -> zbus::Result<Optional<String>>;
-    fn vm_patch_fs(&self, patch_fs_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_generic_vhost_user(
         &self,
         generic_vhost_user_config: &str,
@@ -107,7 +111,9 @@ trait DBusApi1 {
     fn vm_create(&self, vm_config: &str) -> zbus::Result<()>;
     fn vm_delete(&self) -> zbus::Result<()>;
     fn vm_info(&self) -> zbus::Result<String>;
+    fn vm_patch_fs(&self, patch_fs_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_pause(&self) -> zbus::Result<()>;
+    fn vm_pause_to_snapshot(&self, snapshot_config: &str) -> zbus::Result<()>;
     fn vm_power_button(&self) -> zbus::Result<()>;
     fn vm_reboot(&self) -> zbus::Result<()>;
     fn vm_remove_device(&self, vm_remove_device: &str) -> zbus::Result<()>;
@@ -117,8 +123,10 @@ trait DBusApi1 {
     fn vm_receive_migration(&self, receive_migration_data: &str) -> zbus::Result<()>;
     fn vm_send_migration(&self, receive_migration_data: &str) -> zbus::Result<()>;
     fn vm_resume(&self) -> zbus::Result<()>;
+    fn vm_resume_from_snapshot(&self, restore_config: &str) -> zbus::Result<()>;
     fn vm_shutdown(&self) -> zbus::Result<()>;
     fn vm_snapshot(&self, vm_snapshot_config: &str) -> zbus::Result<()>;
+    fn vm_wait_start(&self) -> zbus::Result<(String)>;
 }
 
 #[cfg(feature = "dbus_api")]
@@ -166,10 +174,6 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
 
     fn api_vm_add_fs(&self, fs_config: &str) -> ApiResult {
         self.print_response(self.vm_add_fs(fs_config))
-    }
-
-    fn api_vm_patch_fs(&self, patch_fs_config: &str) -> ApiResult {
-        self.print_response(self.vm_patch_fs(patch_fs_config))
     }
 
     fn api_vm_add_generic_vhost_user(&self, generic_vhost_user_config: &str) -> ApiResult {
@@ -223,8 +227,17 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
             .map_err(Error::DBusApiClient)
     }
 
+    fn api_vm_patch_fs(&self, patch_fs_config: &str) -> ApiResult {
+        self.print_response(self.vm_patch_fs(patch_fs_config))
+    }
+
     fn api_vm_pause(&self) -> ApiResult {
         self.vm_pause().map_err(Error::DBusApiClient)
+    }
+
+    fn api_vm_pause_to_snapshot(&self, snapshot_config: &str) -> ApiResult {
+        self.vm_pause_to_snapshot(snapshot_config)
+            .map_err(Error::DBusApiClient)
     }
 
     fn api_vm_power_button(&self) -> ApiResult {
@@ -268,6 +281,11 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
         self.vm_resume().map_err(Error::DBusApiClient)
     }
 
+    fn api_vm_resume_from_snapshot(&self, restore_config: &str) -> ApiResult {
+        self.vm_resume_from_snapshot(restore_config)
+            .map_err(Error::DBusApiClient)
+    }
+
     fn api_vm_shutdown(&self) -> ApiResult {
         self.vm_shutdown().map_err(Error::DBusApiClient)
     }
@@ -275,6 +293,10 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
     fn api_vm_snapshot(&self, vm_snapshot_config: &str) -> ApiResult {
         self.vm_snapshot(vm_snapshot_config)
             .map_err(Error::DBusApiClient)
+    }
+
+    fn api_vm_wait_start(&self) -> ApiResult {
+        self.vm_wait_start().map_err(Error::DBusApiClient)
     }
 }
 
@@ -322,7 +344,7 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
         Some("shutdown") => {
             simple_api_command(socket, "PUT", "shutdown", None).map_err(Error::HttpApiClient)
         }
-        Some("nmi") => simple_api_command(socket, "PUT", "nmi", None).map_err(Error::HttpApiClient),
+        Some("vm-wait-start") => simple_api_command(socket, "GET", "vm-wait-start", None).map_err(Error::HttpApiClient),
         Some("resize") => {
             let resize = resize_config(
                 matches
@@ -502,13 +524,8 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                 .map_err(Error::HttpApiClient)
         }
         Some("snapshot") => {
-            let snapshot_config = snapshot_config(
-                matches
-                    .subcommand_matches("snapshot")
-                    .unwrap()
-                    .get_one::<String>("snapshot_config")
-                    .unwrap(),
-            );
+            let sub_matches = matches.subcommand_matches("snapshot").unwrap();
+            let snapshot_config = snapshot_config(sub_matches)?;
             simple_api_command(socket, "PUT", "snapshot", Some(&snapshot_config))
                 .map_err(Error::HttpApiClient)
         }
@@ -571,6 +588,23 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             )?;
             simple_api_command(socket, "PUT", "create", Some(&data)).map_err(Error::HttpApiClient)
         }
+        Some("pause-to-snapshot") => {
+            let sub_matches = matches.subcommand_matches("pause-to-snapshot").unwrap();
+            let snapshot_config = snapshot_config(sub_matches)?;
+            simple_api_command(socket, "PUT", "pause-to-snapshot", Some(&snapshot_config))
+                .map_err(Error::HttpApiClient)
+        }
+        Some("resume-from-snapshot") => {
+            let (resume_from_snapshot_config, fds) = restore_config(
+                matches
+                    .subcommand_matches("resume-from-snapshot")
+                    .unwrap()
+                    .get_one::<String>("resume_from_snapshot_config")
+                    .unwrap(),
+            )?;
+            simple_api_command_with_fds(socket, "PUT", "restore", Some(&resume_from_snapshot_config), &fds)
+                .map_err(Error::HttpApiClient)
+        }
         _ => unreachable!(),
     }
 }
@@ -589,6 +623,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
         Some("counters") => proxy.api_vm_counters(),
         Some("ping") => proxy.api_vmm_ping(),
         Some("shutdown") => proxy.api_vm_shutdown(),
+        Some("vm-wait-start") => proxy.api_vm_wait_start(),
         Some("resize") => {
             let resize = resize_config(
                 matches
@@ -734,6 +769,16 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             )?;
             proxy.api_vm_add_vsock(&vsock_config)
         }
+        Some("pause-to-snapshot") => {
+            let pause_to_snapshot_config = snapshot_config(
+                matches
+                    .subcommand_matches("pause-to-snapshot")
+                    .unwrap()
+                    .get_one::<String>("pause_to_snapshot_config")
+                    .unwrap(),
+            );
+            proxy.api_vm_pause_to_snapshot(&pause_to_snapshot_config)
+        }
         Some("snapshot") => {
             let snapshot_config = snapshot_config(
                 matches
@@ -753,6 +798,16 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
                     .unwrap(),
             )?;
             proxy.api_vm_restore(&restore_config)
+        }
+        Some("resume_from_snapshot") => {
+            let resume_from_snapshot_config = restore_config(
+                matches
+                    .subcommand_matches("resume_from_snapshot")
+                    .unwrap()
+                    .get_one::<String>("resume_from_snapshot_config")
+                    .unwrap(),
+            );
+            proxy.api_vm_resume_from_snapshot(&resume_from_snapshot_config)
         }
         Some("coredump") => {
             let coredump_config = coredump_config(
@@ -944,12 +999,24 @@ fn add_vsock_config(config: &str) -> Result<String, Error> {
     Ok(vsock_config)
 }
 
-fn snapshot_config(url: &str) -> String {
-    let snapshot_config = vmm::api::VmSnapshotConfig {
+fn snapshot_config(sub_matches: &ArgMatches) -> Result<String, Error> {
+    let url = sub_matches.get_one::<String>("snapshot_config").unwrap();
+    let snapshot_type = sub_matches
+        .get_one::<String>("snapshot_type")
+        .map(|s| s.parse::<SnapshotType>().unwrap_or_default())
+        .unwrap_or_default();
+    let memory_vol_url = sub_matches.get_one::<String>("memory_vol_url").cloned();
+    let multi_snapshot = sub_matches.get_flag("multi_snapshot");
+
+    let snapshot_config = SnapshotConfig {
         destination_url: String::from(url),
+        snapshot_type,
+        memory_vol_url,
+        multi_snapshot,
     };
 
-    serde_json::to_string(&snapshot_config).unwrap()
+    let snapshot_config = serde_json::to_string(&snapshot_config).unwrap();
+    Ok(snapshot_config)
 }
 
 fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
@@ -1054,13 +1121,6 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                     .index(1)
                     .help(vmm::vm_config::FsConfig::SYNTAX),
             ),
-        Command::new("patch-fs")
-            .about("Patch fs device")
-            .arg(
-                Arg::new("patch_fs_config")
-                    .index(1)
-                    .help(vmm::vm_config::FsMountConfigInfo::SYNTAX),
-            ),
         Command::new("add-generic-vhost-user")
             .about("Add generic vhost-user device")
             .arg(
@@ -1102,8 +1162,42 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
         Command::new("delete").about("Delete a VM"),
         Command::new("info").about("Info on the VM"),
         Command::new("nmi").about("Trigger NMI"),
+        Command::new("patch-fs")
+            .about("Patch fs device")
+            .arg(
+                Arg::new("patch_fs_config")
+                    .index(1)
+                    .help(vmm::vm_config::FsMountConfigInfo::SYNTAX),
+            ),
         Command::new("pause").about("Pause the VM"),
+        Command::new("pause-to-snapshot")
+            .about("Pause the VM and create a snapshot")
+            .arg(
+                Arg::new("snapshot_config")
+                    .index(1)
+                    .help("<destination_url>"),
+            )
+            .arg(
+                Arg::new("snapshot_type")
+                    .long("snapshot-type")
+                    .help("Snapshot type: 'full' or 'incremental' (saves only CoW anonymous pages) or 'soft-dirty' (saves dirty pages only)")
+                    .num_args(1)
+                    .default_value("full"),
+            )
+            .arg(
+                Arg::new("memory_vol_url")
+                    .long("memory-vol-url")
+                    .help(MEMORY_VOL_URL_HELP)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("multi_snapshot")
+                    .long("multi-snapshot")
+                    .help("Create multi-snapshot with dirty log conflicted with memory_vol_url")
+                    .num_args(0),
+            ),
         Command::new("ping").about("Ping the VMM to check for API server availability"),
+        Command::new("vm-wait-start").about("Wait for the VM to start up"),
         Command::new("power-button").about("Trigger a power button in the VM"),
         Command::new("reboot").about("Reboot the VM"),
         Command::new("receive-migration")
@@ -1172,6 +1266,13 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                     .help(RestoreConfig::SYNTAX),
             ),
         Command::new("resume").about("Resume the VM"),
+        Command::new("resume-from-snapshot")
+            .about("Resume the VM from a snapshot")
+            .arg(
+                Arg::new("resume_from_snapshot_config")
+                    .index(1)
+                    .help(RestoreConfig::SYNTAX),
+            ),
         Command::new("send-migration")
             .about("Initiate a VM migration")
             .arg(
@@ -1187,6 +1288,25 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                 Arg::new("snapshot_config")
                     .index(1)
                     .help("<destination_url>"),
+            )
+            .arg(
+                Arg::new("snapshot_type")
+                    .long("snapshot-type")
+                    .help("Snapshot type: 'full' or 'incremental' (saves only CoW anonymous pages) or 'soft-dirty' (saves dirty pages only)")
+                    .num_args(1)
+                    .default_value("full"),
+            )
+            .arg(
+                Arg::new("memory_vol_url")
+                    .long("memory-vol-url")
+                    .help(MEMORY_VOL_URL_HELP)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("multi_snapshot")
+                    .long("multi-snapshot")
+                    .help("Create multi-snapshot with dirty log conflicted with memory_vol_url")
+                    .num_args(0),
             ),
     ]
     .to_vec()

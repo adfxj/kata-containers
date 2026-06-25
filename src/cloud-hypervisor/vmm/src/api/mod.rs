@@ -44,7 +44,7 @@ use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vm_migration::MigratableError;
+use vm_migration::{MigratableError, SnapshotConfig};
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(feature = "dbus_api")]
@@ -63,6 +63,10 @@ use crate::vm_config::{
 /// API errors are sent back from the VMM API server through the ApiResponse.
 #[derive(Error, Debug)]
 pub enum ApiError {
+    /// Cannot clone EventFd.
+    #[error("Cannot clone EventFd")]
+    EventFdClone(#[source] io::Error),
+
     /// Cannot write to EventFd.
     #[error("Cannot write to EventFd")]
     EventFdWrite(#[source] io::Error),
@@ -102,6 +106,14 @@ pub enum ApiError {
     /// The VM could not resume.
     #[error("The VM could not resume")]
     VmResume(#[source] VmError),
+
+    /// The VM could not be paused to snapshot.
+    #[error("The VM could not be paused to snapshot")]
+    VmPauseToSnapshot(#[source] VmError),
+
+    /// The VM could not resume from snapshot.
+    #[error("The VM could not s from snapshot")]
+    VmResumeFromSnapshot(#[source] VmError),
 
     /// The VM is not booted.
     #[error("The VM is not booted")]
@@ -233,6 +245,11 @@ pub struct VmmPingResponse {
     pub features: Vec<String>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmWaitStartResponse {
+    pub started: bool,
+}
+
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmResizeData {
     pub desired_vcpus: Option<u32>,
@@ -255,12 +272,6 @@ pub struct VmResizeZoneData {
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmRemoveDeviceData {
     pub id: String,
-}
-
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
-pub struct VmSnapshotConfig {
-    /// The snapshot destination URL
-    pub destination_url: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -501,6 +512,9 @@ pub enum ApiResponsePayload {
     /// Vmm ping response
     VmmPing(VmmPingResponse),
 
+    /// Vm wait start response
+    VmWaitStart(VmWaitStartResponse),
+
     /// Vm action response
     VmAction(Option<Vec<u8>>),
 }
@@ -515,9 +529,13 @@ pub trait RequestHandler {
 
     fn vm_pause(&mut self) -> Result<(), VmError>;
 
+    fn vm_pause_to_snapshot(&mut self, snapshot_config: &SnapshotConfig) -> Result<(), VmError>;
+
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_resume_from_snapshot(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
+
+    fn vm_snapshot(&mut self, snapshot_config: &SnapshotConfig) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -531,6 +549,8 @@ pub trait RequestHandler {
     fn vm_info(&self) -> Result<VmInfoResponse, VmError>;
 
     fn vmm_ping(&self) -> VmmPingResponse;
+
+    fn vm_wait_start(&mut self) -> VmWaitStartResponse;
 
     fn vm_delete(&mut self) -> Result<(), VmError>;
 
@@ -1236,6 +1256,42 @@ impl ApiAction for VmPause {
     }
 }
 
+pub struct VmPauseToSnapshot;
+
+impl ApiAction for VmPauseToSnapshot {
+    type RequestBody = SnapshotConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmPauseToSnapshot {config:?}");
+
+            let response = vmm
+                .vm_pause_to_snapshot(&config)
+                .map_err(ApiError::VmPauseToSnapshot)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
 pub struct VmPowerButton;
 
 impl ApiAction for VmPowerButton {
@@ -1555,6 +1611,43 @@ impl ApiAction for VmResume {
     }
 }
 
+pub struct VmResumeFromSnapshot;
+
+impl ApiAction for VmResumeFromSnapshot {
+    type RequestBody = RestoreConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmResumeFromSnapshot {config:?}");
+
+            let response = vmm
+                .vm_resume_from_snapshot(config)
+                .map_err(ApiError::VmResumeFromSnapshot)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
 pub struct VmSendMigration;
 
 impl ApiAction for VmSendMigration {
@@ -1628,7 +1721,7 @@ impl ApiAction for VmShutdown {
 pub struct VmSnapshot;
 
 impl ApiAction for VmSnapshot {
-    type RequestBody = VmSnapshotConfig;
+    type RequestBody = SnapshotConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -1640,7 +1733,7 @@ impl ApiAction for VmSnapshot {
             info!("API request event: VmSnapshot {config:?}");
 
             let response = vmm
-                .vm_snapshot(&config.destination_url)
+                .vm_snapshot(&config)
                 .map_err(ApiError::VmSnapshot)
                 .map(|_| ApiResponsePayload::Empty);
 
@@ -1693,6 +1786,55 @@ impl ApiAction for VmmPing {
         match vmm_pong {
             ApiResponsePayload::VmmPing(pong) => Ok(pong),
             _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
+
+pub struct VmWaitStart;
+
+impl ApiAction for VmWaitStart {
+    type RequestBody = ();
+    type ResponseBody = VmWaitStartResponse;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmWaitStart");
+
+            let response = ApiResponsePayload::VmWaitStart(vmm.vm_wait_start());
+
+            response_sender
+                .send(Ok(response))
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: (),
+    ) -> ApiResult<VmWaitStartResponse> {
+        loop {
+            let vm_wait = get_response(
+                self,
+                api_evt.try_clone().map_err(ApiError::EventFdClone)?,
+                api_sender.clone(),
+                data,
+            )?;
+
+            match vm_wait {
+                ApiResponsePayload::VmWaitStart(wait) => {
+                    if wait.started {
+                        return Ok(wait);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                },
+                _ => return Err(ApiError::ResponsePayloadType),
+            }
         }
     }
 }

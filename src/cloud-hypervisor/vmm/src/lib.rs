@@ -43,13 +43,14 @@ use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
     Snapshot, Snapshottable, Transportable,
 };
+pub use vm_migration::{SnapshotConfig, SnapshotType};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
     ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse, VmWaitStartResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -87,6 +88,7 @@ pub mod interrupt;
 pub mod landlock;
 pub mod memory_manager;
 pub mod migration;
+pub mod pagemap_anon;
 pub mod migration_transport;
 mod pci_segment;
 pub mod seccomp_filters;
@@ -99,6 +101,7 @@ mod serial_manager;
 ))]
 pub(crate) mod sev;
 mod sigwinch_listener;
+pub mod soft_dirty;
 mod sync_utils;
 mod uffd;
 mod userfaultfd;
@@ -1629,6 +1632,7 @@ impl Vmm {
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
         fs_backend_init: bool,
+        memory_vol_url: Option<&str>,
     ) -> std::result::Result<(), VmError> {
         let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1677,6 +1681,7 @@ impl Vmm {
             Some(source_url),
             Some(prefault),
             Some(memory_restore_mode),
+            memory_vol_url,
         )?;
 
         if let Some(fs_mount_list_config) = &vm_config.clone().lock().unwrap().patch_fs {
@@ -1906,6 +1911,7 @@ impl RequestHandler for Vmm {
                         None,
                         None,
                         None,
+                        None,
                     )?;
 
                     if let Some(fs_mount_list_config) = &vm_config.lock().unwrap().patch_fs {
@@ -1940,6 +1946,12 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_pause_to_snapshot(&mut self, snapshot_config: &SnapshotConfig) -> result::Result<(), VmError> {
+        self.vm_pause()?;
+        self.vm_snapshot(snapshot_config)?;
+        self.vm_delete()
+    }
+
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             vm.resume().map_err(VmError::Resume)
@@ -1948,14 +1960,18 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_resume_from_snapshot(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+        RequestHandler::vm_restore(self, restore_cfg)
+    }
+
+    fn vm_snapshot(&mut self, snapshot_config: &SnapshotConfig) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
             vm.snapshot()
                 .map_err(VmError::Snapshot)
                 .and_then(|snapshot| {
-                    vm.send(&snapshot, destination_url)
+                    vm.send(&snapshot, snapshot_config)
                         .map_err(VmError::SnapshotSend)
                 })
         } else {
@@ -2014,14 +2030,51 @@ impl RequestHandler for Vmm {
             }
         }
 
-        // Update VM's fs configurations with new tap device
+        // Update VM's net configurations with new tap/ip/mask/mac for restore
         if let (Some(restored_taps), Some(vm_net_configs)) =
             (restore_cfg.restore_taps, &mut vm_config.lock().unwrap().net)
         {
             for restore_tap in restored_taps.iter() {
                 for net_config in vm_net_configs.iter_mut() {
                     if net_config.pci_common.id == Some(restore_tap.id.clone()) {
-                        net_config.tap.clone_from(&Some(restore_tap.tap.clone()));
+                        if let Some(ref tap) = restore_tap.tap {
+                            net_config.tap = Some(tap.clone());
+                        }
+                        if let Some(ref ip) = restore_tap.ip {
+                            net_config.ip = Some(*ip);
+                        }
+                        if let Some(ref mask) = restore_tap.mask {
+                            net_config.mask = Some(*mask);
+                        }
+                        if let Some(ref mac) = restore_tap.mac {
+                            net_config.mac = mac.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update VM's disk configurations with new disk paths
+        if let (Some(restored_disks), Some(vm_disk_configs)) =
+            (restore_cfg.disks, &mut vm_config.lock().unwrap().disks)
+        {
+            for restore_disk in restored_disks.iter() {
+                for disk_config in vm_disk_configs.iter_mut() {
+                    if disk_config.pci_common.id == Some(restore_disk.id.clone()) {
+                        disk_config.path = Some(restore_disk.path.clone());
+                    }
+                }
+            }
+        }
+
+        // Update VM's pmem configurations with new pmem file paths
+        if let (Some(restored_pmems), Some(vm_pmem_configs)) =
+            (restore_cfg.pmem, &mut vm_config.lock().unwrap().pmem)
+        {
+            for restore_pmem in restored_pmems.iter() {
+                for pmem_config in vm_pmem_configs.iter_mut() {
+                    if pmem_config.pci_common.id == Some(restore_pmem.id.clone()) {
+                        pmem_config.file.clone_from(&restore_pmem.file);
                     }
                 }
             }
@@ -2040,6 +2093,7 @@ impl RequestHandler for Vmm {
             restore_cfg.prefault,
             restore_cfg.memory_restore_mode,
             restore_cfg.fs_backend_init,
+            restore_cfg.memory_vol_url.as_deref(),
         )
         .and_then(|()| {
             if restore_cfg.resume {
@@ -2072,6 +2126,14 @@ impl RequestHandler for Vmm {
         let r = if let Some(ref mut vm) = self.vm.take() {
             // Drain console_info so that the FDs are not reused
             let _ = self.console_info.take();
+            match vm.counters() {
+                Ok(info) => {
+                    info!("counters details: {:?}", info);
+                }
+                Err(e) => {
+                    info! {"counter failed {}", e};
+                }
+            };
             vm.shutdown()
         } else {
             Err(VmError::VmNotRunning)
@@ -2144,6 +2206,7 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            None,
         )?;
 
         if let Some(fs_mount_list_config) = &config.lock().unwrap().patch_fs {
@@ -2206,6 +2269,15 @@ impl RequestHandler for Vmm {
             pid: std::process::id() as i64,
             features: feature_list(),
         }
+    }
+
+    fn vm_wait_start(&mut self) -> VmWaitStartResponse {
+        let mut response = VmWaitStartResponse { started: true };
+        if let Some(ref vm) = self.vm {
+            response.started = vm.sys_started();
+        }
+
+        response
     }
 
     fn vm_delete(&mut self) -> result::Result<(), VmError> {
@@ -2821,6 +2893,7 @@ mod unit_tests {
             },
             balloon: None,
             fs: None,
+            patch_fs: None,
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
@@ -2861,6 +2934,8 @@ mod unit_tests {
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: false,
         })
     }
 

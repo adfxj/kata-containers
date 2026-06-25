@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
@@ -14,6 +15,7 @@ use std::sync::LazyLock;
 use block::ImageType;
 use clap::ArgMatches;
 use log::{debug, warn};
+use net_util::MacAddr;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
 };
@@ -497,6 +499,8 @@ pub struct VmParams<'a> {
     pub fw_cfg_config: Option<&'a str>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<&'a str>,
+    #[cfg(target_arch = "x86_64")]
+    pub sys_ctrl: bool,
 }
 
 impl<'a> VmParams<'a> {
@@ -575,6 +579,7 @@ impl<'a> VmParams<'a> {
             args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
         #[cfg(feature = "ivshmem")]
         let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
+        let sys_ctrl = args.get_flag("sys-ctrl");
         VmParams {
             cpus,
             memory,
@@ -620,6 +625,8 @@ impl<'a> VmParams<'a> {
             fw_cfg_config,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl,
         }
     }
 }
@@ -2826,7 +2833,29 @@ pub struct RestoreTapConfig {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
-    pub tap: String,
+    pub tap: Option<String>,
+    #[serde(default)]
+    pub ip: Option<IpAddr>,
+    #[serde(default)]
+    pub mask: Option<IpAddr>,
+    #[serde(default)]
+    pub mac: Option<MacAddr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct RestoreDiskConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct RestorePmemConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub file: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -2840,7 +2869,7 @@ pub struct RestoreConfig {
     pub net_fds: Option<Vec<RestoredNetConfig>>,
     #[serde(default)]
     pub resume: bool,
-     #[serde(default)]
+    #[serde(default)]
     pub vsock_socket: Option<PathBuf>,
     #[serde(default)]
     pub dirty_log: bool,
@@ -2850,6 +2879,17 @@ pub struct RestoreConfig {
     pub fs_sources: Option<Vec<RestoreFsConfig>>,
     #[serde(default)]
     pub restore_taps: Option<Vec<RestoreTapConfig>>,
+    #[serde(default)]
+    pub disks: Option<Vec<RestoreDiskConfig>>,
+    #[serde(default)]
+    pub pmem: Option<Vec<RestorePmemConfig>>,
+    /// Optional existing memory blob path for reading memory range data from a
+    /// separate volume.
+    /// Accepts either an absolute path like `/dev/vdb` or a `file:///dev/vdb`
+    /// URL. When set, memory snapshots are read from this path instead of
+    /// source_url/<SNAPSHOT_FILENAME>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_vol_url: Option<String>,
 }
 
 impl RestoreConfig {
@@ -2857,17 +2897,21 @@ impl RestoreConfig {
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false,\
         vsock_socket=<vsock_socket>,dirty_log=on|off,fs_backend_init=on|off,\
-        fs_sources=<fs_sources>,restore_taps=<restore_taps>\" \
+        fs_sources=<fs_sources>,restore_taps=<restore_taps>,disks=<disks>,pmem=<pmem>,\
+        memory_vol_url=<memory_vol_url>\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
         \n`net_fds` is a list of net ids with new file descriptors, only net devices backed by FDs directly are needed as input \
-        \n `resume` controls whether the VM will be directly resumed after restore.\
+        \n`resume` controls whether the VM will be directly resumed after restore \
         \n`vsock_socket` is socket path of vsock \
         \n`dirty_log` used when snapshot with vm start with dirty_log \
         \n`fs_backend_init` used when virtiofs has been mounted in guest or as rootfs for guest \
         \n`fs_sources` is source dir of virtiofs with pattern [tag1@/path/to/dir,tag2@/path/to/dir] \
-        \n`restore_taps` is tap devices with pattern [id1@tap1,id2@tap2].";
+        \n`restore_taps` is tap devices with pattern [id1@[tap=tap1,ip=...,mask=...,mac=...],id2@[tap=tap2,ip=...,mask=...,mac=...],...] \
+        \n`disks` is disk devices with pattern [id1@/path/to/disk1,id2@/path/to/disk2] \
+        \n`pmem` is pmem devices with pattern [id1@/path/to/pmem1,id2@/path/to/pmem2] \
+        \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume.";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2881,18 +2925,20 @@ impl RestoreConfig {
             .add("dirty_log")
             .add("fs_backend_init")
             .add("fs_sources")
-            .add("restore_taps");
+            .add("restore_taps")
+            .add("disks")
+            .add("pmem")
+            .add("memory_vol_url");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
             .get("source_url")
             .map(PathBuf::from)
             .ok_or(Error::ParseRestoreSourceUrlMissing)?;
-        let prefault = parser
-            .convert::<Toggle>("prefault")
-            .map_err(Error::ParseRestore)?
-            .unwrap_or(Toggle(false))
-            .0;
+
+        let convert_toggle = |name| parser.convert::<Toggle>(name).map_err(Error::ParseRestore);
+
+        let prefault = convert_toggle("prefault")?.unwrap_or(Toggle(false)).0;
         let memory_restore_mode = parser
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
@@ -2909,24 +2955,10 @@ impl RestoreConfig {
                     })
                     .collect()
             });
-        let resume = parser
-            .convert::<Toggle>("resume")
-            .map_err(Error::ParseRestore)?
-            .unwrap_or(Toggle(false))
-            .0;
-
+        let resume = convert_toggle("resume")?.unwrap_or(Toggle(false)).0;
         let vsock_socket = parser.get("vsock_socket").map(PathBuf::from);
-        let dirty_log = parser
-            .convert::<Toggle>("dirty_log")
-            .map_err(Error::ParseRestore)?
-            .unwrap_or(Toggle(false))
-            .0;
-        let fs_backend_init = parser
-            .convert::<Toggle>("fs_backend_init")
-            .map_err(Error::ParseRestore)?
-            .unwrap_or(Toggle(false))
-            .0;
-
+        let dirty_log = convert_toggle("dirty_log")?.unwrap_or(Toggle(false)).0;
+        let fs_backend_init = convert_toggle("fs_backend_init")?.unwrap_or(Toggle(false)).0;
         let fs_sources = parser
             .convert::<Tuple<String, String>>("fs_sources")
             .map_err(Error::ParseRestore)?
@@ -2938,18 +2970,49 @@ impl RestoreConfig {
                     })
                     .collect()
             });
-
         let restore_taps = parser
             .convert::<Tuple<String, String>>("restore_taps")
             .map_err(Error::ParseRestore)?
             .map(|v| {
                 v.0.iter()
-                    .map(|(id, tap)| RestoreTapConfig {
+                    .map(|(id, config_str)| -> Result<RestoreTapConfig> {
+                        let mut tap_parser = OptionParser::new();
+                        tap_parser.add("tap").add("ip").add("mask").add("mac");
+                        tap_parser.parse(config_str).map_err(Error::ParseRestore)?;
+                        Ok(RestoreTapConfig {
+                            id: id.clone(),
+                            tap: tap_parser.get("tap"),
+                            ip: tap_parser.convert("ip").map_err(Error::ParseRestore)?,
+                            mask: tap_parser.convert("mask").map_err(Error::ParseRestore)?,
+                            mac: tap_parser.convert("mac").map_err(Error::ParseRestore)?,
+                        })
+                    })
+                    .collect::<Result<_>>()
+            })
+            .transpose()?;
+        let disks = parser
+            .convert::<Tuple<String, String>>("disks")
+            .map_err(Error::ParseRestore)?
+            .map(|v| {
+                v.0.iter()
+                    .map(|(id, path)| RestoreDiskConfig {
                         id: id.clone(),
-                        tap: tap.clone(),
+                        path: PathBuf::from(path),
                     })
                     .collect()
             });
+        let pmem = parser
+            .convert::<Tuple<String, String>>("pmem")
+            .map_err(Error::ParseRestore)?
+            .map(|v| {
+                v.0.iter()
+                    .map(|(id, file)| RestorePmemConfig {
+                        id: id.clone(),
+                        file: PathBuf::from(file),
+                    })
+                    .collect()
+            });
+        let memory_vol_url = parser.get("memory_vol_url");
 
         Ok(RestoreConfig {
             source_url,
@@ -2962,6 +3025,9 @@ impl RestoreConfig {
             fs_backend_init,
             fs_sources,
             restore_taps,
+            disks,
+            pmem,
+            memory_vol_url,
         })
     }
 
@@ -3773,6 +3839,8 @@ impl VmConfig {
             landlock_rules,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: vm_params.sys_ctrl,
         };
         config.validate().map_err(Error::Validation)?;
         Ok(config)
@@ -5023,6 +5091,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
                 resume: false,
+                vsock_socket: None,
+                dirty_log: false,
+                fs_backend_init: false,
+                fs_sources: None,
+                restore_taps: None,
+                disks: None,
+                pmem: None,
+                memory_vol_url: None,
             }
         );
         assert_eq!(
@@ -5046,6 +5122,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     }
                 ]),
                 resume: false,
+                vsock_socket: None,
+                dirty_log: false,
+                fs_backend_init: false,
+                fs_sources: None,
+                restore_taps: None,
+                disks: None,
+                pmem: None,
+                memory_vol_url: None,
             }
         );
         assert_eq!(
@@ -5056,6 +5140,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
                 net_fds: None,
                 resume: false,
+                vsock_socket: None,
+                dirty_log: false,
+                fs_backend_init: false,
+                fs_sources: None,
+                restore_taps: None,
+                disks: None,
+                pmem: None,
+                memory_vol_url: None,
             }
         );
         assert_eq!(
@@ -5066,6 +5158,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
                 resume: true,
+                vsock_socket: None,
+                dirty_log: false,
+                fs_backend_init: false,
+                fs_sources: None,
+                restore_taps: None,
+                disks: None,
+                pmem: None,
+                memory_vol_url: None,
             }
         );
         // Parsing should fail as source_url is a required field
@@ -5105,6 +5205,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             generic_vhost_user: None,
             balloon: None,
             fs: None,
+            patch_fs: None,
             pmem: None,
             serial: SerialConfig::default(),
             console: ConsoleConfig::default(),
@@ -5177,6 +5278,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 },
             ]),
             resume: false,
+            vsock_socket: None,
+            dirty_log: false,
+            fs_backend_init: false,
+            fs_sources: None,
+            restore_taps: None,
+            disks: None,
+            pmem: None,
+            memory_vol_url: None,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -5242,6 +5351,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: None,
             resume: false,
+            vsock_socket: None,
+            dirty_log: false,
+            fs_backend_init: false,
+            fs_sources: None,
+            restore_taps: None,
+            disks: None,
+            pmem: None,
+            memory_vol_url: None,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             pci_common: PciDeviceCommonConfig {
@@ -5259,6 +5376,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_restore_mode: MemoryRestoreMode::OnDemand,
             net_fds: None,
             resume: false,
+            vsock_socket: None,
+            dirty_log: false,
+            fs_backend_init: false,
+            fs_sources: None,
+            restore_taps: None,
+            disks: None,
+            pmem: None,
+            memory_vol_url: None,
         };
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),
@@ -5339,6 +5464,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             },
             balloon: None,
             fs: None,
+            patch_fs: None,
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
@@ -5378,6 +5504,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: false,
         };
 
         valid_config.validate().unwrap();

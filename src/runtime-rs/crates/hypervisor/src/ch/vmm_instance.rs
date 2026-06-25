@@ -369,10 +369,6 @@ impl VmmInstance {
         self.vm_action(&vmm::api::VmResume, ()).await.map(|_| ())
     }
 
-    pub async fn vm_snapshot(&mut self, snapshot_config: VmSnapshotConfig) -> Result<()> {
-        self.vm_action(&vmm::api::VmSnapshot, snapshot_config).await.map(|_| ())
-    }
-
     pub async fn vm_restore(&mut self, restore_config: RestoreConfig) -> Result<()> {
         self.vm_action(&vmm::api::VmRestore, restore_config).await.map(|_| ())
     }

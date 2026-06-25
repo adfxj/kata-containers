@@ -1116,6 +1116,9 @@ pub struct VmConfig {
     pub landlock_rules: Option<Vec<LandlockConfig>>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<IvshmemConfig>,
+    #[cfg(target_arch = "x86_64")]
+    #[serde(default)]
+    pub sys_ctrl: bool,
 }
 
 impl VmConfig {

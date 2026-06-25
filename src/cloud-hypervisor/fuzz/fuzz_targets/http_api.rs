@@ -15,7 +15,7 @@ use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{
     ApiRequest, RequestHandler, VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData,
-    VmmPingResponse,
+    VmmPingResponse, VmWaitStartResponse,
 };
 use vmm::config::RestoreConfig;
 use vmm::vm::{Error as VmError, VmState};
@@ -96,11 +96,15 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(())
     }
 
+    fn vm_pause_to_snapshot(&mut self, _: &str) -> Result<(), VmError> {
+        Ok(())
+    }
+
     fn vm_resume(&mut self) -> Result<(), VmError> {
         Ok(())
     }
 
-    fn vm_snapshot(&mut self, _: &str) -> Result<(), VmError> {
+    fn vm_resume_from_snapshot(&mut self, _: &str) -> Result<(), VmError> {
         Ok(())
     }
 
@@ -221,6 +225,12 @@ impl RequestHandler for StubApiRequestHandler {
             pid: 0,
             features: Vec::new(),
         }
+    }
+
+    fn vm_wait_start(&mut self) -> Result<String, VmError> {
+        Ok(VmWaitStartResponse {
+            wait_start: true,
+        })
     }
 
     fn vm_delete(&mut self) -> Result<(), VmError> {

@@ -250,6 +250,10 @@ impl DBusApi {
         self.vm_action(&VmPause, ()).await.map(|_| ())
     }
 
+    async fn vm_pause_to_snapshot(&self, snapshot_config: &str) -> Result<()> {
+        self.vm_action(&VmPauseToSnapshot, snapshot_config).await.map(|_| ())
+    }
+
     async fn vm_power_button(&self) -> Result<()> {
         self.vm_action(&VmPowerButton, ()).await.map(|_| ())
     }
@@ -301,6 +305,10 @@ impl DBusApi {
         self.vm_action(&VmResume, ()).await.map(|_| ())
     }
 
+    async fn vm_resume_from_snapshot(&self, restore_config: &str) -> Result<()> {
+        self.vm_action(&VmResumeFromSnapshot, restore_config).await.map(|_| ())
+    }
+
     async fn vm_shutdown(&self) -> Result<()> {
         self.vm_action(&VmShutdown, ()).await.map(|_| ())
     }
@@ -310,6 +318,16 @@ impl DBusApi {
         self.vm_action(&VmSnapshot, vm_snapshot_config)
             .await
             .map(|_| ())
+    }
+
+    async fn vm_wait_start(&self) -> Result<VmWaitStartResponse> {
+        let api_sender = self.clone_api_sender().await;
+        let api_notifier = self.clone_api_notifier()?;
+
+        let result = blocking::unblock(move || VmWaitStart.send(api_notifier, api_sender, ()))
+            .await
+            .map_err(api_error)?;
+        serde_json::to_string(&result).map_err(api_error)
     }
 
     // implementation of this function is provided by the `#[zbus(signal)]` macro call

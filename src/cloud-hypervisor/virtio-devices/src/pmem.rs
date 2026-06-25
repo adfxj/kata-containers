@@ -452,7 +452,18 @@ impl VirtioDevice for Pmem {
 
 impl Pausable for Pmem {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.common.pause()
+        self.common.pause()?;
+
+        // Flush pmem backend file data to disk for cross-machine pause-snapshot
+        // scenarios, ensuring all written data is persisted before the
+        // snapshot is transferred to a remote host.
+        if let Some(disk) = self.disk.as_ref() {
+            disk.sync_all().map_err(|e| {
+                MigratableError::Pause(anyhow!("Failed to fsync pmem device {}: {}", self.id, e))
+            })?;
+        }
+
+        Ok(())
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {

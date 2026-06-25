@@ -87,6 +87,7 @@ sha2 = { workspace = true }
 signal-hook = { workspace = true }
 thiserror = { workspace = true }
 tracer = { path = "../tracer" }
+tokio = { workspace = true }
 uuid = { workspace = true }
 vfio-ioctls = { workspace = true, default-features = false }
 vfio_user = { workspace = true }

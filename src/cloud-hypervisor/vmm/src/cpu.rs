@@ -501,6 +501,8 @@ pub struct Vcpu {
     saved_state: Option<CpuState>,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+    tsc_msrs: Vec<MsrEntry>,
 }
 
 impl Vcpu {
@@ -531,6 +533,8 @@ impl Vcpu {
             saved_state: None,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
+            #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+            tsc_msrs: Vec::new(),
         })
     }
 
@@ -995,6 +999,24 @@ impl CpuManager {
                 .set_state(&state)
                 .map_err(|e| Error::VcpuCreate(anyhow!("Could not set the vCPU state {e:?}")))?;
 
+            // Parse msrs from state, save related msrs in tsc_msrs.
+            
+            #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+            {
+                let tsc_msrs: Vec<MsrEntry> = match &state {
+                    #[cfg(feature = "kvm")]
+                    hypervisor::CpuState::Kvm(inner) => inner
+                        .msrs
+                        .iter()
+                        .filter(|msr| msr.index == msr_index::MSR_IA32_TSC)
+                        .cloned()
+                        .collect(),
+                    #[cfg(feature = "mshv")]
+                    _ => Vec::new(),
+                };
+                vcpu.tsc_msrs = tsc_msrs;
+            }
+
             vcpu.saved_state = Some(state);
         }
 
@@ -1095,6 +1117,16 @@ impl CpuManager {
                 // ready to break live upgrade.
                 snapshot_from_id(snapshot, cpu_id.to_string().as_str()),
             )?);
+        }
+
+        // Reset tsc msrs for all vcpu, so that KVM could synchronize TSC
+        // for restored VM, before vcpu run.
+        #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+        if snapshot.is_some() {
+            for vcpu in &self.vcpus {
+                let vcpu = vcpu.lock().unwrap();
+                let _ = vcpu.vcpu.set_msrs(&vcpu.tsc_msrs);
+            }
         }
 
         Ok(vcpus)

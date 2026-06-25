@@ -109,6 +109,40 @@ paths:
         405:
           description: The VM instance could not resume because it is not paused.
 
+  /vm.pause-to-snapshot:
+    put:
+      summary: Pause VM and returns a VM snapshot.
+      requestBody:
+        description: The snapshot configuration
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmSnapshotConfig"
+        required: true
+      responses:
+        204:
+          description: The VM instance was successfully paused and snapshotted.
+        404:
+          description: The VM instance could not be paused and snapshotted because it is not created.
+        405:
+          description: The VM instance could not be paused and snapshotted because it is not booted.
+
+  /vm.resume-from-snapshot:
+    put:
+      summary: Resume a VM from a snapshot.
+      requestBody:
+        description: The restore configuration
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreConfig"
+        required: true
+      responses:
+        204:
+          description: The VM instance was successfully restored and resumed.
+        404:
+          description: The VM instance could not be restored because it is already created.
+
   /vm.shutdown:
     put:
       summary: Shut the VM instance down.
@@ -1438,6 +1472,15 @@ components:
       properties:
         destination_url:
           type: string
+        snapshot_type:
+          type: string
+          default: full
+        memory_vol_url:
+          type: string
+          description: Optional existing memory blob path for storing memory range data on a separate volume. Accepts /dev/... and file:///dev/... forms.
+        multi_snapshot:
+          type: boolean
+          default: false
 
     VmCoredumpData:
       type: object
@@ -1450,6 +1493,24 @@ components:
       enum: [Copy, OnDemand]
       default: Copy
 
+    NetFdConfig:
+      type: object
+      properties:
+        id:
+          type: string
+        fd:
+          type: integer
+          format: int32
+
+    FsSourceConfig:
+      type: object
+      properties:
+        id:
+          type: string
+        path:
+          type: string
+          description: Path to the file system source.
+
     RestoreConfig:
       required:
         - source_url
@@ -1461,11 +1522,28 @@ components:
           type: boolean
         memory_restore_mode:
           $ref: "#/components/schemas/MemoryRestoreMode"
+        net_fds:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetFdConfig"
         resume:
           type: boolean
+        vsock_socket:
+          type: string
+          description: Path to UNIX domain socket, used to proxy vsock connections.
         dirty_log:
           type: boolean
           default: false
+        fs_backend_init:
+          type: boolean
+          default: false
+        fs_sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/FsSourceConfig"
+        memory_vol_url:
+          type: string
+          description: Optional existing memory blob path for reading memory range data from a separate volume. Accepts /dev/... and file:///dev/... forms.
 
     ReceiveMigrationData:
       required:

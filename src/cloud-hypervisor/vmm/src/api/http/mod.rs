@@ -27,11 +27,14 @@ use vmm_sys_util::eventfd::EventFd;
 use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdown};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use crate::api::VmWaitStart;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi,
     VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmPatchFs,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmPatchFs, VmPauseToSnapshot,
+    VmResumeFromSnapshot,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -199,10 +202,6 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         Box::new(VmActionHandler::new(&VmAddFs)),
     );
     r.routes.insert(
-        endpoint!("/vm.patch-fs"),
-        Box::new(VmActionHandler::new(&VmPatchFs)),
-    );
-    r.routes.insert(
         endpoint!("/vm.add-generic-vhost-user"),
         Box::new(VmActionHandler::new(&VmAddGenericVhostUser)),
     );
@@ -238,8 +237,16 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     );
     r.routes.insert(endpoint!("/vm.info"), Box::new(VmInfo {}));
     r.routes.insert(
+        endpoint!("/vm.patch-fs"),
+        Box::new(VmActionHandler::new(&VmPatchFs)),
+    );
+    r.routes.insert(
         endpoint!("/vm.pause"),
         Box::new(VmActionHandler::new(&VmPause)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.pause-to-snapshot"),
+        Box::new(VmActionHandler::new(&VmPauseToSnapshot)),
     );
     r.routes.insert(
         endpoint!("/vm.power-button"),
@@ -278,6 +285,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         Box::new(VmActionHandler::new(&VmResume)),
     );
     r.routes.insert(
+        endpoint!("/vm.resume-from-snapshot"),
+        Box::new(VmActionHandler::new(&VmResumeFromSnapshot)),
+    );
+    r.routes.insert(
         endpoint!("/vm.send-migration"),
         Box::new(VmActionHandler::new(&VmSendMigration)),
     );
@@ -293,6 +304,11 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.coredump"),
         Box::new(VmActionHandler::new(&VmCoredump)),
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+    r.routes.insert(
+        endpoint!("/vm.wait_start"),
+        Box::new(VmActionHandler::new(&VmWaitStart)),
     );
     r.routes
         .insert(endpoint!("/vmm.ping"), Box::new(VmmPing {}));

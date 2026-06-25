@@ -198,7 +198,7 @@ dependencies = [
  "thiserror 1.0.69",
  "uuid 1.23.1",
  "vm-fdt",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -756,8 +756,8 @@ dependencies = [
  "thiserror 1.0.69",
  "uuid 1.23.1",
  "virtio-bindings",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
  "vm-virtio",
  "vmm-sys-util 0.15.0",
  "zstd 0.13.3",
@@ -1521,7 +1521,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 name = "dbs-acpi"
 version = "0.1.0"
 dependencies = [
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1533,7 +1533,7 @@ dependencies = [
  "libc",
  "nix 0.23.2",
  "thiserror 1.0.69",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -1555,7 +1555,7 @@ dependencies = [
  "nix 0.26.4",
  "test-utils",
  "thiserror 1.0.69",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -1574,7 +1574,7 @@ dependencies = [
  "test-utils",
  "thiserror 1.0.69",
  "vm-fdt",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1635,8 +1635,8 @@ dependencies = [
  "thiserror 1.0.69",
  "vfio-bindings",
  "vfio-ioctls",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1733,8 +1733,8 @@ dependencies = [
  "timerfd",
  "vhost 0.15.0",
  "virtio-bindings",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -1856,7 +1856,7 @@ dependencies = [
  "tpm",
  "vm-allocator",
  "vm-device",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vm-migration",
  "vmm-sys-util 0.15.0",
  "zerocopy 0.8.48",
@@ -1982,8 +1982,8 @@ dependencies = [
  "tracing",
  "vfio-bindings",
  "vfio-ioctls",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -2408,27 +2408,6 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 [[package]]
 name = "fuse-backend-rs"
 version = "0.13.1"
-source = "git+https://github.com/adfxj/fuse-backend-rs.git?branch=restore#3aa359a91608bb1d5730f862d16448f46a121a98"
-dependencies = [
- "arc-swap",
- "bitflags 1.3.2",
- "caps",
- "core-foundation-sys",
- "lazy_static",
- "libc",
- "log",
- "mio 0.8.11",
- "nix 0.24.3",
- "radix_trie",
- "serde",
- "virtio-queue 0.12.0",
- "vm-memory 0.14.1",
- "vmm-sys-util 0.12.1",
-]
-
-[[package]]
-name = "fuse-backend-rs"
-version = "0.13.1"
 source = "git+https://github.com/adfxj/fuse-backend-rs.git?branch=restore-new#da3b0a45719301bc06f1e0e652d778aeacc4a549"
 dependencies = [
  "arc-swap",
@@ -2445,8 +2424,8 @@ dependencies = [
  "serde",
  "versionize",
  "versionize_derive",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
  "vmm-sys-util 0.12.1",
 ]
 
@@ -2466,8 +2445,8 @@ dependencies = [
  "mio 0.8.11",
  "nix 0.24.3",
  "radix_trie",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -3148,7 +3127,7 @@ dependencies = [
  "serde_with 3.20.0",
  "thiserror 1.0.69",
  "vfio-ioctls",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
  "zerocopy 0.8.48",
 ]
@@ -4298,7 +4277,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
 dependencies = [
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -4615,8 +4594,8 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "virtio-bindings",
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
  "vm-virtio",
  "vmm-sys-util 0.15.0",
 ]
@@ -5020,7 +4999,7 @@ dependencies = [
 [[package]]
 name = "nydus-api"
 version = "0.4.0"
-source = "git+https://github.com/adfxj/nydus#0b0bb510abb618f6667ad68005f1e221d7c8c54f"
+source = "git+https://github.com/adfxj/nydus?branch=restore-new#5318ef0894b5155c0c7d2bbe71ef9c1191d03016"
 dependencies = [
  "backtrace",
  "dbs-uhttp",
@@ -5053,12 +5032,12 @@ dependencies = [
 [[package]]
 name = "nydus-rafs"
 version = "0.4.0"
-source = "git+https://github.com/adfxj/nydus#0b0bb510abb618f6667ad68005f1e221d7c8c54f"
+source = "git+https://github.com/adfxj/nydus?branch=restore-new#5318ef0894b5155c0c7d2bbe71ef9c1191d03016"
 dependencies = [
  "anyhow",
  "arc-swap",
  "bitflags 1.3.2",
- "fuse-backend-rs 0.13.1 (git+https://github.com/adfxj/fuse-backend-rs.git?branch=restore)",
+ "fuse-backend-rs 0.13.1",
  "lazy_static",
  "libc",
  "log",
@@ -5069,7 +5048,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "vm-memory 0.14.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -5092,17 +5071,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
 name = "nydus-storage"
 version = "0.7.0"
-source = "git+https://github.com/adfxj/nydus#0b0bb510abb618f6667ad68005f1e221d7c8c54f"
+source = "git+https://github.com/adfxj/nydus?branch=restore-new#5318ef0894b5155c0c7d2bbe71ef9c1191d03016"
 dependencies = [
  "arc-swap",
  "bitflags 1.3.2",
- "fuse-backend-rs 0.13.1 (git+https://github.com/adfxj/fuse-backend-rs.git?branch=restore)",
+ "fuse-backend-rs 0.13.1",
  "hex",
  "lazy_static",
  "leaky-bucket",
@@ -5115,7 +5094,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tokio",
- "vm-memory 0.14.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -5144,13 +5123,13 @@ dependencies = [
  "tar",
  "tokio",
  "url",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
 name = "nydus-utils"
 version = "0.5.0"
-source = "git+https://github.com/adfxj/nydus#0b0bb510abb618f6667ad68005f1e221d7c8c54f"
+source = "git+https://github.com/adfxj/nydus?branch=restore-new#5318ef0894b5155c0c7d2bbe71ef9c1191d03016"
 dependencies = [
  "blake3",
  "crc",
@@ -5684,7 +5663,7 @@ dependencies = [
  "vfio_user",
  "vm-allocator",
  "vm-device",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vm-migration",
  "vmm-sys-util 0.15.0",
 ]
@@ -9345,7 +9324,7 @@ dependencies = [
  "mshv-ioctls",
  "thiserror 2.0.18",
  "vfio-bindings",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -9363,7 +9342,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "vfio-bindings",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -9376,7 +9355,7 @@ dependencies = [
  "bitflags 2.11.1",
  "libc",
  "uuid 1.23.1",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -9389,7 +9368,7 @@ dependencies = [
  "bitflags 2.11.1",
  "libc",
  "uuid 1.23.1",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -9444,7 +9423,7 @@ dependencies = [
  "downcast-rs",
  "epoll",
  "event_monitor",
- "fuse-backend-rs 0.13.1 (git+https://github.com/adfxj/fuse-backend-rs.git?branch=restore-new)",
+ "fuse-backend-rs 0.13.1",
  "hypervisor",
  "libc",
  "log",
@@ -9467,25 +9446,13 @@ dependencies = [
  "threadpool",
  "vhost 0.16.0",
  "virtio-bindings",
- "virtio-queue 0.17.0",
+ "virtio-queue",
  "vm-allocator",
  "vm-device",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vm-migration",
  "vm-virtio",
  "vmm-sys-util 0.15.0",
-]
-
-[[package]]
-name = "virtio-queue"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07d8406e7250c934462de585d8f2d2781c31819bca1fbb7c5e964ca6bbaabfe8"
-dependencies = [
- "log",
- "virtio-bindings",
- "vm-memory 0.14.1",
- "vmm-sys-util 0.12.1",
 ]
 
 [[package]]
@@ -9497,7 +9464,7 @@ dependencies = [
  "libc",
  "log",
  "virtio-bindings",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -9508,7 +9475,7 @@ dependencies = [
  "arch",
  "libc",
  "thiserror 1.0.69",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -9519,7 +9486,7 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "vfio-ioctls",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -9528,17 +9495,6 @@ name = "vm-fdt"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
-
-[[package]]
-name = "vm-memory"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3aba5064cc5f6f7740cddc8dae34d2d9a311cac69b60d942af7f3ab8fc49f4"
-dependencies = [
- "libc",
- "thiserror 1.0.69",
- "winapi",
-]
 
 [[package]]
 name = "vm-memory"
@@ -9561,7 +9517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -9574,8 +9530,8 @@ checksum = "69c376a9b84afdf97bddd2628096cf3554208b2a676cf06b4532e0f433a54e02"
 name = "vm-virtio"
 version = "0.1.0"
 dependencies = [
- "virtio-queue 0.17.0",
- "vm-memory 0.17.1",
+ "virtio-queue",
+ "vm-memory",
 ]
 
 [[package]]
@@ -9596,7 +9552,7 @@ dependencies = [
  "epoll",
  "event_monitor",
  "flume",
- "fuse-backend-rs 0.13.1 (git+https://github.com/adfxj/fuse-backend-rs.git?branch=restore-new)",
+ "fuse-backend-rs 0.13.1",
  "futures",
  "gdbstub",
  "gdbstub_arch",
@@ -9624,6 +9580,7 @@ dependencies = [
  "signal-hook 0.4.4",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracer",
  "uuid 1.23.1",
  "vfio-ioctls",
@@ -9633,7 +9590,7 @@ dependencies = [
  "virtio-devices",
  "vm-allocator",
  "vm-device",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vm-migration",
  "vm-virtio",
  "vmm-sys-util 0.15.0",

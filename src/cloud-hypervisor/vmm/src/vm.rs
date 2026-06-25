@@ -79,8 +79,8 @@ use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, Snapshottable,
-    Transportable, snapshot_from_id, state_from_id,
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotConfig,
+    Snapshottable, Transportable, snapshot_from_id, state_from_id,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -373,7 +373,10 @@ pub enum Error {
     #[error("Error locking disk images: Another instance likely holds a lock")]
     LockingError(#[source] DeviceManagerError),
 
-    #[cfg(feature = "fw_cfg")]
+    #[error("Error setting system control state")]
+    SysCtrlSetRestore(#[source] DeviceManagerError),
+
+       #[cfg(feature = "fw_cfg")]
     #[error("Fw Cfg missing kernel")]
     MissingFwCfgKernelFile(#[source] io::Error),
 
@@ -1353,6 +1356,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        memory_vol_url: Option<&str>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1410,6 +1414,7 @@ impl Vm {
                     memory_restore_mode.unwrap_or_default(),
                     phys_bits,
                     &exit_evt,
+                    memory_vol_url,
                 )
                 .map_err(Error::MemoryManager)?
             } else {
@@ -2089,6 +2094,10 @@ impl Vm {
         self.state = new_state;
 
         Ok(())
+    }
+
+    pub fn sys_started(&self) -> bool {
+        self.device_manager.lock().unwrap().sys_started()
     }
 
     pub fn resize(
@@ -3107,6 +3116,12 @@ impl Vm {
             .try_lock_disks()
             .map_err(Error::LockingError)?;
 
+        self.device_manager
+            .lock()
+            .unwrap()
+            .sys_restore()
+            .map_err(Error::SysCtrlSetRestore)?;
+
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
@@ -3506,8 +3521,9 @@ impl Transportable for Vm {
     fn send(
         &self,
         snapshot: &Snapshot,
-        destination_url: &str,
+        config: &SnapshotConfig,
     ) -> std::result::Result<(), MigratableError> {
+        let destination_url = &config.destination_url;
         let mut snapshot_config_path = url_to_path(destination_url)?;
         snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
 
@@ -3527,6 +3543,11 @@ impl Transportable for Vm {
             .write(vm_config.as_bytes())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
+        // Ensure config data is flushed to disk for cross-machine pause-snapshot.
+        snapshot_config_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         let mut snapshot_state_path = url_to_path(destination_url)?;
         snapshot_state_path.push(SNAPSHOT_STATE_FILE);
 
@@ -3538,6 +3559,12 @@ impl Transportable for Vm {
             .open(snapshot_state_path)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
+        // Clone the snapshot and add metadata.
+        let mut snapshot_with_meta = snapshot.clone();
+        snapshot_with_meta.metadata = Some(vm_migration::SnapshotMetadata {
+            snapshot_type: config.snapshot_type,
+        });
+
         // Serialize and write the snapshot state
         let vm_state =
             serde_json::to_vec(snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
@@ -3546,12 +3573,17 @@ impl Transportable for Vm {
             .write(&vm_state)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
+        // Ensure state data is flushed to disk for cross-machine pause-snapshot.
+        snapshot_state_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         // Tell the memory manager to also send/write its own snapshot.
         if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
             self.memory_manager
                 .lock()
                 .unwrap()
-                .send(&memory_manager_snapshot.clone(), destination_url)?;
+                .send(&memory_manager_snapshot.clone(), &config)?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
                 "Missing memory manager snapshot"
@@ -4213,4 +4245,22 @@ pub fn test_vm() {
             r => panic!("unexpected exit reason: {r:?}"),
         }
     }
+}
+
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+#[test]
+pub fn test_vm_snapshot_restore() {
+    let vm_snapshot_state = VmSnapshot {
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        clock: Some(hypervisor::ClockData::Kvm(
+            hypervisor::kvm::kvm_clock_data::default(),
+        )),
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        common_cpuid: vec![],
+    };
+
+    let snapshot = Snapshot::new_from_state(&vm_snapshot_state).unwrap();
+
+    let vm_snapshot = get_vm_snapshot(&snapshot).map_err(Error::Restore).unwrap();
+    println!("{:?}", vm_snapshot.clock.unwrap());
 }
