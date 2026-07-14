@@ -17,6 +17,7 @@ use std::{io, result, thread};
 
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::Pl011;
+use bytes::{BufMut, BytesMut};
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use devices::legacy::Serial;
 use libc::EFD_NONBLOCK;
@@ -440,5 +441,61 @@ impl Drop for SerialManager {
                 .map_err(Error::RemoveUnixSocket)
                 .ok();
         }
+    }
+}
+
+/// Writer to process guest kernel dmesg.
+pub struct DmesgWriter {
+    buf: BytesMut,
+}
+
+impl DmesgWriter {
+    /// Creates a new instance.
+    pub fn new() -> Self {
+        Self {
+            buf: BytesMut::with_capacity(1024),
+        }
+    }
+}
+
+impl io::Write for DmesgWriter {
+    /// 0000000   [                   0   .   0   3   4   9   1   6   ]       R
+    ///          5b  20  20  20  20  30  2e  30  33  34  39  31  36  5d  20  52
+    /// 0000020   u   n       /   s   b   i   n   /   i   n   i   t       a   s
+    ///          75  6e  20  2f  73  62  69  6e  2f  69  6e  69  74  20  61  73
+    /// 0000040       i   n   i   t       p   r   o   c   e   s   s  \r  \n   [
+    ///
+    /// dmesg message end a line with /r/n . When redirect message to logger, we should
+    /// remove the /r/n .
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let arr: Vec<&[u8]> = buf.split(|c| *c == b'\n').collect();
+        let count = arr.len();
+
+        for (i, sub) in arr.iter().enumerate() {
+            if sub.is_empty() {
+                if !self.buf.is_empty() {
+                    info!(
+                        "{}",
+                        String::from_utf8_lossy(self.buf.as_ref()).trim_end()
+                    );
+                    self.buf.clear();
+                }
+            } else if sub.len() < buf.len() && i < count - 1 {
+                info!(
+                    "{}{}",
+                    String::from_utf8_lossy(self.buf.as_ref()).trim_end(),
+                    String::from_utf8_lossy(sub).trim_end(),
+                );
+                self.buf.clear();
+            } else {
+                self.buf.put_slice(sub);
+            }
+        }
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

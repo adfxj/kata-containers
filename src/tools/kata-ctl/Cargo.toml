@@ -15,25 +15,27 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "cargo"] }
 serde_json.workspace = true
 thiserror.workspace = true
-privdrop = "0.5.2"
-nix = "0.25.0"
-strum = "0.24.1"
-strum_macros = "0.24.3"
+privdrop.workspace = true
+nix.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
 serde.workspace = true
 url.workspace = true
 futures.workspace = true
-base64 = "0.13.0"
+base64.workspace = true
 toml.workspace = true
-sys-info = "0.9.1"
+sys-info.workspace = true
 
 shim-interface.workspace = true
 kata-types.workspace = true
 kata-sys-util.workspace = true
+kata-hypervisor.workspace = true
 agent.workspace = true
 virt_container.workspace = true
+common.workspace = true
 serial_test.workspace = true
 vmm-sys-util.workspace = true
-epoll = "4.0.1"
+epoll.workspace = true
 libc.workspace = true
 
 # Note: this crate sets the slog 'max_*' features which allows the log level
@@ -49,34 +51,26 @@ procfs.workspace = true
 lazy_static.workspace = true
 
 # for log-parser
-serde_yaml = "0.9"
-ron = "0.8"
-quick-xml = { version = "0.28", features = ["serialize"] }
-csv = "1.2"
-serde_with = "2.3"
-chrono = { version = "0.4", features = ["serde"] }
-rstest = "0.26.1"
+serde_yaml.workspace = true
+ron.workspace = true
+quick-xml.workspace = true
+csv.workspace = true
+serde_with.workspace = true
+chrono.workspace = true
+rstest.workspace = true
 
 [target.'cfg(target_arch = "s390x")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "blocking",
-    "native-tls",
-] }
+reqwest = { workspace = true, features = ["native-tls"] }
 
 [target.'cfg(not(target_arch = "s390x"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "blocking",
-    "rustls-tls",
-] }
+reqwest.workspace = true
 
 [dev-dependencies]
-semver = "1.0.12"
+semver.workspace = true
 tempfile.workspace = true
-nix = "0.25.0"
+nix.workspace = true
 test-utils.workspace = true
-micro_http = { git = "https://github.com/firecracker-microvm/micro-http", rev = "5c2254d6cf4f32a668d0d8e57ba20bebad9d4fba" }
+micro_http.workspace = true
 
 [package.metadata.cargo-machete]
 ignored = ["strum"]

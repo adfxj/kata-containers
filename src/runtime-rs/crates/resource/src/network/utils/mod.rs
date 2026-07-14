@@ -10,7 +10,7 @@ pub(crate) mod link;
 use anyhow::{anyhow, Result};
 use rand::{rng, Rng};
 
-pub(crate) fn parse_mac(s: &str) -> Option<hypervisor::Address> {
+pub(crate) fn parse_mac(s: &str) -> Option<kata_hypervisor::Address> {
     let v: Vec<_> = s.split(':').collect();
     if v.len() != 6 {
         return None;
@@ -20,7 +20,7 @@ pub(crate) fn parse_mac(s: &str) -> Option<hypervisor::Address> {
         bytes[i] = u8::from_str_radix(v[i], 16).ok()?;
     }
 
-    Some(hypervisor::Address(bytes))
+    Some(kata_hypervisor::Address(bytes))
 }
 
 pub(crate) fn get_mac_addr(b: &[u8]) -> Result<String> {

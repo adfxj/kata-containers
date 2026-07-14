@@ -19,7 +19,7 @@ use common::{
     },
     ContainerManager,
 };
-use hypervisor::Hypervisor;
+use kata_hypervisor::Hypervisor;
 use oci::Process as OCIProcess;
 use oci_spec::runtime as oci;
 use resource::ResourceManager;

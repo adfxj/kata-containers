@@ -730,7 +730,7 @@ impl QemuInner {
 
         let is_unaligned = !new_hotplugged_mem.is_multiple_of(guest_mem_block_size);
         if is_unaligned {
-            new_hotplugged_mem = ch_config::convert::checked_next_multiple_of(
+            new_hotplugged_mem = checked_next_multiple_of(
                 new_hotplugged_mem,
                 guest_mem_block_size,
             )
@@ -1093,6 +1093,13 @@ impl QemuInner {
         info!(sl!(), "QemuInner::update_device() {:?}", &device);
 
         Ok(())
+    }
+}
+
+fn checked_next_multiple_of(value: u64, multiple: u64) -> Option<u64> {
+    match value.checked_rem(multiple) {
+        None => Some(value),
+        Some(r) => value.checked_add(multiple - r),
     }
 }
 

@@ -108,6 +108,12 @@ mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
 
+// used for kata
+pub extern crate hypervisor;
+pub extern crate signal_hook;
+pub extern crate net_util;
+pub extern crate virtio_devices;
+
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 
@@ -734,7 +740,7 @@ impl Vmm {
         }
     }
 
-    fn setup_signal_handler(&mut self, landlock_enable: bool) -> Result<()> {
+    pub fn setup_signal_handler(&mut self, landlock_enable: bool) -> Result<()> {
         let signals = Signals::new(Self::HANDLED_SIGNALS);
         match signals {
             Ok(signals) => {
@@ -793,7 +799,7 @@ impl Vmm {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         vmm_version: VmmVersionInfo,
         api_evt: EventFd,
         #[cfg(feature = "guest_debug")] debug_evt: EventFd,
@@ -1712,7 +1718,7 @@ impl Vmm {
         }
     }
 
-    fn control_loop(
+    pub fn control_loop(
         &mut self,
         api_receiver: &Receiver<ApiRequest>,
         #[cfg(feature = "guest_debug")] gdb_receiver: &Receiver<gdb::GdbRequest>,
@@ -2062,8 +2068,35 @@ impl RequestHandler for Vmm {
                 for disk_config in vm_disk_configs.iter_mut() {
                     if disk_config.pci_common.id == Some(restore_disk.id.clone()) {
                         disk_config.path = Some(restore_disk.path.clone());
+                        if restore_disk.rate_limit_group.is_some() {
+                            disk_config.rate_limit_group =
+                                restore_disk.rate_limit_group.clone();
+                        }
+                        if restore_disk.rate_limiter_config.is_some() {
+                            disk_config.rate_limiter_config =
+                                restore_disk.rate_limiter_config.clone();
+                        }
                     }
                 }
+            }
+        }
+
+        // Update VM's rate_limit_groups with new rate limit group configurations
+        if let Some(restored_rate_limit_groups) = restore_cfg.rate_limit_groups {
+            let mut vm_config_lock = vm_config.lock().unwrap();
+            if let Some(ref mut vm_groups) = vm_config_lock.rate_limit_groups {
+                for restored_group in restored_rate_limit_groups.iter() {
+                    if let Some(existing) =
+                        vm_groups.iter_mut().find(|g| g.id == restored_group.id)
+                    {
+                        existing.rate_limiter_config =
+                            restored_group.rate_limiter_config.clone();
+                    } else {
+                        vm_groups.push(restored_group.clone());
+                    }
+                }
+            } else {
+                vm_config_lock.rate_limit_groups = Some(restored_rate_limit_groups);
             }
         }
 
@@ -2085,6 +2118,11 @@ impl RequestHandler for Vmm {
             (restore_cfg.vsock_socket, &mut vm_config.lock().unwrap().vsock)
         {
             vm_vsock.socket.clone_from(&restore_vsock_socket);
+        }
+
+        // Update VM's serial socket with new socket path
+        if let Some(restore_serial_socket) = restore_cfg.serial_socket {
+            vm_config.lock().unwrap().serial.common.socket = Some(restore_serial_socket);
         }
 
         self.vm_restore(

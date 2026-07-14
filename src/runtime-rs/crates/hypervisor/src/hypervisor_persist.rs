@@ -36,4 +36,6 @@ pub struct HypervisorState {
     pub passfd_listener_port: Option<u32>,
     /// guest protection
     pub guest_protection_to_use: GuestProtection,
+    /// enable gpudirect
+    pub enable_gpudirect: bool,
 }

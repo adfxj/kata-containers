@@ -5,7 +5,7 @@
 
 use agent::Agent;
 use anyhow::{anyhow, Context, Error, Result};
-use hypervisor::{
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig, DeviceType,

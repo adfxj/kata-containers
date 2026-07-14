@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use super::Volume;
 use anyhow::Result;
 use async_trait::async_trait;
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use kata_sys_util::mount::{get_mount_path, get_mount_type};
 use kata_types::mount::{kata_guest_sandbox_dir, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DEVICE, SHM_DIR};
 use oci_spec::runtime as oci;

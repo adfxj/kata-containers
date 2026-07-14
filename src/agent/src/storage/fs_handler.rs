@@ -15,6 +15,12 @@ use kata_types::mount::{StorageDevice, KATA_VOLUME_OVERLAYFS_CREATE_DIR};
 use protocols::agent::Storage;
 use tracing::instrument;
 
+const KATA_OVERLAY_BLK_POINT: &str = "io.katacontainers.rootfs.overlayfs.mount_blk_point";
+const KATA_OVERLAY_BLK_SOURCE: &str = "io.katacontainers.rootfs.overlayfs.mount_blk_src";
+const KATA_OVERLAY: &str = "overlay";
+
+const FS_TYPE_EXT4: &str = "ext4";
+
 #[derive(Debug)]
 pub struct OverlayfsHandler {}
 
@@ -31,6 +37,31 @@ impl StorageHandler for OverlayfsHandler {
         mut storage: Storage,
         ctx: &mut StorageContext,
     ) -> Result<Arc<dyn StorageDevice>> {
+        let overlay_blk_point = &(KATA_OVERLAY_BLK_POINT.to_string() + "=");
+        let overlay_blk_source = &(KATA_OVERLAY_BLK_SOURCE.to_string() + "=");
+        for driver_option in &storage.driver_options {
+            if let Some(point) = driver_option
+                .as_str()
+                .strip_prefix(overlay_blk_point)
+            {
+                for driver_option in &storage.driver_options {
+                    if let Some(src) = driver_option
+                        .as_str()
+                        .strip_prefix(overlay_blk_source)
+                    {
+                        let blk_storage = Storage {
+                            source: src.to_string(),
+                            mount_point: point.to_string(),
+                            fstype: FS_TYPE_EXT4.to_string(),
+                            ..Default::default()
+                        };
+
+                        let _ = common_storage_handler(ctx.logger, &blk_storage)?;
+                    }
+                }
+            }
+        }
+
         if storage
             .options
             .iter()
@@ -40,12 +71,15 @@ impl StorageHandler for OverlayfsHandler {
                 .cid
                 .clone()
                 .ok_or_else(|| anyhow!("No container id in rw overlay"))?;
-            let cpath = Path::new(crate::rpc::CONTAINER_BASE).join(cid);
+            let cpath = Path::new(crate::rpc::CONTAINER_BASE).join(KATA_OVERLAY).join(cid);
             let work = cpath.join("work");
             let upper = cpath.join("upper");
 
             fs::create_dir_all(&work).context("Creating overlay work directory")?;
             fs::create_dir_all(&upper).context("Creating overlay upper directory")?;
+
+            let cpath = Path::new(&storage.mount_point);
+            fs::create_dir_all(&cpath).context("Creating overlay merged directory")?;
 
             storage.fstype = "overlay".into();
             storage
@@ -55,6 +89,11 @@ impl StorageHandler for OverlayfsHandler {
                 .options
                 .push(format!("workdir={}", work.to_string_lossy()));
         }
+
+        storage
+            .options
+            .retain(|opt| opt != "io.katacontainers.fs-opt.overlay-rw");
+
         let overlay_create_dir_prefix = &(KATA_VOLUME_OVERLAYFS_CREATE_DIR.to_string() + "=");
         for driver_option in &storage.driver_options {
             if let Some(dir) = driver_option

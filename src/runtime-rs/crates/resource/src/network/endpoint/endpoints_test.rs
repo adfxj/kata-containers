@@ -26,7 +26,7 @@ mod tests {
         network_pair::{NetworkInterface, NetworkPair, TapInterface},
         utils::link::net_test_utils::delete_link,
     };
-    use hypervisor::{device::device_manager::DeviceManager, qemu::Qemu};
+    use kata_hypervisor::{device::device_manager::DeviceManager, qemu::Qemu};
 
     async fn get_device_manager() -> Result<Arc<RwLock<DeviceManager>>> {
         let hypervisor_name: &str = "qemu";

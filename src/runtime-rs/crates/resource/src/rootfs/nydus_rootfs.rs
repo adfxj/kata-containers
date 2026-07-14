@@ -16,7 +16,7 @@ use crate::{
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 use kata_types::mount::{Mount, NydusExtraOptions};
 use oci_spec::runtime as oci;
 use tokio::sync::RwLock;

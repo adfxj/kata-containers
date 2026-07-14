@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use tokio::sync::RwLock;
 
 use super::Volume;

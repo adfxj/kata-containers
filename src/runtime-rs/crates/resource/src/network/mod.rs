@@ -7,8 +7,10 @@
 use std::sync::Arc;
 
 mod dan;
+mod xlet;
 mod endpoint;
 pub use dan::{dan_config_path, Dan, DanNetworkConfig};
+pub use xlet::{Xlet, XletNetworkConfig};
 pub use endpoint::endpoint_persist::EndpointState;
 pub use endpoint::Endpoint;
 mod network_entity;
@@ -28,12 +30,13 @@ use tokio::sync::RwLock;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 
 #[derive(Debug)]
 pub enum NetworkConfig {
     NetNs(NetworkWithNetNsConfig),
     Dan(DanNetworkConfig),
+    Xlet(XletNetworkConfig),
 }
 
 #[async_trait]
@@ -60,6 +63,11 @@ pub async fn new(
             Dan::new(c, d)
                 .await
                 .context("New directly attachable network")?,
+        )),
+        NetworkConfig::Xlet(c) => Ok(Arc::new(
+            Xlet::new(c, d)
+                .await
+                .context("New xlet network")?,
         )),
     }
 }

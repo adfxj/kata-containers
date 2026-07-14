@@ -178,6 +178,10 @@ impl DeviceManager {
         Ok(())
     }
 
+    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
+        self.hypervisor.get_overlayfs_block_device().await
+    }
+
     pub async fn try_remove_device(&mut self, device_id: &str) -> Result<()> {
         if let Some(dev) = self.devices.get(device_id) {
             let mut device_guard = dev.lock().await;
@@ -699,6 +703,10 @@ pub async fn do_handle_device(
         .context("failed to get device info")?;
 
     Ok(device_info)
+}
+
+pub async fn get_overlayfs_block_device(d: &RwLock<DeviceManager>) -> Option<DeviceType> {
+    d.read().await.get_overlayfs_block_device().await
 }
 
 pub async fn do_update_device(

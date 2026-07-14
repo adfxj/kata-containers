@@ -38,6 +38,17 @@ impl AgentManager for KataAgent {
         Ok(())
     }
 
+    async fn start_without_log_forwarder(&self, address: &str) -> Result<()> {
+        info!(sl!(), "begin to connect agent {:?}", address);
+        self.set_socket_address(address)
+            .await
+            .context("set socket")?;
+        self.connect_agent_server()
+            .await
+            .context("connect agent server")?;
+        Ok(())
+    }
+
     async fn stop(&self) {
         self.stop_log_forwarder().await;
     }
@@ -128,6 +139,7 @@ impl_agent!(
     online_cpu_mem | crate::OnlineCPUMemRequest | crate::Empty | None,
     get_metrics | crate::Empty | crate::MetricsResponse | None,
     get_guest_details | crate::GetGuestDetailsRequest | crate::GuestDetailsResponse | None,
+    set_guest_date_time | crate::SetGuestDateTimeRequest | crate::Empty | None,
     add_swap | crate::AddSwapRequest | crate::Empty | None,
     add_swap_path | crate::AddSwapPathRequest | crate::Empty | None,
     set_policy | crate::SetPolicyRequest | crate::Empty | None,

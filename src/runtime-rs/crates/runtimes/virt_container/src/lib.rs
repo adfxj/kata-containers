@@ -15,23 +15,23 @@ pub mod health_check;
 pub mod sandbox;
 pub mod sandbox_persist;
 
-use std::path::Path;
 use std::sync::Arc;
 
-use agent::{kata::KataAgent, Agent, AGENT_KATA};
+use agent::{kata::KataAgent, AGENT_KATA};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use common::{message::Message, types::SandboxConfig, RuntimeHandler, RuntimeInstance};
-use hypervisor::Hypervisor;
+use factory::{factory::VMFactory, FactoryBase};
+use kata_hypervisor::Hypervisor;
 #[cfg(all(
     feature = "dragonball",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
+use kata_hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
-use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
-use hypervisor::{remote::Remote, HYPERVISOR_REMOTE};
+use kata_hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
+use kata_hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
+use kata_hypervisor::{remote::Remote, HYPERVISOR_REMOTE};
 #[cfg(all(
     feature = "dragonball",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -46,19 +46,23 @@ use kata_types::config::{hypervisor::register_hypervisor_plugin, QemuConfig, Tom
     feature = "cloud-hypervisor",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-use hypervisor::ch::CloudHypervisor;
+use kata_hypervisor::ch::CloudHypervisor;
 #[cfg(all(
     feature = "cloud-hypervisor",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use kata_types::config::{hypervisor::HYPERVISOR_NAME_CH, CloudHypervisorConfig};
 
-use crate::factory::vm::VmConfig;
 use resource::cpu_mem::initial_size::InitialSizeManager;
 use resource::ResourceManager;
 use sandbox::VIRTCONTAINER;
 use tokio::sync::mpsc::Sender;
 use tracing::instrument;
+
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 unsafe impl Send for VirtContainer {}
 unsafe impl Sync for VirtContainer {}
@@ -122,17 +126,18 @@ impl RuntimeHandler for VirtContainer {
         init_size_manager: InitialSizeManager,
         sandbox_config: SandboxConfig,
     ) -> Result<RuntimeInstance> {
+        let vf_config = Arc::new(factory::vm::VMConfig::new(config.clone()));
+        let factory_impl = factory::get_factory_instance(config.clone(), false).await.context("get factory_impl")?;
+        let vm_factory = VMFactory::new(factory_impl);
+        let bare_vm = vm_factory
+            .get_base_vm(vf_config.clone())
+            .await
+            .context("get bare vm")?;
+
+        let hypervisor = bare_vm.get_hypervisor();
+        let agent = bare_vm.get_agent();
+
         let factory = config.get_factory();
-        let (hypervisor, agent) = if factory.enable_template {
-            build_vm_from_template()
-                .await
-                .context("build vm from template")?
-        } else {
-            (
-                new_hypervisor(&config).await.context("new hypervisor")?,
-                new_agent(&config).context("new agent")? as Arc<dyn agent::Agent>,
-            )
-        };
 
         let resource_manager = Arc::new(
             ResourceManager::new(
@@ -176,29 +181,7 @@ impl RuntimeHandler for VirtContainer {
     }
 }
 
-async fn build_vm_from_template() -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>)> {
-    let (mut toml_config, _) =
-        TomlConfig::load_from_default().context("failed to load toml config")?;
-    let hypervisor_name = toml_config.runtime.hypervisor_name.clone();
-    if let Some(h) = toml_config.hypervisor.get_mut(&hypervisor_name) {
-        h.vm_template.boot_to_be_template = false;
-        h.vm_template.boot_from_template = true;
-        let path = Path::new(&h.factory.template_path);
-        h.vm_template.memory_path = path.join("memory").to_string_lossy().to_string();
-        h.vm_template.device_state_path = path.join("state").to_string_lossy().to_string();
-        let _ = VmConfig::validate_hypervisor_config(h);
-    } else {
-        return Err(anyhow!("hypervisor '{}' not found", hypervisor_name));
-    }
-    let hypervisor = new_hypervisor(&toml_config)
-        .await
-        .context("new hypervisor")?;
-    let agent = new_agent(&toml_config).context("new agent")? as Arc<dyn agent::Agent>;
-
-    Ok((hypervisor, agent))
-}
-
-async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>> {
+pub async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>> {
     let hypervisor_name = &toml_config.runtime.hypervisor_name;
     let hypervisor_config = toml_config
         .hypervisor
@@ -245,10 +228,18 @@ async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>>
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         HYPERVISOR_NAME_CH => {
-            let hypervisor = CloudHypervisor::new();
+            let mut hypervisor = CloudHypervisor::new();
             hypervisor
                 .set_hypervisor_config(hypervisor_config.clone())
                 .await;
+            hypervisor
+                .set_vfio_config(toml_config.runtime.enable_gpudirect)
+                .await;
+            if toml_config.runtime.use_passfd_io {
+                hypervisor
+                    .set_passfd_listener_port(toml_config.runtime.passfd_listener_port)
+                    .await;
+            }
             Ok(Arc::new(hypervisor))
         }
         HYPERVISOR_REMOTE => {
@@ -262,7 +253,7 @@ async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>>
     }
 }
 
-fn new_agent(toml_config: &TomlConfig) -> Result<Arc<KataAgent>> {
+pub fn new_agent(toml_config: &TomlConfig) -> Result<Arc<KataAgent>> {
     let agent_name = &toml_config.runtime.agent_name;
     let agent_config = toml_config
         .agent

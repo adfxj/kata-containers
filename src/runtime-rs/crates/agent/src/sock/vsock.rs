@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-use std::os::unix::prelude::{AsRawFd, FromRawFd};
+use std::os::unix::prelude::AsRawFd;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -60,7 +60,7 @@ impl Sock for Vsock {
                     .context("failed to create vsock socket")?;
 
                     // Wrap fd so it closes on error
-                    let socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                    let socket = std::os::unix::net::UnixStream::from(fd);
 
                     // Blocking connect (usually returns quickly for vsock)
                     connect(socket.as_raw_fd(), &sa)

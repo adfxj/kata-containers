@@ -5,7 +5,7 @@
 // Description: Boot UVM for testing container storages/volumes.
 
 use anyhow::{anyhow, Context, Result};
-use hypervisor::Hypervisor;
+use kata_hypervisor::Hypervisor;
 use kata_types::config::{hypervisor::HYPERVISOR_NAME_CH, hypervisor::HYPERVISOR_NAME_QEMU};
 use share_fs_utils::SharedFs;
 use slog::info;

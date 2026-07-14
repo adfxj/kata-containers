@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use agent::Storage;
-use hypervisor::{device::device_manager::DeviceManager, utils::chown_to_parent, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, utils::chown_to_parent, Hypervisor};
 use kata_types::{config::hypervisor::SharedFsInfo, rootless::is_rootless};
 
 use super::{

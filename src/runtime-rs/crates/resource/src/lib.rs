@@ -17,7 +17,7 @@ pub mod manager;
 mod manager_inner;
 pub mod network;
 pub mod resource_persist;
-use hypervisor::{
+use kata_hypervisor::{
     vfio_device::VfioDeviceBase, BlockConfig, HybridVsockConfig, PortDeviceConfig,
     ProtectionDeviceConfig, VsockConfig,
 };

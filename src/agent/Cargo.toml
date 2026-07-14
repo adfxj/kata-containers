@@ -27,6 +27,7 @@ const_format.workspace = true
 async-trait.workspace = true
 async-recursion.workspace = true
 futures.workspace = true
+rlimit.workspace = true
 
 # Async runtime
 tokio.workspace = true
@@ -84,8 +85,8 @@ vsock-exporter.workspace = true
 
 # Initdata
 base64 = { workspace = true }
-sha2 = "0.10.8"
-async-compression = { version = "0.4.22", features = ["tokio", "gzip"] }
+sha2.workspace = true
+async-compression.workspace = true
 
 container-device-interface = "0.1.1"
 

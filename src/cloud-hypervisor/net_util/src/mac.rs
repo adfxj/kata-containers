@@ -16,7 +16,7 @@ pub const MAC_ADDR_LEN: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MacAddr {
-    bytes: [u8; MAC_ADDR_LEN],
+    pub bytes: [u8; MAC_ADDR_LEN],
 }
 
 impl MacAddr {

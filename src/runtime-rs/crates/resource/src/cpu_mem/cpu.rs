@@ -5,7 +5,7 @@
 //
 
 use anyhow::{Context, Ok, Result};
-use hypervisor::Hypervisor;
+use kata_hypervisor::Hypervisor;
 use kata_types::{config::TomlConfig, cpu::LinuxContainerCpuResources};
 use oci::LinuxCpu;
 use oci_spec::runtime as oci;

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use kata_sys_util::mount::{get_mount_path, get_mount_type};
 use kata_types::mount::DirectVolumeMountInfo;
 use nix::sys::{stat, stat::SFlag};

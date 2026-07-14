@@ -193,6 +193,10 @@ impl Hypervisor for Remote {
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
         Err(anyhow::anyhow!("Not yet supported"))
     }
+
+    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
+        None
+    }
 }
 
 #[async_trait]

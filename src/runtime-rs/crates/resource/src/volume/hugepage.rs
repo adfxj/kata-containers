@@ -16,7 +16,7 @@ use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use byte_unit::{Byte, Unit};
-use hypervisor::{device::device_manager::DeviceManager, HUGETLBFS};
+use kata_hypervisor::{device::device_manager::DeviceManager, HUGETLBFS};
 use kata_sys_util::{
     fs::get_base_name,
     mount::{get_mount_path, PROC_MOUNTS_FILE},

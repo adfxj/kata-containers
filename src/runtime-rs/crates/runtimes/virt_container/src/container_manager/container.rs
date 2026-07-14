@@ -779,10 +779,10 @@ fn amend_spec(
     }
 
     if disable_guest_selinux {
-        if let Some(ref mut process) = spec.process_mut() {
+        if let Some(process) = spec.process_mut() {
             process.set_selinux_label(None);
         }
-        if let Some(ref mut linux) = spec.linux_mut() {
+        if let Some(linux) = spec.linux_mut() {
             linux.set_mount_label(None);
         }
     }

@@ -40,7 +40,11 @@ fn get_uds_with_sid(short_id: &str, path: &str) -> Result<String> {
     let target_ids: Vec<String> = fs::read_dir(&kata_run_path)?
         .filter_map(|e| {
             let x = e.ok()?.file_name().to_string_lossy().into_owned();
-            x.as_str().starts_with(short_id).then_some(x)
+            if x.as_str() == short_id {
+                Some(x)
+            } else {
+                None
+            }
         })
         .collect::<Vec<_>>();
 

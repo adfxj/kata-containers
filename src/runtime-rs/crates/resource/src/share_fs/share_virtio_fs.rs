@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use nix::mount::MsFlags;
 use tokio::sync::RwLock;
 
-use hypervisor::{
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, do_update_device, get_shared_fs_info, DeviceManager},
         driver::{ShareFsMountConfig, ShareFsMountOperation, ShareFsMountType},

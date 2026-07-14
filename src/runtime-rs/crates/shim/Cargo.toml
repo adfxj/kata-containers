@@ -23,6 +23,7 @@ go-flag = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true }
+oci-spec = { workspace = true }
 protobuf = { workspace = true }
 sha2 = { workspace = true }
 slog = { workspace = true, features = [
@@ -36,7 +37,7 @@ slog-stdlog = "4.1.0"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 unix_socket2 = "0.5.4"
-oci-spec = { workspace = true }
+vmm-sys-util = { workspace = true }
 
 # Local dependencies
 kata-types = { workspace = true }

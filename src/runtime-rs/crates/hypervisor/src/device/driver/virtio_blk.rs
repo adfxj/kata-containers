@@ -133,11 +133,14 @@ pub struct BlockConfig {
     /// block device multi-queue
     pub num_queues: usize,
 
-    /// Logical sector size in bytes reported to the guest. 0 means use hypervisor default.
+    /// Logical sector size in bytes reported to the guest. 0 means use kata_hypervisor default.
     pub logical_sector_size: u32,
 
-    /// Physical sector size in bytes reported to the guest. 0 means use hypervisor default.
+    /// Physical sector size in bytes reported to the guest. 0 means use kata_hypervisor default.
     pub physical_sector_size: u32,
+
+    /// device for overlayfs
+    pub is_overlayfs: bool,
 }
 
 #[derive(Debug, Clone, Default)]

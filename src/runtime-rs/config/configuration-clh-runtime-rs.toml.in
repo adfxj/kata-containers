@@ -10,7 +10,6 @@
 # XXX:   Type: @PROJECT_TYPE@
 
 [hypervisor.clh]
-path = "@CLHPATH@"
 kernel = "@KERNELPATH_CLH@"
 image = "@IMAGEPATH@"
 
@@ -22,13 +21,37 @@ rootfs_type = @DEFROOTFSTYPE@
 
 # Block storage driver to be used for the VM rootfs is backed
 # by a block device.
-#
-# virtio-pmem is not supported with Cloud Hypervisor.
 vm_rootfs_driver = "@VMROOTFSDRIVER_CLH@"
+
+# Enable confidential guest support.
+# Toggling that setting may trigger different hardware features, ranging
+# from memory encryption to both memory and CPU-state encryption and integrity.
+# The Kata Containers runtime dynamically detects the available feature set and
+# aims at enabling the largest possible one, returning an error if none is
+# available, or none is supported by the hypervisor.
+#
+# Known limitations:
+# * Does not work by design:
+#   - CPU Hotplug 
+#   - Memory Hotplug
+#   - NVDIMM devices
+#
+# Supported TEEs:
+# * Intel TDX
+#
+# Default false
+# confidential_guest = true
 
 # Path to the firmware.
 # If you want Cloud Hypervisor to use a specific firmware, set its path below.
-firmware = "@FIRMWAREPATH@"
+# This is option is only used when confidential_guest is enabled.
+#
+# For more information about firmwared that can be used with specific TEEs,
+# please, refer to:
+# * Intel TDX:
+#   - td-shim: https://github.com/confidential-containers/td-shim
+#
+# firmware = "@FIRMWAREPATH@"
 
 # List of valid annotation names for the hypervisor
 # Each member of the list is a regular expression, which is the base name
@@ -56,7 +79,7 @@ valid_ctlpaths = []
 # may stop the virtual machine from booting.
 # To see the list of default parameters, enable hypervisor debug, create a
 # container and look for 'default-kernel-parameters' log entries.
-kernel_params = "@KERNELPARAMS@"
+kernel_params = "@KERNELPARAMS_CLH@"
 
 # Default number of vCPUs per SB/VM:
 # unspecified or 0                --> will be set to 1
@@ -85,14 +108,19 @@ default_maxvcpus = @DEFMAXVCPUS@
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFMEMSZ@
 
+# Default maximum memory in MiB per SB / VM
+# unspecified or == 0           --> will be set to the actual amount of physical RAM
+# > 0 <= amount of physical RAM --> will be set to the specified number
+# > amount of physical RAM      --> will be set to the actual amount of physical RAM
+default_maxmemory = @DEFMAXMEMSZ@
+
 # Shared file system type:
+#   - inline-virtio-fs (default)
 #   - virtio-fs
 #   - virtio-fs-nydus
-#   - none
-shared_fs = "@DEFSHAREDFS_CLH_VIRTIOFS@"
-
-# Path to vhost-user-fs daemon.
-virtio_fs_daemon = "@DEFVIRTIOFSDAEMON@"
+# "inline-virtio-fs" is the same as "virtio-fs", but it is running in the same process
+# of shim, does not need an external virtiofsd process.
+shared_fs = "@DBSHAREDFS@"
 
 # Default size of DAX cache in MiB
 virtio_fs_cache_size = @DEFVIRTIOFSCACHESIZE@
@@ -217,7 +245,36 @@ enable_mem_prealloc = false
 # This is useful when you want to use vhost-user network
 # stacks within the container. This will automatically
 # result in memory pre allocation
-enable_hugepages = false
+#enable_hugepages = true
+
+# If host doesn't support offload csum, set to true. Thus we won't enable offload csum for nics.
+# Default false
+#disable_offload_csum = true
+
+# If host doesn't support offload tso, set to true. Thus we won't enable offload tso for nics.
+# Default false
+#disable_offload_tso = true
+
+# If host doesn't support offload ufo, set to true. Thus we won't enable offload ufo for nics.
+# Default false
+#disable_offload_ufo = true
+
+# This option changes the default hypervisor and kernel parameters
+# to enable debug output where available.
+#
+# Default false
+#enable_debug = true
+
+# The log level will be applied to hypervisor.
+# Possible values are:
+# - trace
+# - debug
+# - info
+# - warn
+# - error
+# - critical
+# Default: info
+#log_level = info
 
 # Enable running clh VMM as a non-root user.
 # By default clh VMM run as root. When this is set to true, clh VMM process runs as
@@ -226,12 +283,6 @@ rootless = false
 
 # Disable the 'seccomp' feature from Cloud Hypervisor, firecracker or dragonball, default false
 disable_seccomp = false
-
-# This option changes the default hypervisor and kernel parameters
-# to enable debug output where available.
-#
-# Default false
-enable_debug = false
 
 # Disable the customizations done in the runtime when it detects
 # that it is running on top a VMM. This will result in the runtime
@@ -280,6 +331,17 @@ container_pipe_size = @PIPESIZE@
 # (default: disabled)
 enable_debug = false
 
+# The log level will be applied to agent.
+# Possible values are:
+# - trace
+# - debug
+# - info
+# - warn
+# - error
+# - critical
+# (default: info)
+log_level = "info"
+
 # Enable agent tracing.
 #
 # If enabled, the agent will generate OpenTelemetry trace spans.
@@ -299,7 +361,7 @@ enable_tracing = false
 # If enabled, user can connect guest OS running inside hypervisor
 # through "kata-runtime exec <sandbox-id>" command
 
-debug_console_enabled = false
+debug_console_enabled = true
 
 # Agent dial timeout in millisecond.
 # (default: 10)
@@ -393,8 +455,8 @@ compact_period_psi_percent_limit = 1
 compact_psi_percent_limit = 5
 
 # Control the maximum number of seconds for each compaction of mem-agent compact function.
-# Default to 300
-compact_sec_max = 300
+# Default to 180
+compact_sec_max = 180
 
 # Control the mem-agent compaction function compact order.
 # compact_order is use with compact_threshold.
@@ -430,6 +492,17 @@ compact_force_times = 9223372036854775807
 # system log
 # (default: disabled)
 enable_debug = false
+
+# The log level will be applied to runtimes.
+# Possible values are:
+# - trace
+# - debug
+# - info
+# - warn
+# - error
+# - critical
+# (default: info)
+log_level = "info"
 
 # If enabled, enabled, it means that 1) if the runtime exits abnormally,
 # the cleanup process will be skipped, and 2) the runtime will not exit
@@ -494,16 +567,8 @@ jaeger_password = ""
 # `disable_new_netns` conflicts with `internetworking_model=bridged` and `internetworking_model=macvtap`. It works only
 # with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
 # (like OVS) directly.
-# (default: false)
-disable_new_netns = false
-
-# if enabled, the runtime will add all the kata processes inside one dedicated cgroup.
-# The container cgroups in the host are not created, just one single cgroup per sandbox.
-# The runtime caller is free to restrict or collect cgroup stats of the overall Kata sandbox.
-# The sandbox cgroup path is the parent cgroup of a container with the PodSandbox annotation.
-# The sandbox cgroup is constrained if there is no container type annotation.
-# See: https://pkg.go.dev/github.com/kata-containers/kata-containers/src/runtime/virtcontainers#ContainerType
-sandbox_cgroup_only = @DEFSANDBOXCGROUPONLY_CLH@
+# (default: true)
+disable_new_netns = true
 
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
@@ -543,3 +608,32 @@ sandbox_bind_mounts = @DEFBINDMOUNTS@
 # to the hypervisor.
 # (default: /run/kata-containers/dans)
 dan_conf = "@DEFDANCONF@"
+
+# If enabled, the runtime will attempt to use fd passthrough feature for process io.
+use_passfd_io = true
+
+# If fd passthrough io is enabled, the runtime will attempt to use the specified port instead of the default port.
+passfd_listener_port = 1027
+
+# Used to signal support for PCIe P2P traffic between NVIDIA VFIO endpoints.
+enable_gpudirect = false
+
+# If enabled, sandbox will not remove cgroup created.
+enable_pool_cgroup = false
+
+[hypervisor.clh.factory]
+# VM templating support. Once enabled, new VMs are created from template
+# using vm cloning. They will share the same initial kernel, initramfs and
+# agent memory by mapping it readonly. It helps speeding up new container
+# creation and saves a lot of memory if there are many kata containers running
+# on the same host.
+#
+# When disabled, new VMs are created from scratch.
+#
+# Default false
+enable_template = false
+
+# Specifies the path of template.
+#
+# Default "/run/vc/vm/template-rs/ch"
+# template_path = "/run/vc/vm/template-rs/ch"

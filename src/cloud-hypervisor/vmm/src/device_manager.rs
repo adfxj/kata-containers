@@ -118,7 +118,7 @@ use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
-use crate::serial_manager::{Error as SerialManagerError, SerialManager};
+use crate::serial_manager::{Error as SerialManagerError, SerialManager, DmesgWriter};
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
@@ -2476,7 +2476,7 @@ impl DeviceManager {
                 return Err(DeviceManagerError::NoSocketOptionSupportForConsoleDevice);
             }
             ConsoleTransport::Null => Endpoint::Null,
-            ConsoleTransport::Off => return Ok(None),
+            ConsoleTransport::Off | ConsoleTransport::Log => return Ok(None),
         };
 
         let id = match console_config.pci_common.id.as_ref() {
@@ -2552,6 +2552,9 @@ impl DeviceManager {
             ConsoleTransport::File(ref file) | ConsoleTransport::Tty(ref file) => {
                 Some(Box::new(Arc::clone(file)))
             }
+            ConsoleTransport::Log => {
+                Some(Box::new(DmesgWriter::new()))
+            }
             ConsoleTransport::Off
             | ConsoleTransport::Null
             | ConsoleTransport::Pty(_)
@@ -2594,7 +2597,8 @@ impl DeviceManager {
                 ConsoleTransport::Off
                 | ConsoleTransport::Null
                 | ConsoleTransport::Pty(_)
-                | ConsoleTransport::Socket(_) => None,
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::Log => None,
             };
             if let Some(writer) = debug_console_writer {
                 let _ = self.add_debug_console_device(writer)?;

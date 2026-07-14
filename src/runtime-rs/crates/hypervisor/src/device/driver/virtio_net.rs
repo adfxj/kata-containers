@@ -27,7 +27,7 @@ impl fmt::Debug for Address {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NetworkConfig {
     /// for detach, now it's default value 0.
     pub index: u64,
@@ -39,7 +39,7 @@ pub struct NetworkConfig {
     /// Guest MAC address.
     pub guest_mac: Option<Address>,
     /// Virtio queue size
-    pub queue_size: usize,
+    pub queue_size: u16,
     /// Virtio queue num
     pub queue_num: usize,
     /// Use shared irq
@@ -48,6 +48,22 @@ pub struct NetworkConfig {
     pub use_generic_irq: Option<bool>,
     /// Allow duplicate mac
     pub allow_duplicate_mac: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            host_dev_name: String::default(),
+            virt_iface_name: String::default(),
+            guest_mac: None,
+            queue_size: 256,
+            queue_num: 2,
+            use_shared_irq: None,
+            use_generic_irq: None,
+            allow_duplicate_mac: bool::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

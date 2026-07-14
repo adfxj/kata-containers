@@ -74,6 +74,7 @@ impl TryFrom<sandbox_api::CreateSandboxRequest> for SandboxRequest {
             network_env: SandboxNetworkEnv {
                 netns: Some(from.netns_path),
                 network_created: false,
+                annotations: config.annotations.clone(),
             },
             annotations: config.annotations.clone(),
             hooks: None,

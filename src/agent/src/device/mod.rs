@@ -11,6 +11,8 @@ use self::vfio_device_handler::{VfioApDeviceHandler, VfioPciDeviceHandler};
 use crate::pci;
 use crate::sandbox::PciHostGuestMapping;
 use crate::sandbox::Sandbox;
+use crate::uevent::{UeventMatcher, wait_for_uevent};
+use crate::linux_abi::create_pci_root_bus_path;
 use anyhow::{anyhow, Context, Result};
 use cdi::annotations::parse_annotations;
 use cdi::cache::{new_cache, with_auto_refresh, CdiOption};
@@ -724,6 +726,52 @@ pub fn pcipath_to_sysfs(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<Str
     }
 
     Ok(relpath)
+}
+
+#[derive(Debug)]
+struct BlockMatcher {
+    suffix: String,
+}
+
+impl BlockMatcher {
+    fn new(devname: &str) -> BlockMatcher {
+        let suffix = format!(r"/block/{}", devname);
+
+        BlockMatcher { suffix }
+    }
+}
+
+impl UeventMatcher for BlockMatcher {
+    fn is_match(&self, uev: &crate::uevent::Uevent) -> bool {
+        uev.subsystem == BLOCK
+            && uev.devpath.starts_with(&create_pci_root_bus_path("00"))
+            && uev.devpath.ends_with(&self.suffix)
+            && !uev.devname.is_empty()
+    }
+}
+
+#[instrument]
+pub async fn wait_for_disk_device(sandbox: &Arc<Mutex<Sandbox>>, devpath: &str) -> Result<()> {
+    let devname = match devpath.strip_prefix("/dev/") {
+        Some(dev) => dev,
+        None => {
+            return Err(anyhow!(
+                "Storage source '{}' must start with /dev/",
+                devpath
+            ))
+        }
+    };
+
+    let matcher = BlockMatcher::new(devname);
+    let uev = wait_for_uevent(sandbox, matcher).await?;
+    if uev.devname != devname {
+        return Err(anyhow!(
+            "Unexpected device name {} for block device (expected {})",
+            uev.devname,
+            devname
+        ));
+    }
+    Ok(())
 }
 
 #[instrument]

@@ -18,7 +18,7 @@ use std::{
 use agent::Agent;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use inotify::{EventMask, Inotify, WatchMask};
 use kata_sys_util::mount::{get_mount_options, get_mount_path, get_mount_type};
 use nix::sys::stat::SFlag;

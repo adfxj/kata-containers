@@ -14,7 +14,7 @@ use crate::share_fs::{do_get_guest_path, do_get_host_path};
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::{
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig, DeviceType,

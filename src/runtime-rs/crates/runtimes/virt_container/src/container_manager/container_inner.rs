@@ -10,7 +10,7 @@ use common::{
     error::Error,
     types::{ContainerID, ContainerProcess, ProcessExitStatus, ProcessStatus, ProcessType},
 };
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use nix::sys::signal::Signal;
 use oci::LinuxResources;
 use oci_spec::runtime as oci;
@@ -312,7 +312,7 @@ impl ContainerInner {
         Ok(())
     }
 
-    async fn clean_volumes(&mut self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
+    pub async fn clean_volumes(&mut self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
         let mut unhandled = Vec::new();
         for v in self.volumes.iter() {
             if let Err(err) = v.cleanup(device_manager).await {
@@ -331,7 +331,7 @@ impl ContainerInner {
         Ok(())
     }
 
-    async fn clean_rootfs(&mut self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
+    pub async fn clean_rootfs(&mut self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
         let mut unhandled = Vec::new();
         for rootfs in self.rootfs.iter() {
             if let Err(err) = rootfs.cleanup(device_manager).await {

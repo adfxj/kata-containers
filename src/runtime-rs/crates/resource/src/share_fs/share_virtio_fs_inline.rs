@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
 
 use agent::Storage;
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 use kata_types::config::hypervisor::SharedFsInfo;
 
 use super::{

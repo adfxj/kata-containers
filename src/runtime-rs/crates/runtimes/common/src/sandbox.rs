@@ -17,6 +17,7 @@ use std::sync::Arc;
 pub struct SandboxNetworkEnv {
     pub netns: Option<String>,
     pub network_created: bool,
+    pub annotations: std::collections::HashMap<String, String>,
 }
 
 impl std::fmt::Debug for SandboxNetworkEnv {
@@ -24,6 +25,7 @@ impl std::fmt::Debug for SandboxNetworkEnv {
         f.debug_struct("SandboxNetworkEnv")
             .field("netns", &self.netns)
             .field("network_created", &self.network_created)
+            .field("annotations", &self.annotations)
             .finish()
     }
 }
@@ -54,6 +56,9 @@ pub trait Sandbox: Send + Sync {
     // Docker 26+ network rescan: discover interfaces that Docker configured
     // between the Create and Start RPCs.
     async fn rescan_network(&self) -> Result<()>;
+
+    async fn resize_vcpu(&self, old_vcpu: u32, new_vcpu: u32) -> Result<()>;
+    async fn resize_memory(&self, new_mem_mb: u32) -> Result<()>;
 
     // metrics function
     async fn agent_metrics(&self) -> Result<String>;

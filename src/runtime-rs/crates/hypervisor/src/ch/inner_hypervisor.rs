@@ -3,79 +3,47 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::convert::TryInto;
+use std::collections::HashMap;
+use std::iter::FromIterator;
+use std::convert::TryFrom;
+use std::cmp::Ordering;
+use std::sync::{Arc, RwLock};
+use tokio::task;
+use tokio::time::Duration;
+
 use super::inner::CloudHypervisorInner;
-use crate::ch::utils::get_api_socket_path;
-use crate::ch::utils::get_rootless_symlink_sandbox_path;
-use crate::ch::utils::get_vsock_path;
+use super::convert::{NamedHypervisorConfig, RestoreConfigInner};
+use super::utils::{
+    get_api_socket_path, get_vsock_path, guest_protection_is_tdx
+};
+use crate::DeviceType;
 use crate::kernel_param::KernelParams;
+use crate::MemoryConfig;
 use crate::selinux;
 use crate::utils::create_dir_all_with_inherit_owner;
-use crate::utils::remove_dir_all_if_exists;
-use crate::utils::set_groups;
-use crate::utils::vm_cleanup;
-use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
-use crate::MemoryConfig;
-use crate::VM_ROOTFS_DRIVER_BLK;
+use crate::utils::{get_jailer_root, get_sandbox_path};
+use crate::{VM_ROOTFS_DRIVER_BLK, VM_TEMPLATE_SIZE};
 use crate::{VcpuThreadIds, VmmState};
-use anyhow::{anyhow, Context, Result};
-use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
-use ch_config::{
-    ch_api::{
-        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
-        cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping, cloud_hypervisor_vmm_shutdown,
-    },
-    VmResize,
-};
-use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, VmConfig};
-use core::future::poll_fn;
-use futures::future::join_all;
+use anyhow::{anyhow, Context, Ok, Result};
+use std::collections::HashSet;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::default::DEFAULT_CH_ROOTFS_TYPE;
-use kata_types::config::hypervisor::RootlessUser;
-use kata_types::rootless::is_rootless;
+use kata_types::config::PASSFD_LISTENER_PORT;
 use lazy_static::lazy_static;
-use nix::sched::{setns, CloneFlags};
-use nix::unistd::setgid;
-use nix::unistd::setuid;
-use nix::unistd::Gid;
-use nix::unistd::Uid;
-use serde_json::Value;
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::fs;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::process::Stdio;
-use std::sync::{Arc, RwLock};
-use tokio::io::BufReader;
-use tokio::process::{Child, Command};
-use tokio::sync::watch::Receiver;
-use tokio::task;
-use tokio::task::JoinHandle;
-use tokio::time::Duration;
-use tokio::{io::AsyncBufReadExt, sync::mpsc};
-
-const CH_NAME: &str = "clh";
+use vmm::{
+    api::{VmmPingResponse, VmResizeData},
+    SnapshotConfig,
+    vm_config::VmConfig,
+    config::RestoreConfig,
+};
 
 /// Number of milliseconds to wait before retrying a CH operation.
 const CH_POLL_TIME_MS: u64 = 50;
 
-// The name of the CH JSON key for the build-time features list.
-const CH_FEATURES_KEY: &str = "features";
-
 // The name of the CH build-time feature for Intel TDX.
 const CH_FEATURE_TDX: &str = "tdx";
-
-#[derive(Debug, PartialEq)]
-enum CloudHypervisorLogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum GuestProtectionError {
@@ -97,14 +65,9 @@ pub enum GuestProtectionError {
 }
 
 impl CloudHypervisorInner {
-    async fn start_hypervisor(&mut self, timeout_secs: i32) -> Result<()> {
-        self.cloud_hypervisor_launch(timeout_secs)
-            .await
+    async fn start_hypervisor(&mut self, _timeout_secs: i32) -> Result<()> {
+        self.cloud_hypervisor_launch()
             .context("launch failed")?;
-
-        self.cloud_hypervisor_setup_comms()
-            .await
-            .context("comms setup failed")?;
 
         self.cloud_hypervisor_check_running()
             .await
@@ -129,8 +92,12 @@ impl CloudHypervisorInner {
         let confidential_guest = cfg.security_info.confidential_guest;
 
         // Note that the configuration option hypervisor.block_device_driver is not used.
-        // NVDIMM is not supported for Cloud Hypervisor.
-        let rootfs_driver = VM_ROOTFS_DRIVER_BLK;
+        let rootfs_driver = if confidential_guest {
+            // PMEM is not available with TDX.
+            VM_ROOTFS_DRIVER_BLK
+        } else {
+            &cfg.boot_info.vm_rootfs_driver
+        };
 
         let rootfs_type = match cfg.boot_info.rootfs_type.is_empty() {
             true => DEFAULT_CH_ROOTFS_TYPE,
@@ -163,8 +130,16 @@ impl CloudHypervisorInner {
             KernelParams::from_string("quiet")
         };
 
+        if let Some(passfd_listener_port) = self.passfd_listener_port {
+            params.append(&mut KernelParams::from_string(&format!(
+                "{}={}",
+                PASSFD_LISTENER_PORT, passfd_listener_port
+            )));
+        }
+
         params.append(&mut console_params);
 
+        // Add the rootfs device
         params.append(&mut rootfs_params);
 
         // Now add some additional options required for CH
@@ -190,9 +165,7 @@ impl CloudHypervisorInner {
         let (shared_fs_devices, network_devices, host_devices, protection_device) =
             self.get_shared_devices().await?;
 
-        let sandbox_path = get_sandbox_path(&self.id);
-
-        create_dir_all_with_inherit_owner(sandbox_path.clone(), 0o750)
+        create_dir_all_with_inherit_owner(&self.vm_path.clone(), 0o750)
             .context("failed to create sandbox path")?;
 
         let vsock_socket_path = get_vsock_path(&self.id)?;
@@ -205,19 +178,25 @@ impl CloudHypervisorInner {
 
         let kernel_params = self.get_kernel_params().await?;
 
+        let mut config_clone = self.config.clone();
+        if self.config.vm_template.boot_to_be_template {
+            config_clone.cpu_info.default_vcpus = 1.0;
+            config_clone.memory_info.default_memory = VM_TEMPLATE_SIZE;
+        }
+
         let named_cfg = NamedHypervisorConfig {
             kernel_params,
-            sandbox_path,
+            sandbox_path: self.vm_path.clone(),
             vsock_socket_path,
-            cfg: self.config.clone(),
+            cfg: config_clone,
             guest_protection_to_use: self.guest_protection_to_use.clone(),
             shared_fs_devices,
+            network_devices,
             host_devices,
             protection_device,
-            ..Default::default()
         };
 
-        let cfg = VmConfig::try_from(named_cfg)?;
+        let cfg: VmConfig = VmConfig::try_from(named_cfg)?;
 
         let serialised = serde_json::to_string(&cfg)?;
 
@@ -226,79 +205,42 @@ impl CloudHypervisorInner {
             "CH specific VmConfig configuration (JSON): {:?}", serialised
         );
 
-        let response = cloud_hypervisor_vm_create(&self.api_socket, cfg).await?;
+        self.vmm_instance.create_vm_instance(cfg).await.context("failed to create vm")?;
 
-        if let Some(detail) = response {
-            debug!(sl!(), "vm boot response: {:?}", detail);
-        }
-
-        if let Some(network_devices) = network_devices {
-            for net in network_devices {
-                let vm_fds = net.fds.clone().unwrap_or_default();
-                let response =
-                    cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, net, vm_fds.clone())
-                        .await
-                        .context("failed to add vm netdev with fds")?;
-
-                if let Some(detail) = response {
-                    debug!(sl!(), "vm netdev add response: {:?}", detail);
-                }
-
-                for fd in vm_fds {
-                    // Explicitly close the fd now that it has been sent to CLH.
-                    nix::unistd::close(fd).context("failed to close netdev fd")?;
-                }
-            }
-        }
-
-        let response = cloud_hypervisor_vm_start(&self.api_socket).await?;
-
-        if let Some(detail) = response {
-            debug!(sl!(), "vm start response: {:?}", detail);
-        }
-
+        self.vmm_instance.start_vm_instance().await.context("failed to start vm")?;
+ 
         Ok(())
     }
 
-    async fn cloud_hypervisor_setup_comms(&mut self) -> Result<()> {
-        let api_socket_path = get_api_socket_path(&self.id)?;
+    async fn boot_from_template(&mut self) -> Result<()> {
+        let (_shared_fs_devices, network_devices, host_devices, _protection_device) =
+            self.get_shared_devices().await?;
 
-        // The hypervisor has just been spawned, but may not yet have created
-        // the API socket, so repeatedly try to connect for up to
-        // timeout_secs.
-        let join_handle: JoinHandle<Result<UnixStream>> =
-            task::spawn_blocking(move || -> Result<UnixStream> {
-                let api_socket: UnixStream;
+        create_dir_all_with_inherit_owner(self.vm_path.clone(), 0o750)
+            .context("failed to create sandbox path")?;
 
-                loop {
-                    let result = UnixStream::connect(api_socket_path.clone());
+        info!(sl!(), "Boot from template");
 
-                    if let Ok(result) = result {
-                        api_socket = result;
-                        break;
-                    }
-
-                    std::thread::sleep(Duration::from_millis(CH_POLL_TIME_MS));
-                }
-
-                Ok(api_socket)
-            });
-
-        let timeout_msg = format!(
-            "API socket connect timed out after {} seconds",
-            self.timeout_secs
+        let restore_cfg = RestoreConfigInner::new(
+            Some(self.config.factory.template_path.clone()),
+            get_vsock_path(&self.id)?,
         );
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs as u64), join_handle)
-                .await
-                .context(timeout_msg)?;
+        let cfg = RestoreConfig::try_from(restore_cfg)?;
 
-        let result = result?;
+        self.vmm_instance.vm_restore(cfg).await.context("failed to restore vm")?;
 
-        let api_socket = result?;
+        if let Some(mut net_configs) = network_devices {
+            while let Some(net_config) = net_configs.pop() {
+                self.vmm_instance.vm_add_net(net_config).await.context("attach net")?;
+            }
+        }
 
-        *self.api_socket.lock().await = Some(api_socket);
+        if let Some(mut device_configs) = host_devices {
+            while let Some(device_config) = device_configs.pop() {
+                self.vmm_instance.vm_add_device(device_config).await.context("attach device")?;
+            }
+        }
 
         Ok(())
     }
@@ -306,7 +248,10 @@ impl CloudHypervisorInner {
     async fn cloud_hypervisor_check_running(&mut self) -> Result<()> {
         let timeout_secs = self.timeout_secs;
 
-        let timeout_msg = format!("API socket connect timed out after {timeout_secs} seconds");
+        let timeout_msg = format!(
+            "API socket connect timed out after {} seconds",
+            timeout_secs
+        );
 
         let join_handle = self.cloud_hypervisor_ping_until_ready(CH_POLL_TIME_MS);
 
@@ -315,246 +260,51 @@ impl CloudHypervisorInner {
             .context(timeout_msg)?
     }
 
-    async fn cloud_hypervisor_ensure_not_launched(&self) -> Result<()> {
-        if let Some(child) = &self.process {
-            return Err(anyhow!(
-                "{} already running with PID {}",
-                CH_NAME,
-                child.id().unwrap_or(0)
-            ));
-        }
-
-        Ok(())
-    }
-
-    async fn cloud_hypervisor_launch(&mut self, _timeout_secs: i32) -> Result<()> {
-        self.cloud_hypervisor_ensure_not_launched().await?;
-
+    fn cloud_hypervisor_launch(&mut self) -> Result<()> {
         let cfg = &self.config;
-
-        let debug = cfg.debug_info.enable_debug;
 
         let disable_seccomp = cfg.security_info.disable_seccomp;
 
-        let api_socket_path = get_api_socket_path(&self.id)?;
-
-        let _ = std::fs::remove_file(api_socket_path.clone());
-
-        let binary_path = cfg.path.to_string();
-
-        let path = Path::new(&binary_path).canonicalize()?;
-
-        let mut cmd = Command::new(path);
-
-        cmd.current_dir("/");
-
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        cmd.env("RUST_BACKTRACE", "full");
-
-        cmd.args(["--api-socket", &api_socket_path]);
-
-        if let Some(extra_args) = &self.extra_args {
-            cmd.args(extra_args);
-        }
-
-        if debug {
-            // Note that with TDX enabled, this results in a lot of additional
-            // CH output, particularly if the user adds "earlyprintk" to the
-            // guest kernel command line (by modifying "kernel_params=").
-            cmd.arg("-v");
-        }
-
-        if disable_seccomp {
-            cmd.args(["--seccomp", "false"]);
-        }
-
         let netns = self.netns.clone();
-        if let Some(netns_ref) = &self.netns {
-            info!(sl!(), "set netns for vmm : {:?}", netns_ref);
+        if self.netns.is_some() {
+            info!(
+                sl!(),
+                "set netns for vmm : {:?}",
+                self.netns.as_ref().unwrap()
+            );
         }
 
-        let user: Option<RootlessUser> = if is_rootless() {
-            Some(
-                self.config
-                    .security_info
-                    .rootless_user
-                    .clone()
-                    .ok_or_else(|| {
-                        anyhow!("rootless user must be specified for rootless cloud-hypervisor")
-                    })?,
-            )
+        let secomp_value = match disable_seccomp {
+                true => Some("true"),
+                false => Some("false"),
+        };
+
+        let api_socket = if cfg.debug_info.enable_debug {
+            let api_socket_path = get_api_socket_path(&self.id)?;
+            Some(api_socket_path)
         } else {
             None
         };
 
-        unsafe {
-            let selinux_label = self.config.security_info.selinux_label.clone();
-            let _pre = cmd.pre_exec(move || {
-                if let Some(netns_path) = &netns {
-                    let netns_fd = std::fs::File::open(netns_path);
-                    let _ = setns(netns_fd?.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                        .context("set netns failed");
-                }
-                if let Some(label) = selinux_label.as_ref() {
-                    if let Err(e) = selinux::set_exec_label(label) {
-                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
-                        // Don't return error here to avoid breaking the process startup
-                        // Log the error and continue
-                    } else {
-                        info!(
-                            sl!(),
-                            "Successfully set SELinux label in child process: {}", &label
-                        );
-                    }
-                }
-                if let Some(user) = &user {
-                    let groups = user.groups.clone();
-                    let gid = Gid::from_raw(user.gid);
-                    let uid = Uid::from_raw(user.uid);
-
-                    let _ = set_groups(&groups);
-                    let _ = setgid(gid).context("setgid failed");
-                    let _ = setuid(uid).context("setuid failed");
-                }
-
-                Ok(())
-            });
-        }
-
-        debug!(sl!(), "launching {} as: {:?}", CH_NAME, cmd);
-
-        let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
-
-        // Save process PID
-        self.pid = child.id();
-
-        let shutdown = self
-            .shutdown_rx
-            .as_ref()
-            .ok_or("no receiver channel")
-            .map_err(|e| anyhow!(e))?
-            .clone();
-
-        let exit_notify: mpsc::Sender<i32> = self
-            .exit_notify
-            .take()
-            .ok_or_else(|| anyhow!("no exit notify"))?;
-
-        let ch_outputlogger_task =
-            tokio::spawn(cloud_hypervisor_log_output(child, shutdown, exit_notify));
-
-        let tasks = vec![ch_outputlogger_task];
-
-        self.tasks = Some(tasks);
-
-        Ok(())
-    }
-
-    async fn cloud_hypervisor_shutdown(&mut self) -> Result<()> {
-        let response = cloud_hypervisor_vmm_shutdown(&self.api_socket)
-            .await
-            .context("shutdown failed")?;
-
-        if let Some(detail) = response {
-            debug!(sl!(), "shutdown response: {:?}", detail);
-        }
-
-        // Trigger a controlled shutdown
-        self.shutdown_tx
-            .as_mut()
-            .ok_or("no shutdown channel")
-            .map_err(|e| anyhow!(e))?
-            .send(true)
-            .map_err(|e| anyhow!(e).context("failed to request shutdown"))?;
-
-        let tasks = self
-            .tasks
-            .take()
-            .ok_or("no tasks")
-            .map_err(|e| anyhow!(e))?;
-
-        let results = join_all(tasks).await;
-
-        let mut wait_errors: Vec<tokio::task::JoinError> = vec![];
-
-        for result in results {
-            if let Err(e) = result {
-                eprintln!("wait task error: {e:#?}");
-
-                wait_errors.push(e);
-            }
-        }
-
-        if wait_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!("wait all tasks failed: {:#?}", wait_errors))
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn cloud_hypervisor_wait(&mut self) -> Result<()> {
-        let mut child = self
-            .process
-            .take()
-            .ok_or(format!("{CH_NAME} not running"))
-            .map_err(|e| anyhow!(e))?;
-
-        let _pid = child
-            .id()
-            .ok_or(format!("{CH_NAME} missing PID"))
-            .map_err(|e| anyhow!(e))?;
-
-        // Note that this kills _and_ waits for the process!
-        child.kill().await?;
+        self.vmm_instance.run_vmm_server(&self.id, netns, secomp_value, &api_socket).context("start vmm server")?;
 
         Ok(())
     }
 
     // Check the specified ping API response to see if it contains CH's
     // build-time features list. If so, save them.
-    async fn handle_ch_build_features(&mut self, ping_response: &str) -> Result<()> {
-        let v: Value = serde_json::from_str(ping_response)?;
-
-        let got = &v[CH_FEATURES_KEY];
-
-        if got.is_null() {
-            return Ok(());
-        }
-
-        let features_list = got
-            .as_array()
-            .ok_or("expected CH to return array of features")
-            .map_err(|e| anyhow!(e))?;
-
-        let features: Vec<String> = features_list
-            .iter()
-            .map(Value::to_string)
-            .map(|s| s.trim_start_matches('"').trim_end_matches('"').to_string())
-            .collect();
-
-        self.ch_features = Some(features);
+    async fn handle_ch_build_features(&mut self, ping_response: VmmPingResponse) -> Result<()> {
+        self.ch_features = Some(ping_response.features);
 
         Ok(())
     }
 
     async fn cloud_hypervisor_ping_until_ready(&mut self, _poll_time_ms: u64) -> Result<()> {
         loop {
-            let response = cloud_hypervisor_vmm_ping(&self.api_socket)
-                .await
-                .context("ping failed");
+            let response = self.vmm_instance.vmm_ping().await.context("failed to ping vmm");
 
-            if let Ok(response) = response {
-                if let Some(detail) = response {
-                    // Check for a list of built-in features, returned by this
-                    // API call in newer versions of CH.
-                    debug!(sl!(), "ping response: {:?}", detail);
-
-                    self.handle_ch_build_features(&detail).await?;
-                }
+            if let core::result::Result::Ok(response) = response {
+                self.handle_ch_build_features(response).await?;
                 break;
             }
 
@@ -657,7 +407,23 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::VmmServerReady;
 
-        self.boot_vm().await?;
+        if self.config.vm_template.boot_from_template && !self.config.memory_info.enable_hugepages {
+            self.boot_from_template().await.map_err(|error| {
+                error!(sl!(), "boot vm error: {:?}", error);
+                if let Err(err) = futures::executor::block_on(self.stop_vm()) {
+                    error!(sl!(), "failed to call stop_vm: {:?}", err);
+                }
+                error
+            })?;
+        } else {
+            self.boot_vm().await.map_err(|error| {
+                error!(sl!(), "boot vm error: {:?}", error);
+                if let Err(err) = futures::executor::block_on(self.stop_vm()) {
+                    error!(sl!(), "failed to call stop_vm: {:?}", err);
+                }
+                error
+            })?;
+        }
 
         self.state = VmmState::VmRunning;
 
@@ -670,31 +436,64 @@ impl CloudHypervisorInner {
         // which results in this method being called potentially a second
         // time. Without this check, we'll return an error representing EPIPE
         // since the CH API socket is at that point invalid.
-        if self.state != VmmState::VmRunning {
-            return Ok(());
+        if self.state == VmmState::VmRunning {
+            self.state = VmmState::VmmServerReady;
+
+            self.vmm_instance.shutdown_vm_instance().await.context("stop")?;
         }
 
+        self.vmm_instance.stop()?;
+
         self.state = VmmState::NotReady;
+    
+        Ok(())
+    }
 
-        self.cloud_hypervisor_shutdown().await?;
+    pub(crate) async fn pause_vm(&mut self) -> Result<()> {
+        if self.state != VmmState::VmRunning {
+            return Err(anyhow!(
+                "cannot pause vm with VMM state {:?}",
+                self.state
+            ));
+        }
+
+        self.vmm_instance.vm_pause().await.context("pause vm")?;
+
+        self.state = VmmState::VmPaused;
 
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn wait_vm(&self) -> Result<i32> {
-        Ok(0)
-    }
+    pub(crate) async fn resume_vm(&mut self) -> Result<()> {
+        if self.state != VmmState::VmPaused {
+            return Err(anyhow!(
+                "cannot resume vm with VMM state {:?}",
+                self.state
+            ));
+        }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
+        self.vmm_instance.vm_resume().await.context("resume vm")?;
+
+        self.state = VmmState::VmRunning;
+
         Ok(())
     }
 
-    pub(crate) fn resume_vm(&self) -> Result<()> {
-        Ok(())
-    }
+    pub(crate) async fn save_vm(&mut self) -> Result<()> {
+        if self.state != VmmState::VmPaused {
+            return Err(anyhow!(
+                "cannot save vm with VMM state {:?}",
+                self.state
+            ));
+        }
 
-    pub(crate) async fn save_vm(&self) -> Result<()> {
+        let snapshot_config = SnapshotConfig{
+            destination_url: self.config.factory.template_path.clone(),
+            ..Default::default()
+        };
+
+        self.vmm_instance.vm_snapshot(snapshot_config).await.context("save vm")?;
+
         Ok(())
     }
 
@@ -713,81 +512,45 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
-        let thread_id = self.get_vmm_master_tid().await?;
-        let proc_path = format!("/proc/{thread_id}");
+        let mut vcpu_thread_ids: VcpuThreadIds = VcpuThreadIds {
+            vcpus: HashMap::new(),
+        };
 
-        let vcpus = get_ch_vcpu_tids(&proc_path)?;
-        let vcpu_thread_ids = VcpuThreadIds { vcpus };
-
+        for tid in self.vmm_instance.get_vcpu_tids() {
+            vcpu_thread_ids.vcpus.insert(tid.0 as u32, tid.1);
+        }
+        info!(sl!(), "get thread ids {:?}", vcpu_thread_ids);
         Ok(vcpu_thread_ids)
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "CloudHypervisor::cleanup()");
-        if is_rootless() {
-            remove_dir_all_if_exists(get_rootless_symlink_sandbox_path(self.id.as_str()).as_str())?;
-        }
-        vm_cleanup(&self.config, self.vm_path.as_str())
-    }
-
-    pub(crate) async fn resize_vcpu(
-        &self,
-        old_vcpus: u32,
-        mut new_vcpus: u32,
-    ) -> Result<(u32, u32)> {
-        info!(
-            sl!(),
-            "cloud hypervisor resize_vcpu(): {} -> {}", old_vcpus, new_vcpus
-        );
-
-        if new_vcpus == 0 {
-            return Err(anyhow!("resize to 0 vcpus requested"));
-        }
-
-        if new_vcpus > self.config.cpu_info.default_maxvcpus {
-            warn!(
-                sl!(),
-                "Cannot allocate more vcpus than the max allowed number of vcpus. The maximum allowed amount of vcpus will be used instead.");
-            new_vcpus = self.config.cpu_info.default_maxvcpus;
-        }
-
-        if new_vcpus == old_vcpus {
-            return Ok((old_vcpus, new_vcpus));
-        }
-
-        let vmresize = VmResize {
-            desired_vcpus: Some(new_vcpus as u8),
-            ..Default::default()
-        };
-
-        cloud_hypervisor_vm_resize(&self.api_socket, vmresize)
-            .await
-            .context("resize vcpus")?;
-
-        Ok((old_vcpus, new_vcpus))
+        self.cleanup_resource();
+        Ok(())
     }
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
-        let pid = self.get_vmm_master_tid().await?;
+        let mut pids = HashSet::new();
 
-        Ok(vec![pid])
+        pids.insert(self.vmm_instance.pid());
+
+        for tid in crate::ch::utils::get_child_threads(self.vmm_instance.pid()) {
+            pids.insert(tid);
+        }
+
+
+        info!(sl!(), "get pids {:?}", pids);
+        Ok(Vec::from_iter(pids.into_iter()))
     }
 
     pub(crate) async fn get_vmm_master_tid(&self) -> Result<u32> {
-        if let Some(pid) = self.pid {
-            Ok(pid)
-        } else {
-            Err(anyhow!("could not get vmm master tid"))
-        }
+        let master_tid = self.vmm_instance.get_vmm_master_tid();
+        Ok(master_tid)
     }
 
     pub(crate) async fn get_ns_path(&self) -> Result<String> {
-        if let Some(pid) = self.pid {
-            let ns_path = format!("/proc/{pid}/ns");
-            Ok(ns_path)
-        } else {
-            Err(anyhow!("could not get ns path"))
-        }
+        let ns_path = self.vmm_instance.get_ns_path();
+        Ok(ns_path)
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
@@ -810,11 +573,13 @@ impl CloudHypervisorInner {
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
                 | CapabilityBits::HybridVsockSupport
+                | CapabilityBits::GuestMemoryProbe
         } else {
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
                 | CapabilityBits::FsSharingSupport
                 | CapabilityBits::HybridVsockSupport
+                | CapabilityBits::GuestMemoryProbe
         };
 
         caps.set(flags);
@@ -833,183 +598,157 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) fn set_guest_memory_block_size(&mut self, size: u32) {
-        self.guest_memory_block_size_mb = bytes_to_megs(size as u64);
+        self.guest_memory_block_size_mb = size;
     }
 
     pub(crate) fn guest_memory_block_size_mb(&self) -> u32 {
         self.guest_memory_block_size_mb
     }
 
-    pub(crate) async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
-        let vminfo = cloud_hypervisor_vm_info(&self.api_socket)
-            .await
-            .context("get vminfo")?;
-
-        let current_mem_size = vminfo.config.memory.size;
-        let new_total_mem = megs_to_bytes(new_mem_mb);
-
-        info!(
-            sl!(),
-            "cloud-hypervisor::resize_memory(): asked to resize memory to {} MB, current memory is {} MB", new_mem_mb, bytes_to_megs(current_mem_size)
-        );
-
-        // Early Check to verify if boot memory is the same as requested
-        if current_mem_size == new_total_mem {
-            info!(sl!(), "VM alreay has requested memory");
-            return Ok((new_mem_mb, MemoryConfig::default()));
+    pub(crate) async fn resize_memory(&mut self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
+        if new_mem_mb > 5 * 1024 &&
+            (self.config.memory_info.default_memory + self.mem_hotplug_size_mb < 1024 || self.config.vm_template.boot_from_template) {
+            self.resize_memory_unit(5 * 1024).await?;
         }
 
-        if current_mem_size > new_total_mem {
-            info!(sl!(), "Remove memory is not supported, nothing to do");
-            return Ok((new_mem_mb, MemoryConfig::default()));
-        }
+        self.resize_memory_unit(new_mem_mb).await
+    }
 
-        let guest_mem_block_size = megs_to_bytes(self.guest_memory_block_size_mb);
+    pub(crate) async fn resize_memory_unit(&mut self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
+         // check the invalid request memory
+         if new_mem_mb > self.hypervisor_config().memory_info.default_maxmemory {
+            warn!(
+                sl!(),
+                "memory size unchanged, the request memory size {} is greater than the max memory size {}",
+                new_mem_mb, self.hypervisor_config().memory_info.default_maxmemory
+            );
 
-        let mut new_hotplugged_mem = new_total_mem - current_mem_size;
-
-        info!(
-            sl!(),
-            "new hotplugged mem before alignment: {} B ({} MB), guest_mem_block_size: {} MB",
-            new_hotplugged_mem,
-            bytes_to_megs(new_hotplugged_mem),
-            bytes_to_megs(guest_mem_block_size)
-        );
-
-        let is_unaligned = !new_hotplugged_mem.is_multiple_of(guest_mem_block_size);
-        if is_unaligned {
-            new_hotplugged_mem = ch_config::convert::checked_next_multiple_of(
-                new_hotplugged_mem,
-                guest_mem_block_size,
-            )
-            .ok_or(anyhow!(format!(
-                "alignment of {} B to the block size of {} B failed",
-                new_hotplugged_mem, guest_mem_block_size
-            )))?
-        }
-
-        let new_total_mem_aligned = new_hotplugged_mem + current_mem_size;
-
-        let max_total_mem = megs_to_bytes(self.config.memory_info.default_maxmemory);
-        if new_total_mem_aligned > max_total_mem {
-            return Err(anyhow!(
-                "requested memory ({} MB) is greater than maximum allowed ({} MB)",
-                bytes_to_megs(new_total_mem_aligned),
-                self.config.memory_info.default_maxmemory
+            return Ok((
+                0,
+                MemoryConfig {
+                    ..Default::default()
+                },
             ));
         }
 
-        info!(
-            sl!(),
-            "hotplugged mem from {} MB to {} MB)",
-            bytes_to_megs(current_mem_size),
-            bytes_to_megs(new_total_mem_aligned)
-        );
-
-        let vmresize = VmResize {
-            desired_ram: Some(new_total_mem_aligned),
-            ..Default::default()
+        let default_memory = if self.config.vm_template.boot_from_template {
+            self.config.vm_template.boot_from_template = false;
+            VM_TEMPLATE_SIZE
+        } else {
+            self.config.memory_info.default_memory
         };
+        let had_mem_mb = default_memory + self.mem_hotplug_size_mb;
+        match new_mem_mb.cmp(&had_mem_mb) {
+            Ordering::Equal => {
+                // Everything is already set up
+                info!(
+                    sl!(),
+                    "memory size unchanged, no need to do memory resizing"
+                );
+            }
+            _ => {
+                // update the hotplug size
+                self.mem_hotplug_size_mb = if new_mem_mb > default_memory {
+                    new_mem_mb - default_memory
+                } else {
+                    0
+                };
 
-        cloud_hypervisor_vm_resize(&self.api_socket, vmresize)
-            .await
-            .context("resize memory")?;
+                let vm_resize_data = VmResizeData{
+                    desired_ram: Some(new_mem_mb as u64 * 1024 * 1024),
+                    ..Default::default()
+                };
+                self.vmm_instance
+                    .vm_resize(vm_resize_data)
+                    .await
+                    .context(format!(
+                        "failed to do_resize_memory on new_memory={:?}",
+                        new_mem_mb
+                    ))?;
+            }
+        };
 
         Ok((new_mem_mb, MemoryConfig::default()))
     }
-}
 
-// Log all output from the CH process until a shutdown signal is received.
-// When that happens, stop logging and wait for the child process to finish
-// before returning.
-async fn cloud_hypervisor_log_output(
-    mut child: Child,
-    mut shutdown: Receiver<bool>,
-    exit_notify: mpsc::Sender<i32>,
-) -> Result<()> {
-    let stdout = child
-        .stdout
-        .as_mut()
-        .ok_or("failed to get child stdout")
-        .map_err(|e| anyhow!(e))?;
+    // check if resizing info is valid
+    // the error in this function is not ok to be tolerated, the container boot will fail
+    fn precheck_resize_vcpus(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)> {
+        // old_vcpus > 0, safe for conversion
+        let current_vcpus = old_vcpus;
 
-    let stdout_reader = BufReader::new(stdout);
-    let mut stdout_lines = stdout_reader.lines();
+        // a non-zero positive is required
+        if new_vcpus == 0 {
+            return Err(anyhow!("resize vcpu error: 0 vcpu resizing is invalid"));
+        }
 
-    let stderr = child
-        .stderr
-        .as_mut()
-        .ok_or("failed to get child stderr")
-        .map_err(|e| anyhow!(e))?;
+        // cannot exceed maximum value
+        let default_maxvcpus = self.config.cpu_info.default_maxvcpus;
+        if new_vcpus > default_maxvcpus {
+            warn!(
+                sl!(),
+                "Cannot allocate more vcpus than the max allowed number of vcpus. The maximum allowed amount of vcpus will be used instead.");
+            return Ok((current_vcpus, default_maxvcpus));
+        }
 
-    let stderr_reader = BufReader::new(stderr);
-    let mut stderr_lines = stderr_reader.lines();
-
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                info!(sl!(), "got shutdown request");
-                break;
-            },
-            stderr_line = poll_fn(|cx| Pin::new(&mut stderr_lines).poll_next_line(cx)) => {
-                if let Ok(line) = stderr_line {
-                    let line = line.ok_or("missing stderr line").map_err(|e| anyhow!(e))?;
-
-                    match parse_ch_log_level(&line) {
-                        CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        _ => info!(sl!(), "{:?}", line; "stream" => "stderr"),
-                    }
-                }
-            },
-            stdout_line = poll_fn(|cx| Pin::new(&mut stdout_lines).poll_next_line(cx)) => {
-                if let Ok(line) = stdout_line {
-                    let line = line.ok_or("missing stdout line").map_err(|e| anyhow!(e))?;
-
-                    match parse_ch_log_level(&line) {
-                        CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        _ => info!(sl!(), "{:?}", line; "stream" => "stdout"),
-                    }
-                }
-            },
-        };
+        Ok((current_vcpus, new_vcpus))
     }
 
-    // Note that this kills _and_ waits for the process!
-    let _ = child.kill().await;
-    if let Ok(status) = child.wait().await {
-        let _ = exit_notify.try_send(status.code().unwrap_or(0));
+    pub(crate) async fn resize_vcpu(&mut self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)> {
+        if old_vcpus == new_vcpus {
+            info!(
+                sl!(),
+                "resize_vcpu: no need to resize vcpus because old_vcpus is equal to new_vcpus"
+            );
+            return Ok((new_vcpus, new_vcpus));
+        }
+
+        let (old_vcpus, new_vcpus) = self.precheck_resize_vcpus(old_vcpus, new_vcpus)?;
+        info!(
+            sl!(),
+            "check_resize_vcpus passed, passing new_vcpus = {:?} to vmm", new_vcpus
+        );
+
+        let vm_resize_data = VmResizeData{
+            desired_vcpus: Some(new_vcpus.try_into().unwrap()),
+            ..Default::default()
+        };      
+        self.vmm_instance
+            .vm_resize(vm_resize_data)
+            .await
+            .context(format!(
+                "failed to do_resize_vcpus on new_vcpus={:?}",
+                new_vcpus
+            ))?;
+
+        self.config.cpu_info.current_vcpus = new_vcpus as f32;
+
+        Ok((old_vcpus, new_vcpus))
     }
 
-    Ok(())
-}
-
-// Search in the log line looking for the log level.
-//
-// For performance, the line is scanned exactly once and all log levels
-// are search for.
-fn parse_ch_log_level(line: &str) -> CloudHypervisorLogLevel {
-    for (i, c) in line.char_indices() {
-        if c == 'I' && line[i..].starts_with("INFO:") {
-            return CloudHypervisorLogLevel::Info;
-        } else if c == 'D' && line[i..].starts_with("DEBG:") {
-            return CloudHypervisorLogLevel::Debug;
-        } else if c == 'W' && line[i..].starts_with("WARN:") {
-            return CloudHypervisorLogLevel::Warn;
-        } else if c == 'E' && line[i..].starts_with("ERRO:") {
-            return CloudHypervisorLogLevel::Error;
-        } else if c == 'T' && line[i..].starts_with("TRCE:") {
-            return CloudHypervisorLogLevel::Trace;
+    /// Get the address of agent vsock server used to init connections for io
+    pub(crate) async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
+        if let Some(passfd_port) = self.passfd_listener_port {
+            let vsock_path = get_vsock_path(&self.id)?;
+            Ok((vsock_path, passfd_port))
+        } else {
+            Err(anyhow!("passfd io listener port not set"))
         }
     }
 
-    // Default - logging code cannot fail.
-    CloudHypervisorLogLevel::Info
+    pub(crate) fn cleanup_resource(&self) {
+        std::fs::remove_dir_all(&self.vm_path)
+            .map_err(|err| {
+                error!(sl!(), "failed to remove dir all for {}", &self.vm_path);
+                err
+            })
+            .ok();
+    }
+
+    /// Get overlayfs block device
+    pub(crate) async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
+        self.overlayfs_block_device.clone()
+    }
 }
 
 lazy_static! {
@@ -1055,59 +794,6 @@ fn get_guest_protection() -> Result<GuestProtection> {
     }?;
 
     Ok(guest_protection)
-}
-
-// Return a VCPU/TID map from a specified /proc/{pid} path.
-fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
-    const VCPU_STR: &str = "vcpu";
-
-    let src = std::fs::canonicalize(proc_path)
-        .map_err(|e| anyhow!("Invalid proc path: {proc_path}: {e}"))?;
-
-    let tid_path = src.join("task");
-
-    let mut vcpus = HashMap::new();
-
-    for entry in fs::read_dir(&tid_path)? {
-        let entry = entry?;
-
-        let tid_str = match entry.file_name().into_string() {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-
-        let tid = tid_str
-            .parse::<u32>()
-            .map_err(|e| anyhow!(e).context("invalid tid."))?;
-
-        let comm_path = tid_path.join(tid_str.clone()).join("comm");
-
-        if !comm_path.exists() {
-            return Err(anyhow!("comm path was not found."));
-        }
-
-        let p_name = fs::read_to_string(comm_path)?;
-
-        // The CH names it's threads with a vcpu${number} to identify them, where
-        // the thread name is located at /proc/${ch_pid}/task/${thread_id}/comm.
-        if !p_name.starts_with(VCPU_STR) {
-            continue;
-        }
-
-        let vcpu_id = p_name
-            .trim_start_matches(VCPU_STR)
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
-
-        vcpus.insert(vcpu_id, tid);
-    }
-
-    if vcpus.is_empty() {
-        return Err(anyhow!("The contents of proc path are not available."));
-    }
-
-    Ok(vcpus)
 }
 
 #[cfg(test)]
@@ -1399,232 +1085,5 @@ mod tests {
             }
         }
     }
-
-    #[actix_rt::test]
-    async fn test_parse_ch_log_level() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            line: &'a str,
-            level: CloudHypervisorLogLevel,
-        }
-
-        let tests = &[
-            // Test default level with various values
-            TestData {
-                line: "",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "info:",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            // Levels are case sensitive
-            TestData {
-                line: "foo trce: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo debg: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo info: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo warn: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo erro: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo INFO: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo DEBUG: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo DEBG: bar",
-                level: CloudHypervisorLogLevel::Debug,
-            },
-            TestData {
-                line: "foo WARN:bar",
-                level: CloudHypervisorLogLevel::Warn,
-            },
-            TestData {
-                line: "foo ERROR: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo ERRO: bar",
-                level: CloudHypervisorLogLevel::Error,
-            },
-            TestData {
-                line: "foo TRACE: bar",
-                level: CloudHypervisorLogLevel::Info,
-            },
-            TestData {
-                line: "foo TRCE: bar",
-                level: CloudHypervisorLogLevel::Trace,
-            },
-            // First match wins
-            TestData {
-                line: "TRCE:ERRO:WARN:DEBG:INFO:",
-                level: CloudHypervisorLogLevel::Trace,
-            },
-            TestData {
-                line: "ERRO:WARN:DEBG:INFO:TRCE",
-                level: CloudHypervisorLogLevel::Error,
-            },
-            TestData {
-                line: "WARN:DEBG:INFO:TRCE:ERRO:",
-                level: CloudHypervisorLogLevel::Warn,
-            },
-            TestData {
-                line: "DEBG:INFO:TRCE:ERRO:WARN:",
-                level: CloudHypervisorLogLevel::Debug,
-            },
-            TestData {
-                line: "INFO:TRCE:ERRO:WARN:DEBG:",
-                level: CloudHypervisorLogLevel::Info,
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{i}]: {d:?}");
-
-            let level = parse_ch_log_level(d.line);
-
-            let msg = format!("{msg}: actual level: {level:?}");
-
-            if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {msg}");
-            }
-
-            assert_eq!(d.level, level, "{msg}");
-        }
-    }
-
-    #[actix_rt::test]
-    async fn test_get_thread_ids() {
-        let path_dir = "/tmp/proc";
-        let file_name = "1";
-
-        let tmp_dir = Builder::new().prefix("proc").tempdir().unwrap();
-        let file_path = tmp_dir.path().join(file_name);
-        let _tmp_file = File::create(file_path.as_os_str()).unwrap();
-        let file_path_name = file_path.as_path().to_str().map(|s| s.to_string());
-        let file_path_name_str = file_path_name.as_ref().unwrap().to_string();
-
-        #[derive(Debug)]
-        struct TestData<'a> {
-            proc_path: &'a str,
-            result: Result<HashMap<u32, u32>>,
-        }
-
-        let tests = &[
-            TestData {
-                // Test on a non-existent directory.
-                proc_path: path_dir,
-                result: Err(anyhow!(
-                    "Invalid proc path: {path_dir}: No such file or directory (os error 2)"
-                )),
-            },
-            TestData {
-                // Test on an existing path, however it is not valid because it does not point to a pid.
-                proc_path: &file_path_name_str,
-                result: Err(anyhow!("Not a directory (os error 20)")),
-            },
-            TestData {
-                // Test on an existing proc/${pid} but that does not correspond to a CH pid.
-                proc_path: "/proc/1",
-                result: Err(anyhow!("The contents of proc path are not available.")),
-            },
-        ];
-
-        for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test: [{i}]: {d:?}");
-
-            if std::env::var("DEBUG").is_ok() {
-                println!("DEBUG: {msg}");
-            }
-
-            let result = get_ch_vcpu_tids(d.proc_path);
-            let msg = format!("{msg}, result: {result:?}");
-
-            let expected_error = format!("{}", d.result.as_ref().unwrap_err());
-            let actual_error = format!("{}", result.unwrap_err());
-
-            assert!(actual_error == expected_error, "{}", msg);
-        }
-    }
-
-    #[actix_rt::test]
-    async fn test_get_ch_vcpu_tids_mapping() {
-        let tmp_dir = Builder::new().prefix("fake-proc-pid").tempdir().unwrap();
-        let task_dir = tmp_dir.path().join("task");
-        fs::create_dir_all(&task_dir).unwrap();
-
-        #[derive(Debug)]
-        struct ThreadInfo<'a> {
-            tid: &'a str,
-            comm: &'a str,
-        }
-
-        let threads = &[
-            // Non-vcpu thread, should be skipped.
-            ThreadInfo {
-                tid: "1000",
-                comm: "main_thread\n",
-            },
-            ThreadInfo {
-                tid: "2001",
-                comm: "vcpu0\n",
-            },
-            ThreadInfo {
-                tid: "2002",
-                comm: "vcpu1\n",
-            },
-            ThreadInfo {
-                tid: "2003",
-                comm: "vcpu2\n",
-            },
-        ];
-
-        for t in threads {
-            let tid_dir = task_dir.join(t.tid);
-            fs::create_dir_all(&tid_dir).unwrap();
-            fs::write(tid_dir.join("comm"), t.comm).unwrap();
-        }
-
-        let proc_path = tmp_dir.path().to_str().unwrap();
-        let result = get_ch_vcpu_tids(proc_path);
-
-        let msg = format!("result: {result:?}");
-
-        if std::env::var("DEBUG").is_ok() {
-            println!("DEBUG: {msg}");
-        }
-
-        let vcpus = result.unwrap();
-
-        // The mapping must be vcpu_id -> tid.
-        assert_eq!(vcpus.len(), 3, "non-vcpu threads should be excluded");
-        assert_eq!(vcpus[&0], 2001, "vcpu 0 should map to tid 2001");
-        assert_eq!(vcpus[&1], 2002, "vcpu 1 should map to tid 2002");
-        assert_eq!(vcpus[&2], 2003, "vcpu 2 should map to tid 2003");
-
-        assert!(
-            !vcpus.contains_key(&1000),
-            "non-vcpu thread should not be in the map"
-        );
-    }
 }
+

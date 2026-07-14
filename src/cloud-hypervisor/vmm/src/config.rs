@@ -12,7 +12,7 @@ use std::result;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-use block::ImageType;
+pub use block::ImageType;
 use clap::ArgMatches;
 use log::{debug, warn};
 use net_util::MacAddr;
@@ -2848,6 +2848,10 @@ pub struct RestoreDiskConfig {
     pub id: String,
     #[serde(default)]
     pub path: PathBuf,
+    #[serde(default)]
+    pub rate_limit_group: Option<String>,
+    #[serde(default)]
+    pub rate_limiter_config: Option<RateLimiterConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -2890,6 +2894,10 @@ pub struct RestoreConfig {
     /// source_url/<SNAPSHOT_FILENAME>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_vol_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_socket: Option<PathBuf>,
+    #[serde(default)]
+    pub rate_limit_groups: Option<Vec<RateLimiterGroupConfig>>,
 }
 
 impl RestoreConfig {
@@ -2898,7 +2906,7 @@ impl RestoreConfig {
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false,\
         vsock_socket=<vsock_socket>,dirty_log=on|off,fs_backend_init=on|off,\
         fs_sources=<fs_sources>,restore_taps=<restore_taps>,disks=<disks>,pmem=<pmem>,\
-        memory_vol_url=<memory_vol_url>\" \
+        memory_vol_url=<memory_vol_url>,serial_socket=<serial_socket>,rate_limit_groups=<rate_limit_groups>\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
@@ -2909,9 +2917,11 @@ impl RestoreConfig {
         \n`fs_backend_init` used when virtiofs has been mounted in guest or as rootfs for guest \
         \n`fs_sources` is source dir of virtiofs with pattern [tag1@/path/to/dir,tag2@/path/to/dir] \
         \n`restore_taps` is tap devices with pattern [id1@[tap=tap1,ip=...,mask=...,mac=...],id2@[tap=tap2,ip=...,mask=...,mac=...],...] \
-        \n`disks` is disk devices with pattern [id1@/path/to/disk1,id2@/path/to/disk2] \
+        \n`disks` is disk devices with pattern [id1@[path=/path/to/disk1,rate_limit_group=group1,bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...] \
         \n`pmem` is pmem devices with pattern [id1@/path/to/pmem1,id2@/path/to/pmem2] \
-        \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume.";
+        \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume \
+        \n`serial_socket` is socket path of serial port \
+        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...]";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2928,7 +2938,9 @@ impl RestoreConfig {
             .add("restore_taps")
             .add("disks")
             .add("pmem")
-            .add("memory_vol_url");
+            .add("memory_vol_url")
+            .add("serial_socket")
+            .add("rate_limit_groups");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -2976,6 +2988,11 @@ impl RestoreConfig {
             .map(|v| {
                 v.0.iter()
                     .map(|(id, config_str)| -> Result<RestoreTapConfig> {
+                        let config_str = config_str
+                            .trim()
+                            .strip_prefix('[')
+                            .and_then(|s| s.strip_suffix(']'))
+                            .unwrap_or(config_str.as_str());
                         let mut tap_parser = OptionParser::new();
                         tap_parser.add("tap").add("ip").add("mask").add("mac");
                         tap_parser.parse(config_str).map_err(Error::ParseRestore)?;
@@ -2995,12 +3012,95 @@ impl RestoreConfig {
             .map_err(Error::ParseRestore)?
             .map(|v| {
                 v.0.iter()
-                    .map(|(id, path)| RestoreDiskConfig {
-                        id: id.clone(),
-                        path: PathBuf::from(path),
+                    .map(|(id, config_str)| -> Result<RestoreDiskConfig> {
+                        let config_str = config_str
+                            .trim()
+                            .strip_prefix('[')
+                            .and_then(|s| s.strip_suffix(']'))
+                            .unwrap_or(config_str.as_str());
+                        let mut disk_parser = OptionParser::new();
+                        disk_parser
+                            .add("path")
+                            .add("rate_limit_group")
+                            .add("bw_size")
+                            .add("bw_one_time_burst")
+                            .add("bw_refill_time")
+                            .add("ops_size")
+                            .add("ops_one_time_burst")
+                            .add("ops_refill_time");
+                        disk_parser.parse(config_str).map_err(Error::ParseRestore)?;
+
+                        let path = disk_parser
+                            .get("path")
+                            .map(PathBuf::from)
+                            .unwrap_or_default();
+                        let rate_limit_group = disk_parser.get("rate_limit_group");
+
+                        let bw_size = disk_parser
+                            .convert("bw_size")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let bw_one_time_burst = disk_parser
+                            .convert("bw_one_time_burst")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let bw_refill_time = disk_parser
+                            .convert("bw_refill_time")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let ops_size = disk_parser
+                            .convert("ops_size")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let ops_one_time_burst = disk_parser
+                            .convert("ops_one_time_burst")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let ops_refill_time = disk_parser
+                            .convert("ops_refill_time")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+
+                        let bw_tb_config =
+                            if bw_size != 0 && bw_refill_time != 0 {
+                                Some(TokenBucketConfig {
+                                    size: bw_size,
+                                    one_time_burst: Some(bw_one_time_burst),
+                                    refill_time: bw_refill_time,
+                                })
+                            } else {
+                                None
+                            };
+                        let ops_tb_config =
+                            if ops_size != 0 && ops_refill_time != 0 {
+                                Some(TokenBucketConfig {
+                                    size: ops_size,
+                                    one_time_burst: Some(ops_one_time_burst),
+                                    refill_time: ops_refill_time,
+                                })
+                            } else {
+                                None
+                            };
+                        let rate_limiter_config =
+                            if bw_tb_config.is_some() || ops_tb_config.is_some() {
+                                Some(RateLimiterConfig {
+                                    bandwidth: bw_tb_config,
+                                    ops: ops_tb_config,
+                                })
+                            } else {
+                                None
+                            };
+
+                        Ok(RestoreDiskConfig {
+                            id: id.clone(),
+                            path,
+                            rate_limit_group,
+                            rate_limiter_config,
+                        })
                     })
-                    .collect()
-            });
+                    .collect::<Result<_>>()
+            })
+            .transpose()?;
         let pmem = parser
             .convert::<Tuple<String, String>>("pmem")
             .map_err(Error::ParseRestore)?
@@ -3013,6 +3113,83 @@ impl RestoreConfig {
                     .collect()
             });
         let memory_vol_url = parser.get("memory_vol_url");
+        let serial_socket = parser.get("serial_socket").map(PathBuf::from);
+        let rate_limit_groups = parser
+            .convert::<Tuple<String, String>>("rate_limit_groups")
+            .map_err(Error::ParseRestore)?
+            .map(|v| {
+                v.0.iter()
+                    .map(|(id, config_str)| -> Result<RateLimiterGroupConfig> {
+                        let config_str = config_str
+                            .trim()
+                            .strip_prefix('[')
+                            .and_then(|s| s.strip_suffix(']'))
+                            .unwrap_or(config_str.as_str());
+                        let mut group_parser = OptionParser::new();
+                        group_parser
+                            .add("bw_size")
+                            .add("bw_one_time_burst")
+                            .add("bw_refill_time")
+                            .add("ops_size")
+                            .add("ops_one_time_burst")
+                            .add("ops_refill_time");
+                        group_parser.parse(config_str).map_err(Error::ParseRestore)?;
+
+                        let bw_size = group_parser
+                            .convert("bw_size")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let bw_one_time_burst = group_parser
+                            .convert("bw_one_time_burst")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let bw_refill_time = group_parser
+                            .convert("bw_refill_time")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let ops_size = group_parser
+                            .convert("ops_size")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let ops_one_time_burst = group_parser
+                            .convert("ops_one_time_burst")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+                        let ops_refill_time = group_parser
+                            .convert("ops_refill_time")
+                            .map_err(Error::ParseRestore)?
+                            .unwrap_or_default();
+
+                        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
+                            Some(TokenBucketConfig {
+                                size: bw_size,
+                                one_time_burst: Some(bw_one_time_burst),
+                                refill_time: bw_refill_time,
+                            })
+                        } else {
+                            None
+                        };
+                        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
+                            Some(TokenBucketConfig {
+                                size: ops_size,
+                                one_time_burst: Some(ops_one_time_burst),
+                                refill_time: ops_refill_time,
+                            })
+                        } else {
+                            None
+                        };
+
+                        Ok(RateLimiterGroupConfig {
+                            id: id.clone(),
+                            rate_limiter_config: RateLimiterConfig {
+                                bandwidth: bw_tb_config,
+                                ops: ops_tb_config,
+                            },
+                        })
+                    })
+                    .collect::<Result<_>>()
+            })
+            .transpose()?;
 
         Ok(RestoreConfig {
             source_url,
@@ -3028,6 +3205,8 @@ impl RestoreConfig {
             disks,
             pmem,
             memory_vol_url,
+            serial_socket,
+            rate_limit_groups,
         })
     }
 
@@ -5099,6 +5278,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 disks: None,
                 pmem: None,
                 memory_vol_url: None,
+                serial_socket: None,
+                rate_limit_groups: None,
             }
         );
         assert_eq!(
@@ -5130,6 +5311,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 disks: None,
                 pmem: None,
                 memory_vol_url: None,
+                serial_socket: None,
+                rate_limit_groups: None,
             }
         );
         assert_eq!(
@@ -5148,6 +5331,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 disks: None,
                 pmem: None,
                 memory_vol_url: None,
+                serial_socket: None,
+                rate_limit_groups: None,
             }
         );
         assert_eq!(
@@ -5166,6 +5351,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 disks: None,
                 pmem: None,
                 memory_vol_url: None,
+                serial_socket: None,
+                rate_limit_groups: None,
             }
         );
         // Parsing should fail as source_url is a required field
@@ -5286,6 +5473,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             disks: None,
             pmem: None,
             memory_vol_url: None,
+            serial_socket: None,
+            rate_limit_groups: None,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -5359,6 +5548,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             disks: None,
             pmem: None,
             memory_vol_url: None,
+            serial_socket: None,
+            rate_limit_groups: None,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             pci_common: PciDeviceCommonConfig {
@@ -5384,6 +5575,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             disks: None,
             pmem: None,
             memory_vol_url: None,
+            serial_socket: None,
+            rate_limit_groups: None,
         };
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),

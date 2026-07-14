@@ -29,7 +29,7 @@ use kata_types::{build_path, config::hypervisor::SharedFsInfo};
 use oci_spec::runtime as oci;
 use tokio::sync::RwLock;
 
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 
 const VIRTIO_FS: &str = "virtio-fs";
 const _VIRTIO_FS_NYDUS: &str = "virtio-fs-nydus";

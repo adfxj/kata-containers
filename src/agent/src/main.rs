@@ -32,11 +32,13 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::os::unix::fs::{self as unixfs, FileTypeExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
 use tracing::{instrument, span};
+use std::str::FromStr;
+use rlimit::{setrlimit, Resource};
 
 mod confidential_data_hub;
 mod config;
@@ -169,10 +171,10 @@ async fn create_logger_task(rfd: RawFd, vsock_port: u32, shutdown: Receiver<bool
         )?;
 
         let addr = VsockAddr::new(libc::VMADDR_CID_ANY, vsock_port);
-        socket::bind(listenfd, &addr)?;
-        socket::listen(listenfd, 1)?;
+        socket::bind(listenfd.as_raw_fd(), &addr)?;
+        socket::listen(&listenfd, nix::sys::socket::Backlog::new(1).unwrap())?;
 
-        Box::new(util::get_vsock_stream(listenfd).await?)
+        Box::new(util::get_vsock_stream(listenfd.into_raw_fd()).await?)
     } else {
         Box::new(tokio::io::stdout())
     };
@@ -183,12 +185,18 @@ async fn create_logger_task(rfd: RawFd, vsock_port: u32, shutdown: Receiver<bool
 }
 
 async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    env::set_var("RUST_BACKTRACE", "full");
+    unsafe { env::set_var("RUST_BACKTRACE", "full") };
 
     // List of tasks that need to be stopped for a clean shutdown
     let mut tasks: Vec<JoinHandle<Result<()>>> = vec![];
 
     console::initialize();
+
+    setrlimit(
+        Resource::from_str("RLIMIT_NOFILE")?,
+        100000,
+        100000,
+    )?;
 
     // support vsock log
     let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC)?;
@@ -199,8 +207,8 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
         // dup a new file descriptor for this temporary logger writer,
         // since this logger would be dropped and it's writer would
         // be closed out of this code block.
-        let newwfd = dup(wfd)?;
-        let writer = unsafe { File::from_raw_fd(newwfd) };
+        let newwfd = dup(&wfd)?;
+        let writer = unsafe { File::from_raw_fd(newwfd.into_raw_fd()) };
 
         // Init a temporary logger used by init agent as init process
         // since before do the base mount, it wouldn't access "/proc/cmdline"
@@ -226,11 +234,15 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
     let config = &AGENT_CONFIG;
     let log_vport = config.log_vport as u32;
 
-    let log_handle = tokio::spawn(create_logger_task(rfd, log_vport, shutdown_rx.clone()));
+    let log_handle = tokio::spawn(create_logger_task(
+        rfd.into_raw_fd(),
+        log_vport,
+        shutdown_rx.clone(),
+    ));
 
     tasks.push(log_handle);
 
-    let writer = unsafe { File::from_raw_fd(wfd) };
+    let writer = unsafe { File::from_raw_fd(wfd.into_raw_fd()) };
 
     // Recreate a logger with the log level get from "/proc/cmdline".
     let (logger, logger_async_guard) =
@@ -665,7 +677,7 @@ fn init_agent_as_init(logger: &Logger, unified_cgroup_hierarchy: bool) -> Result
         libc::ioctl(std::io::stdin().as_raw_fd(), libc::TIOCSCTTY, 1);
     }
 
-    env::set_var("PATH", "/bin:/sbin/:/usr/bin/:/usr/sbin/");
+    unsafe { env::set_var("PATH", "/bin:/sbin/:/usr/bin/:/usr/sbin/") };
 
     let contents =
         std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| String::from("localhost"));

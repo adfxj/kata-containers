@@ -14,10 +14,12 @@ libc = { workspace = true }
 nix = { workspace = true }
 protobuf = { workspace = true }
 sendfd = { version = "0.4.3", features = ["tokio"] }
+scopeguard = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 slog = { workspace = true }
 slog-scope = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }

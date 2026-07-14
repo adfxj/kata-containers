@@ -17,7 +17,9 @@ use std::convert::TryInto as _;
 use std::ffi::{CString, OsStr};
 use std::fmt::Debug;
 use std::io;
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 #[cfg(target_arch = "s390x")]
 use std::str::FromStr;
@@ -31,15 +33,15 @@ use ttrpc::{
 use anyhow::{anyhow, Context, Result};
 use cgroups::freezer::FreezerState;
 use oci::{Hooks, LinuxNamespace, Spec};
-use oci_spec::runtime as oci;
+use oci_spec::runtime::{self as oci, LinuxBlockIo};
 #[cfg(feature = "agent-policy")]
 use protobuf::MessageDyn;
 use protobuf::MessageField;
 use protocols::agent::{
     AddSwapPathRequest, AddSwapRequest, AgentDetails, CopyFileRequest, GetIPTablesRequest,
     GetIPTablesResponse, GuestDetailsResponse, Interfaces, Metrics, OOMEvent, ReadStreamResponse,
-    Routes, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse, VolumeStatsRequest,
-    WaitProcessResponse, WriteStreamResponse,
+    Routes, Storage, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse,
+    VolumeStatsRequest, WaitProcessResponse, WriteStreamResponse,
 };
 use protocols::csi::{
     volume_usage::Unit as VolumeUsage_Unit, VolumeCondition, VolumeStatsResponse, VolumeUsage,
@@ -71,10 +73,10 @@ use crate::device::block_device_handler::get_virtio_blk_pci_device_name;
 use crate::device::network_device_handler::wait_for_ccw_net_interface;
 #[cfg(not(target_arch = "s390x"))]
 use crate::device::network_device_handler::wait_for_pci_net_interface;
-use crate::device::{add_devices, dump_nvidia_cdi_yaml, handle_cdi_devices, update_env_pci};
+use crate::device::{add_devices, dump_nvidia_cdi_yaml, handle_cdi_devices, update_env_pci, wait_for_disk_device};
 use crate::features::get_build_features;
 use crate::metrics::get_metrics;
-use crate::mount::baremount;
+use crate::mount::{baremount, zosmount, create_zos_subdir, sfsmount, create_sfs_subdir, cgroupmount, rewrite_dns_config, rewrite_hosts_config, HostConfig};
 use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS};
 use crate::network::setup_guest_dns;
 use crate::passfd_io;
@@ -111,6 +113,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use kata_types::k8s;
+use base64::{Engine as _, engine::general_purpose};
 
 pub const CONTAINER_BASE: &str = "/run/kata-containers";
 const MODPROBE_PATH: &str = "/sbin/modprobe";
@@ -137,6 +140,13 @@ const ERR_NO_SANDBOX_PIDNS: &str = "Sandbox does not have sandbox_pidns";
 // filesystem lock. Based on this, 5 seconds seems a resonable timeout period in case the lock is
 // not available.
 const IPTABLES_RESTORE_WAIT_SEC: u64 = 5;
+
+// used to config io throttle for read/write split
+const KATA_OVERLAY_DEV_TYPE: &str = "overlayfs";
+const IO_OVERLAY_DEVICE_THROTTLE_WBPS: &str = "io.katacontainers.overlayfs.throttle.wbps";
+const IO_OVERLAY_DEVICE_THROTTLE_RBPS: &str = "io.katacontainers.overlayfs.throttle.rbps";
+const IO_OVERLAY_DEVICE_THROTTLE_WIOPS: &str = "io.katacontainers.overlayfs.throttle.wiops";
+const IO_OVERLAY_DEVICE_THROTTLE_RIOPS: &str = "io.katacontainers.overlayfs.throttle.riops";
 
 // Convenience function to obtain the scope logger.
 fn sl() -> slog::Logger {
@@ -236,6 +246,8 @@ impl AgentService {
             "receive createcontainer, storages: {:?}", &req.storages
         );
 
+        update_container_blockio(&mut oci, &req.storages, &self.sandbox).await?;
+
         // Some devices need some extra processing (the ones invoked with
         // --device for instance), and that's what this call is doing. It
         // updates the devices listed in the OCI spec, so that they actually
@@ -289,6 +301,298 @@ impl AgentService {
         // write spec to bundle path, hooks might
         // read ocispec
         let olddir = setup_bundle(&cid, &mut oci)?;
+
+        if let Some(proc) = oci.process() {
+            let envs = proc.env().clone().unwrap();
+            let zos_param = envs.iter().find(|e| e.starts_with("FC_INFRA_FAAS_ZOS_PARAM"));
+            #[allow(unused_assignments)]
+            let mut conv = String::new();
+
+            match zos_param {
+                Some(params) => {
+                    if let Some((_k, mut v_base64)) = params.split_once("=") {
+                        let mut cmd = Command::new("convert");
+                        cmd.arg("unwarp")
+                        .arg(v_base64);
+                        match cmd.output() {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    conv = String::from_utf8(output.stdout).unwrap_or("from_utf8 convert err".to_string());
+                                    v_base64 = &conv;
+                                    //info!(sl(), "[container id: {:?}] ==>, convert FC_INFRA_FAAS_ZOS_PARAM: {:?}", cid, v_base64);
+                                } else {
+                                    return Err(anyhow!("Failed to convert FC_INFRA_FAAS_ZOS_PARAM"));
+                                }
+                            },
+                            #[allow(unused_variables)]
+                            Err(e) => {
+                                return Err(anyhow!("Failed to convert FC_INFRA_FAAS_ZOS_PARAM"));
+                            },
+                        }
+                        match  general_purpose::STANDARD.decode(v_base64) {
+                            Ok(decoded_data) => {
+                                if let Ok(decoded_string) = String::from_utf8(decoded_data) {
+                                    //info!(sl(), "[container id: {:?}] ==>, read ZOS_PARAM: {:?}", cid, decoded_string);
+                                    let param_list: Vec<&str> = decoded_string.split(" ").collect();
+                                    for l in &param_list {
+                                        let param_kv: Vec<&str> = l.split(",").collect();
+                                        let mut zos_param_map = std::collections::HashMap::new();
+                                        for pa in &param_kv {
+                                            if let Some((key, value)) = pa.split_once("=") {
+                                                zos_param_map.insert(key.to_string(), value.to_string());
+                                            } else {
+                                                info!(sl(), "[container id: {:?}] ==>, ZOS_PARAM formt error, cannot parse", cid);
+                                                return Err(anyhow!("ZOS_PARAM formt error, cannot parse"));
+                                            }
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_AK") {
+                                            return Err(anyhow!("ZOS_AK not found in env"));
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_SK") {
+                                            return Err(anyhow!("ZOS_SK not found in env"));
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_BUCKET_NAME") {
+                                            return Err(anyhow!("ZOS_BUCKET_NAME not found in env"));
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_MOUNT_POINT") {
+                                            return Err(anyhow!("ZOS_MOUNT_POINT not found in env"));
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_URL") {
+                                            return Err(anyhow!("ZOS_URL not found in env"));
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_SUBDIR") {
+                                            return Err(anyhow!("ZOS_SUBDIR not found in env"));
+                                        }
+                                        if !zos_param_map.contains_key("ZOS_RONLY") {
+                                            return Err(anyhow!("ZOS_RONLY not found in env"));
+                                        }
+                                
+                                        let ak = zos_param_map.get("ZOS_AK").unwrap();
+                                        let sk = zos_param_map.get("ZOS_SK").unwrap();
+                                        let zos_bucket_name = zos_param_map.get("ZOS_BUCKET_NAME").unwrap();
+                                        let zos_mount_point = zos_param_map.get("ZOS_MOUNT_POINT").unwrap();
+                                        let zos_url = zos_param_map.get("ZOS_URL").unwrap();
+                                        let zos_subdir = zos_param_map.get("ZOS_SUBDIR").unwrap();
+                                        let zos_ronly = zos_param_map.get("ZOS_RONLY").unwrap();
+                                        
+                                        info!(sl(), "[container id: {:?}] ==>, start to mount zos", cid);
+                                        if zos_subdir.starts_with("/") {
+                                            create_zos_subdir(&cid, &ak, &sk, &zos_bucket_name, &zos_mount_point, &zos_url, &zos_subdir)?;
+                                            let final_bucket_name = format!("{}:{}", zos_bucket_name, zos_subdir);
+                                            zosmount(&cid, &ak, &sk, &final_bucket_name, &zos_mount_point, &zos_url, &zos_ronly)?;
+                                        } else {
+                                            zosmount(&cid, &ak, &sk, &zos_bucket_name, &zos_mount_point, &zos_url, &zos_ronly)?;
+                                        }
+                                        /*
+                                        baremount(
+                                            Path::new(&format!("/run/agent-mount/{}/zos-mount", cid)),
+                                            Path::new(&format!("/run/kata-containers/{}/rootfs{}", cid, zos_mount_point)),
+                                            "bind",
+                                            MsFlags::MS_BIND | MsFlags::MS_REC,
+                                            "",
+                                            &sl(),
+                                        )?;
+                                        */
+                                        info!(sl(), "[container id: {:?}] ==>, zos mount finished", cid);
+                                    }
+                                } else {
+                                    return Err(anyhow!("Error during base64 decoding : from utf8 to string conversion error"));
+                                }
+                            },
+                            Err(e) => return Err(anyhow!("Error during base64 decoding: {:?}", e)),
+                        }
+                    } else {
+                        info!(sl(), "[container id: {:?}] ==>, ZOS_PARAM formt error, cannot parse", cid);
+                        return Err(anyhow!("ZOS_PARAM formt error, cannot parse"));
+                    }
+                },
+                None => {
+                    info!(sl(), "[container id: {:?}] ==>, ZOS_PARAM not found in env", cid);
+                },
+            }
+            #[allow(unused_variables)]
+            let sfs_param = envs.iter().find(|e| e.starts_with("FC_INFRA_FAAS_SFS_PARAM"));
+            #[allow(unused_assignments)]
+            let mut conv = String::new();
+            
+            match sfs_param {
+                Some(params) => {
+                    if let Some((_k, mut v_base64)) = params.split_once("=") {
+                        let mut cmd = Command::new("convert");
+                        cmd.arg("unwarp")
+                        .arg(v_base64);
+                        match cmd.output() {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    conv = String::from_utf8(output.stdout).unwrap_or("from_utf8 convert err".to_string());
+                                    v_base64 = &conv;
+                                    info!(sl(), "[container id: {:?}] ==>, convert FC_INFRA_FAAS_SFS_PARAM successfully: {:?}", cid, v_base64);
+                                } else {
+                                    return Err(anyhow!("Failed to convert FC_INFRA_FAAS_SFS_PARAM"));
+                                }
+                            },
+                            #[allow(unused_variables)]
+                            Err(e) => {
+                                return Err(anyhow!("Failed to convert FC_INFRA_FAAS_SFS_PARAM"));
+                            },
+                        }
+                        match  general_purpose::STANDARD.decode(v_base64) {    
+                            Ok(decoded_data) => {
+                                if let Ok(decoded_string) = String::from_utf8(decoded_data) {
+                                    info!(sl(), "[container id: {:?}] ==>, read SFS_PARAM: {:?}", cid, decoded_string);
+                                    let param_list: Vec<&str> = decoded_string.split(" ").collect();
+                                    for l in &param_list {
+                                        let param_kv: Vec<&str> = l.split(",").collect();
+                                        let mut sfs_param_map = std::collections::HashMap::new();
+                                        for pa in &param_kv {
+                                            if let Some((key, value)) = pa.split_once("=") {
+                                                sfs_param_map.insert(key.to_string(), value.to_string());
+                                            } else {
+                                                info!(sl(), "[container id: {:?}] ==>, SFS_PARAM formt error, cannot parse", cid);
+                                                return Err(anyhow!("SFS_PARAM formt error, cannot parse"));
+                                            }
+                                        }
+
+                                        if !sfs_param_map.contains_key("SFS_MOUNT_POINT") {
+                                            return Err(anyhow!("SFS_MOUNT_POINT not found in env"));
+                                        }
+                                        if !sfs_param_map.contains_key("SFS_URL") {
+                                            return Err(anyhow!("SFS_URL not found in env"));
+                                        }
+                                        if !sfs_param_map.contains_key("SFS_SUBDIR") {
+                                            return Err(anyhow!("SFS_SUBDIR not found in env"));
+                                        }
+                
+                                        let sfs_mount_point = sfs_param_map.get("SFS_MOUNT_POINT").unwrap();
+                                        let sfs_url = sfs_param_map.get("SFS_URL").unwrap();
+                                        let sfs_subdir = sfs_param_map.get("SFS_SUBDIR").unwrap();
+                                        
+                                        let is_custom_sfs = {
+                                            if let Some(custom_sfs) = sfs_param_map.get("CUSTOM_SFS") {
+                                                if custom_sfs.to_lowercase() == "true" {
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        };
+                    
+                                        info!(sl(), "[container id: {:?}] ==>, start to mount sfs", cid);
+                                        if sfs_subdir.starts_with("/") {
+                                            create_sfs_subdir(&cid, &sfs_mount_point, &sfs_url, &sfs_subdir, is_custom_sfs)?;
+                                            let final_url = format!("{}{}", sfs_url, sfs_subdir);
+                                            sfsmount(&cid, &sfs_mount_point, &final_url, is_custom_sfs)?;
+                                        } else {
+                                            sfsmount(&cid, &sfs_mount_point, &sfs_url, is_custom_sfs)?;
+                                        }
+                                        /*
+                                        baremount(
+                                            Path::new(&format!("/run/agent-mount/{}/sfs-mount", cid)),
+                                            Path::new(&format!("/run/kata-containers/{}/rootfs{}", cid, sfs_mount_point)),
+                                            "bind",
+                                            MsFlags::MS_BIND | MsFlags::MS_REC,
+                                            "",
+                                            &sl(),
+                                        )?;
+                                        */
+                                        info!(sl(), "[container id: {:?}] ==>, sfs mount finished", cid);
+                                    }
+                                } else {
+                                    return Err(anyhow!("Error during base64 decoding : from utf8 to string conversion error"));
+                                }
+                            },
+                            Err(e) => return Err(anyhow!("Error during base64 decoding: {:?}", e)),
+                        }
+                    } else {
+                        info!(sl(), "[container id: {:?}] ==>, SFS_PARAM formt error, cannot parse", cid);
+                        return Err(anyhow!("SFS_PARAM formt error, cannot parse"));
+                    }
+                },
+                None => {
+                    info!(sl(), "[container id: {:?}] ==>, SFS_PARAM not found in env", cid);
+                },
+            }
+
+            let dns_nameserver = envs.iter().find(|e| e.starts_with("FC_INFRA_FAAS_DNS_NAMESERVER"));
+            let dns_search = envs.iter().find(|e| e.starts_with("FC_INFRA_FAAS_DNS_SEARCH"));
+            let dns_options = envs.iter().find(|e| e.starts_with("FC_INFRA_FAAS_DNS_OPTIONS"));
+            let mut dns_config: Vec<String> = Vec::new();
+            if let Some(nameserver) = dns_nameserver {
+                if let Some((_k, v )) = nameserver.split_once("=") {
+                    let nameserver_list: Vec<&str> = v.split(" ").collect();
+                    for ns in &nameserver_list {
+                        dns_config.push("nameserver ".to_owned() + ns);
+                    }
+                }
+            }
+            let nameserver_len = dns_config.len();
+            if let Some(search) = dns_search {
+                if let Some((_k, v )) = search.split_once("=") {
+                    dns_config.push("search ".to_owned() + v);
+                }
+            }
+            if let Some(options) = dns_options {
+                if let Some((_k, v )) = options.split_once("=") {
+                    dns_config.push("options ".to_owned() + v);
+                }
+            }
+
+            let oci_mounts = oci.mounts().clone().unwrap();
+            
+            for m in &oci_mounts {
+                if m.destination().display().to_string() == "/etc/resolv.conf" {
+                    let original_source = m.source().clone().unwrap().display().to_string();
+                    info!(sl(), "[container id: {:?}] ==> ready to rewrite dns config, dns_config: {:?}", cid, dns_config);
+                    rewrite_dns_config(&cid, &mut dns_config, &original_source, &nameserver_len)?;
+                    break;
+                }
+            }
+
+            let hosts_env = envs.iter().find(|e| e.starts_with("FC_INFRA_FAAS_HOSTS"));
+            let mut hosts_config_opt: Option<HostConfig> = None;
+            if let Some(hosts) = hosts_env {
+                if let Some((_k, v)) = hosts.split_once("=") {
+                    match serde_json::from_str::<HostConfig>(v) {
+                        Ok(cfg) => {
+                            hosts_config_opt = Some(cfg);
+                        }
+                        Err(e) => {
+                            error!(sl(), "[container id: {:?}] ==> failed to parse FC_INFRA_FAAS_HOSTS, ignore, error: {:?}", cid, e);
+                            hosts_config_opt = None;
+                        }
+                    }
+                }
+            }
+
+            if let Some(hosts_config) = hosts_config_opt {
+                let oci_mounts = oci.mounts().clone().unwrap();
+
+                for m in &oci_mounts {
+                    if m.destination().display().to_string() == "/etc/hosts" {
+                        let original_source = m.source().clone().unwrap().display().to_string();
+                        info!(sl(), "[container id: {:?}] ==> ready to rewrite hosts config, hosts_config: {:?}", cid, hosts_config);
+                        rewrite_hosts_config(&cid, &hosts_config, &original_source)?;
+                        break;
+                    }
+                }
+            }
+            
+        } else {
+            info!(sl(), "[container id: {:?}] ==>, failed to get oci.process", cid);
+            return Err(anyhow!("failed to get oci.process"));
+        }
+
+        let annotations = oci.annotations().as_ref().unwrap();
+        if let Some(container_name) = annotations.get("io.kubernetes.cri.container-name") {
+            if container_name == "queue-proxy" {
+                info!(sl(), "[container id: {:?}] ==>, start to mount cgroup for queue-proxy", cid);
+                cgroupmount(&cid)?;
+                info!(sl(), "[container id: {:?}] ==>, cgroup mount finished", cid);
+            }
+        }
+
         // restore the cwd for kata-agent process.
         defer!(unistd::chdir(&olddir).unwrap());
 
@@ -1994,7 +2298,7 @@ fn update_container_namespaces(
         // Else set this to empty string so that a new pid namespace is
         // created for the container.
         if sandbox_pidns {
-            if let Some(ref pidns) = &sandbox.sandbox_pidns {
+            if let Some(pidns) = &sandbox.sandbox_pidns {
                 if !pidns.path.is_empty() {
                     pid_ns.set_path(Some(PathBuf::from(&pidns.path)));
                 }
@@ -2004,6 +2308,91 @@ fn update_container_namespaces(
         }
 
         namespaces.push(pid_ns);
+    }
+
+    Ok(())
+}
+
+// only for read/write split
+async fn update_container_blockio(
+    spec: &mut Spec,
+    storages: &Vec<Storage>,
+    sandbox: &Arc<Mutex<Sandbox>>,
+) -> Result<()> {
+    for storage in storages {
+        if storage.driver != KATA_OVERLAY_DEV_TYPE.to_string() {
+            continue;
+        }
+
+        for driver_option in &storage.driver_options {
+            if let Some(src) = driver_option
+                .as_str()
+                .strip_prefix("io.katacontainers.rootfs.overlayfs.mount_blk_src=")
+            {
+                // Wait for the device to be available
+                wait_for_disk_device(sandbox, src).await?;
+
+                let dev_rdev = fs::metadata(src).unwrap().rdev();
+                let major = stat::major(dev_rdev) as i64;
+                let minor = stat::minor(dev_rdev) as i64;
+
+                let mut blk_io = if let Some(block_io) = spec.linux().clone().unwrap().resources().clone().unwrap().block_io() {
+                    block_io.clone()
+                } else {
+                    LinuxBlockIo::default()
+                };
+
+                if let Some(io_wbps) = spec.annotations().clone().unwrap().get(IO_OVERLAY_DEVICE_THROTTLE_WBPS) {
+                    let mut list = blk_io.throttle_write_bps_device().clone().unwrap_or_default();
+                    list.push(oci::LinuxThrottleDevice::from(protocols::oci::LinuxThrottleDevice {
+                        Major: major,
+                        Minor: minor,
+                        Rate: io_wbps.parse::<u64>().expect("Invalid u64 value in io_wbps"),
+                        ..Default::default()
+                    }));
+                    blk_io.set_throttle_write_bps_device(Some(list));
+                }
+
+                if let Some(io_rbps) = spec.annotations().clone().unwrap().get(IO_OVERLAY_DEVICE_THROTTLE_RBPS) {
+                    let mut list = blk_io.throttle_read_bps_device().clone().unwrap_or_default();
+                    list.push(oci::LinuxThrottleDevice::from(protocols::oci::LinuxThrottleDevice {
+                        Major: major,
+                        Minor: minor,
+                        Rate: io_rbps.parse::<u64>().expect("Invalid u64 value in io_rbps"),
+                        ..Default::default()
+                    }));
+                    blk_io.set_throttle_read_bps_device(Some(list));
+                }
+
+                if let Some(io_wiops) = spec.annotations().clone().unwrap().get(IO_OVERLAY_DEVICE_THROTTLE_WIOPS) {
+                    let mut list = blk_io.throttle_write_iops_device().clone().unwrap_or_default();
+                    list.push(oci::LinuxThrottleDevice::from(protocols::oci::LinuxThrottleDevice {
+                        Major: major,
+                        Minor: minor,
+                        Rate: io_wiops.parse::<u64>().expect("Invalid u64 value in io_wiops"),
+                        ..Default::default()
+                    }));
+                    blk_io.set_throttle_write_iops_device(Some(list));
+                }
+
+                if let Some(io_riops) = spec.annotations().clone().unwrap().get(IO_OVERLAY_DEVICE_THROTTLE_RIOPS) {
+                    let mut list = blk_io.throttle_read_iops_device().clone().unwrap_or_default();
+                    list.push(oci::LinuxThrottleDevice::from(protocols::oci::LinuxThrottleDevice {
+                        Major: major,
+                        Minor: minor,
+                        Rate: io_riops.parse::<u64>().expect("Invalid u64 value in io_riops"),
+                        ..Default::default()
+                    }));
+                    blk_io.set_throttle_read_iops_device(Some(list));
+                }
+
+                if let Some(linux) = &mut spec.linux_mut() {
+                    if let Some(resources) = linux.resources_mut() {
+                        resources.set_block_io(Some(blk_io));
+                    }
+                };
+            }
+        }
     }
 
     Ok(())
@@ -2208,7 +2597,9 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
 
         // Create new symbolic link
         let symlink_target = PathBuf::from(OsStr::from_bytes(&req.data));
-        unistd::symlinkat(&symlink_target, None, &path)?;
+        // Use BorrowedFd to wrap AT_FDCWD for symlinkat
+        let cwd_fd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+        unistd::symlinkat(&symlink_target, cwd_fd, &path)?;
 
         // Set symlink ownership (permissions not supported for symlinks)
         let path_str = CString::new(path.as_os_str().as_bytes())?;

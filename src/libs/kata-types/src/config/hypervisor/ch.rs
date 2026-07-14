@@ -53,10 +53,6 @@ impl ConfigPlugin for CloudHypervisorConfig {
     /// Adjust the configuration information after loading from configuration file.
     fn adjust_config(&self, conf: &mut TomlConfig) -> Result<()> {
         if let Some(ch) = conf.hypervisor.get_mut(HYPERVISOR_NAME_CH) {
-            if ch.path.is_empty() {
-                ch.path = default::DEFAULT_CH_BINARY_PATH.to_string();
-            }
-            resolve_path!(ch.path, "CH binary path `{}` is invalid: {}")?;
             if ch.ctlpath.is_empty() {
                 ch.ctlpath = default::DEFAULT_CH_CONTROL_PATH.to_string();
             }
@@ -85,6 +81,14 @@ impl ConfigPlugin for CloudHypervisorConfig {
             }
             if ch.memory_info.memory_slots == 0 {
                 ch.memory_info.memory_slots = default::DEFAULT_CH_MEMORY_SLOTS;
+            }
+
+            if ch.factory.enable_template && ch.factory.template_path.is_empty() {
+                ch.factory.template_path = default::DEFAULT_TEMPLATE_RS_PATH_CH.to_string();
+            }
+
+            if ch.factory.enable_template {
+                ch.factory.factory_type = default::FACTORY_TEMPLATE.to_string();
             }
         }
 

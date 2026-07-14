@@ -12,4 +12,5 @@ pub struct CgroupState {
     pub overhead_path: Option<String>,
     pub sandbox_cgroup_only: bool,
     pub enable_vcpus_pinning: bool,
+    pub enable_pool_cgroup: bool,
 }

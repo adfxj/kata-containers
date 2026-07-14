@@ -4,50 +4,43 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::inner::CloudHypervisorInner;
-use crate::ch::utils::get_rootless_symlink_sandbox_jailer_root;
-use crate::device::pci_path::PciPath;
-use crate::device::DeviceType;
-use crate::utils::create_dir_all_with_inherit_owner;
-use crate::utils::open_named_tuntap;
-use crate::HybridVsockDevice;
-use crate::NetworkConfig;
-use crate::NetworkDevice;
-use crate::ProtectionDeviceConfig;
-use crate::ShareFsConfig;
-use crate::ShareFsDevice;
-use crate::VfioDevice;
-use crate::VmmState;
-use crate::{BlockConfig, BlockDevice};
-use anyhow::{anyhow, Context, Result};
-use ch_config::ch_api::cloud_hypervisor_vm_device_add;
-use ch_config::ch_api::{
-    cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
-    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
-    cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
-};
-use ch_config::convert::DEFAULT_NUM_PCI_SEGMENTS;
-use ch_config::DiskConfig;
-use ch_config::ImageType;
-use ch_config::{
-    net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, ProtectionDevConfig, VsockConfig,
-};
-use kata_sys_util::netns::NetnsGuard;
-use kata_types::config::hypervisor::RateLimiterConfig;
-use kata_types::rootless::is_rootless;
-
 use safe_path::scoped_join;
 use std::convert::TryFrom;
-use std::os::fd::AsRawFd;
-use std::os::fd::IntoRawFd;
-use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
+use crate::ch::convert::ProtectionDevConfig;
+use super::inner::CloudHypervisorInner;
+use crate::{
+    BlockConfig, BlockDevice, device::pci_path::PciPath, device::DeviceType,
+    HybridVsockDevice, NetworkConfig, NetworkDevice, NetworkConfigInfo,
+    ProtectionDeviceConfig, ShareFsConfig, ShareFsDevice, ShareFsMountConfig,
+    ShareFsMountOperation, ShareFsMountType, VfioDevice, VhostUserNetDevice,
+    VmmState,
+};
+use anyhow::{anyhow, Context, Result};
+use super::convert::DEFAULT_NUM_PCI_SEGMENTS;
+use crate::ch::utils::PciDeviceInfo;
+use kata_types::config::hypervisor::DEFAULT_RATE_LIMITER_REFILL_TIME;
+use vmm::api::VmRemoveDeviceData;
+use vmm::config::ImageType;
+use vmm::net_util::mac::MacAddr;
+use vmm::vm_config::{
+    DeviceConfig, DiskConfig, FsConfig, FsMountConfigInfo, LockGranularityChoice, 
+    NetConfig, PciDeviceCommonConfig, VhostMode, VsockConfig,
+};
+use vmm::virtio_devices::fs::BackendFsConfig;
+use vmm::virtio_devices::{RateLimiterConfig, TokenBucketConfig};
+
 const VIRTIO_FS: &str = "virtio-fs";
+const INLINE_VIRTIO_FS: &str = "inline-virtio-fs";
+
+pub const DEFAULT_FS_QUEUES: usize = 1;
+const DEFAULT_FS_QUEUE_SIZE: u16 = 1024;
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
         if self.state != VmmState::VmRunning {
+            info!(sl!(), "VMM not ready, queueing device {}", device);
             // If the VM is not running, add the device to the pending list to
             // be handled later.
             //
@@ -73,6 +66,7 @@ impl CloudHypervisorInner {
                 DeviceType::ShareFs(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::VhostUserNetwork(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Protection(_) => self.pending_devices.insert(0, device.clone()),
                 _ => {
                     debug!(
@@ -85,6 +79,8 @@ impl CloudHypervisorInner {
             return Ok(device);
         }
 
+        info!(sl!(), "cloudhypervisor add device {:?}", &device);
+
         self.handle_add_device(device).await
     }
 
@@ -95,6 +91,7 @@ impl CloudHypervisorInner {
             DeviceType::Block(block) => self.handle_block_device(block).await,
             DeviceType::Vfio(vfiodev) => self.handle_vfio_device(vfiodev).await,
             DeviceType::Network(netdev) => self.handle_network_device(netdev).await,
+            DeviceType::VhostUserNetwork(vhostuser_netdev) => self.handle_vhostuser_network_device(vhostuser_netdev).await,
             _ => Err(anyhow!("unhandled device: {:?}", device)),
         }
     }
@@ -119,34 +116,120 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         match device {
-            DeviceType::Vfio(vfiodev) => self.inner_remove_device(vfiodev.device_id.as_str()).await,
-            DeviceType::Block(blockdev) => {
-                self.inner_remove_device(blockdev.device_id.as_str()).await
-            }
+            DeviceType::Vfio(vfiodev) => self.remove_vfio_device(&vfiodev).await,
+            DeviceType::Block(block) => self.remove_block_device(&block).await,
             _ => Ok(()),
         }
     }
 
-    pub(crate) async fn update_device(&mut self, _device: DeviceType) -> Result<()> {
-        Ok(())
+    pub(crate) async fn update_device(&mut self, device: DeviceType) -> Result<()> {
+        info!(sl!(), "cloudhypervisor update device {:?}", &device);
+        match device {
+            DeviceType::ShareFs(sharefs_mount) => {
+                // It's safe to unwrap mount config as mount_config is always there.
+                self.add_share_fs_mount(&sharefs_mount.config.mount_config.unwrap())
+                    .await.context("update share-fs device with mount operation.")
+            }
+            _ => Err(anyhow!("unsupported device {:?} to update.", device)),
+        }
+    }
+
+    fn parse_inline_virtiofs_args(&mut self, options: &mut Vec<String>) -> Result<Option<BackendFsConfig>> {
+        let mut debug = false;
+        let mut opt_list = String::new();
+        let mut bfs_cfg = BackendFsConfig::default();
+
+        bfs_cfg.killpriv_v2 = true;
+
+        let config = &self.config;
+        info!(
+            sl!(),
+            "args: {:?}", config.shared_fs.virtio_fs_extra_args
+        );
+        let mut args = config.shared_fs.virtio_fs_extra_args.clone();
+        let _ = go_flag::parse_args_with_warnings::<String, _, _>(&args, None, |flags| {
+            flags.add_flag("d", &mut debug);
+            flags.add_flag("thread-pool-size", &mut bfs_cfg.thread_pool_size);
+            flags.add_flag("drop-sys-resource", &mut bfs_cfg.drop_sys_resource);
+            flags.add_flag("o", &mut opt_list);
+        })
+        .with_context(|| format!("parse args: {:?}", args))?;
+
+        // more options parsed for inline virtio-fs' custom config
+        args.append(options);
+
+        if debug {
+            warn!(
+                sl!(),
+                "Inline virtiofs \"-d\" option not implemented, ignore"
+            );
+        }
+
+        // Parse comma separated option list
+        if !opt_list.is_empty() {
+            let args: Vec<&str> = opt_list.split(',').collect();
+            for arg in args {
+                match arg {
+                    "cache=none" => bfs_cfg.cache = 2,
+                    "cache=auto" => bfs_cfg.cache = 0,
+                    "cache=always" => bfs_cfg.cache = 1,
+                    "no_open" => bfs_cfg.no_open = true,
+                    "open" => bfs_cfg.no_open = false,
+                    "writeback_cache" => bfs_cfg.writeback_cache = true,
+                    "no_writeback_cache" => bfs_cfg.writeback_cache = false,
+                    "writeback" => bfs_cfg.writeback_cache = true,
+                    "no_writeback" => bfs_cfg.writeback_cache = false,
+                    "xattr" => bfs_cfg.xattr = true,
+                    "no_xattr" => bfs_cfg.xattr = false,
+                    "cache_symlinks" => {} // inline virtiofs always cache symlinks
+                    "no_readdir" => bfs_cfg.no_readdir = true,
+                    "trace" => warn!(
+                        sl!(),
+                        "Inline virtiofs \"-o trace\" option not supported yet, ignored."
+                    ),
+                    _ => warn!(sl!(), "Inline virtiofs unsupported option: {}", arg),
+                }
+            }
+        }
+
+        debug!(sl!(), "Inline virtiofs config {:?}", bfs_cfg);
+        Ok(Some(bfs_cfg))
     }
 
     async fn handle_share_fs_device(&mut self, sharefs: ShareFsDevice) -> Result<DeviceType> {
-        let device: ShareFsDevice = sharefs.clone();
-        if device.config.fs_type != VIRTIO_FS {
-            return Err(anyhow!(
-                "cannot handle share fs type: {:?}",
-                device.config.fs_type
-            ));
+        let device = sharefs.clone();
+        let mut bfs_config = None;
+        let mut socket_path = PathBuf::new();
+
+        match &device.config.fs_type as &str {
+            VIRTIO_FS => {
+                socket_path = if device.config.sock_path.starts_with('/') {
+                    PathBuf::from(device.config.sock_path)
+                } else {
+                    scoped_join(&self.vm_path, device.config.sock_path)?
+                };
+            }
+            INLINE_VIRTIO_FS => {
+                let mut options: Vec<String> = device.config.options.clone();
+                bfs_config = self.parse_inline_virtiofs_args(&mut options)?;
+            }
+            _ => {
+                return Err(anyhow!(
+                    "hypervisor isn't configured with shared_fs supported"
+                ));
+            }
         }
 
-        let num_queues = device.config.queue_num as usize;
-        let queue_size = u16::try_from(device.config.queue_size)?;
-
-        let socket_path = if device.config.sock_path.starts_with('/') {
-            PathBuf::from(device.config.sock_path)
+        let num_queues: usize = if device.config.queue_num > 0 {
+            device.config.queue_num as usize
         } else {
-            scoped_join(&self.vm_path, device.config.sock_path)?
+            DEFAULT_FS_QUEUES
+        };
+
+        let queue_size: u16 = if device.config.queue_num > 0 {
+            u16::try_from(device.config.queue_size)?
+        } else {
+            DEFAULT_FS_QUEUE_SIZE
         };
 
         let fs_config = FsConfig {
@@ -154,12 +237,19 @@ impl CloudHypervisorInner {
             socket: socket_path,
             num_queues,
             queue_size,
-            pci_segment: DEFAULT_NUM_PCI_SEGMENTS,
+            pci_common: PciDeviceCommonConfig {
+                pci_segment: DEFAULT_NUM_PCI_SEGMENTS,
+                ..Default::default()
+            },
+            backendfs_config: bfs_config,
 
             ..Default::default()
         };
 
-        let response = cloud_hypervisor_vm_fs_add(&self.api_socket, fs_config).await?;
+        let response = self.vmm_instance.vm_add_fs(
+            fs_config,
+        )
+        .await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "fs add response: {:?}", detail);
@@ -186,11 +276,18 @@ impl CloudHypervisorInner {
 
         let device_config = DeviceConfig {
             path: PathBuf::from(sysfsdev),
-            iommu: false,
-            ..Default::default()
+            pci_common: PciDeviceCommonConfig {
+                iommu: false,
+                ..Default::default()
+            },
+            x_nv_gpudirect_clique: self.alloc_x_nv_gpudirect_clique(),
+            x_exclude_mmap_bars: Vec::new(),
         };
 
-        let response = cloud_hypervisor_vm_device_add(&self.api_socket, device_config).await?;
+        let response = self.vmm_instance.vm_add_device(
+            device_config,
+        )
+        .await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "VFIO add response: {:?}", detail);
@@ -211,8 +308,8 @@ impl CloudHypervisorInner {
         Ok(DeviceType::Vfio(vfio_device))
     }
 
-    async fn inner_remove_device(&mut self, device_id: &str) -> Result<()> {
-        let clh_device_id = self.device_ids.get(device_id);
+    async fn remove_vfio_device(&mut self, device: &VfioDevice) -> Result<()> {
+        let clh_device_id = self.device_ids.get(&device.device_id);
 
         if clh_device_id.is_none() {
             return Err(anyhow!(
@@ -225,10 +322,39 @@ impl CloudHypervisorInner {
             id: clh_device_id.clone(),
         };
 
-        let response = cloud_hypervisor_vm_device_remove(&self.api_socket, rm_data).await?;
+        let response = self.vmm_instance.vm_remove_device(
+            rm_data,
+        )
+        .await?;
 
         if let Some(detail) = response {
-            debug!(sl!(), "device remove response: {:?}", detail);
+            debug!(sl!(), "vfio remove response: {:?}", detail);
+        }
+
+        Ok(())
+    }
+
+    async fn remove_block_device(&mut self, device: &BlockDevice) -> Result<()> {
+        let clh_device_id = self.device_ids.get(&device.device_id);
+
+        if clh_device_id.is_none() {
+            return Err(anyhow!(
+                "Device id for cloud-hypervisor not found while removing block device"
+            ));
+        }
+
+        let clh_device_id = clh_device_id.unwrap();
+        let rm_data = VmRemoveDeviceData {
+            id: clh_device_id.clone(),
+        };
+
+        let response = self.vmm_instance.vm_remove_device(
+            rm_data,
+        )
+        .await?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "block remove response: {:?}", detail);
         }
 
         Ok(())
@@ -261,12 +387,17 @@ impl CloudHypervisorInner {
         let hvsock_config = device.config.clone();
 
         let vsock_config = VsockConfig {
+            pci_common: PciDeviceCommonConfig {
+                ..Default::default()
+            },
             cid: hvsock_config.guest_cid.into(),
             socket: hvsock_config.uds_path.into(),
-            ..Default::default()
         };
 
-        let response = cloud_hypervisor_vm_vsock_add(&self.api_socket, vsock_config).await?;
+        let response = self.vmm_instance.vm_add_vsock(
+            vsock_config,
+        )
+        .await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "hvsock add response: {:?}", detail);
@@ -284,19 +415,37 @@ impl CloudHypervisorInner {
             .is_direct
             .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
 
-        let block_rate_limit = RateLimiterConfig::new(
-            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
-            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
-            self.config
-                .blockdev_info
-                .disk_rate_limiter_bw_one_time_burst,
-            self.config
-                .blockdev_info
-                .disk_rate_limiter_ops_one_time_burst,
-        );
-        disk_config.rate_limiter_config = block_rate_limit;
+        if self.config.blockdev_info.disk_rate_limiter_bw_max_rate > 0
+        || self.config.blockdev_info.disk_rate_limiter_ops_max_rate > 0 {
+            let block_rate_limit = RateLimiterConfig {
+                bandwidth: if self.config.blockdev_info.disk_rate_limiter_bw_max_rate > 0 {
+                    Some(TokenBucketConfig {
+                        size: self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+                        one_time_burst: self.config.blockdev_info.disk_rate_limiter_bw_one_time_burst,
+                        refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+                    })
+                } else {
+                    None
+                },
+                ops: if self.config.blockdev_info.disk_rate_limiter_ops_max_rate > 0 {
+                    Some(TokenBucketConfig {
+                        size: self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+                        one_time_burst: self.config.blockdev_info.disk_rate_limiter_ops_one_time_burst,
+                        refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+                    })
+                } else {
+                    None
+                },
 
-        let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
+            };
+
+            disk_config.rate_limiter_config = Some(block_rate_limit);
+        }
+
+        let response = self.vmm_instance.vm_add_disk(
+            disk_config,
+        )
+        .await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "blockdev add response: {:?}", detail);
@@ -307,30 +456,52 @@ impl CloudHypervisorInner {
             block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
         }
 
+        if block_dev.config.is_overlayfs {
+            self.overlayfs_block_device = Some(DeviceType::Block(block_dev.clone()));
+        }
+
         Ok(DeviceType::Block(block_dev))
     }
 
     async fn handle_network_device(&mut self, device: NetworkDevice) -> Result<DeviceType> {
         let netdev = device.clone();
+        let mut netdev_config = netdev.config.clone();
+        netdev_config.queue_num = std::cmp::min(
+            (self.config.cpu_info.current_vcpus * 2.0) as usize, netdev_config.queue_num);
 
-        let mut clh_net_config = NetConfig::try_from(device.config)?;
-        // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
-        clh_net_config.tap = None;
-        clh_net_config.id = None;
+        let clh_net_config = NetConfig::try_from(NetConfigInner::new(self.config.network_info.clone(), netdev_config))?;
 
-        let files = open_named_tuntap(&netdev.config.host_dev_name, netdev.config.queue_num as u32)
-            .context("open named tuntap")?;
-
-        let fds = files.iter().map(|f| f.as_raw_fd()).collect();
-
-        let response =
-            cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, clh_net_config, fds).await?;
+        let response = self.vmm_instance.vm_add_net(
+            clh_net_config,
+        )
+        .await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "netdev add response: {:?}", detail);
         }
 
         Ok(DeviceType::Network(netdev))
+    }
+
+    /// Add vhost-user-net deivce to cloud-hypervisor
+    async fn handle_vhostuser_network_device(&mut self, device: VhostUserNetDevice) -> Result<DeviceType> {
+        let vhostuser_netdev = device.clone();
+        let mut vhostuser_device = device.clone();
+        vhostuser_device.config.num_queues = std::cmp::min(
+            (self.config.cpu_info.current_vcpus * 2.0) as usize, vhostuser_device.config.num_queues);
+        
+        let vhost_net_config = NetConfig::try_from(VhostUserNetDeviceInner::new(self.config.network_info.clone(), vhostuser_device))?;
+
+        let response = self.vmm_instance.vm_add_net(
+            vhost_net_config,
+        )
+        .await?;
+
+        if let Some(detail) = response {
+            debug!(sl!(), "vhost-user net add response: {:?}", detail);
+        }
+
+        Ok(DeviceType::VhostUserNetwork(vhostuser_netdev))
     }
 
     pub(crate) async fn get_shared_devices(
@@ -349,82 +520,43 @@ impl CloudHypervisorInner {
         while let Some(dev) = self.pending_devices.pop() {
             match dev {
                 DeviceType::ShareFs(dev) => {
-                    let settings = ShareFsSettings::new(dev.config, self.vm_path.clone());
+                    let device: ShareFsDevice = dev.clone();
+                    let mut bfs_config = None;
 
-                    let fs_cfg = if is_rootless() {
-                        // TODO: Replace this symlink workaround if a better approach for rootless socket paths appears.
-                        // In rootless mode the virtiofsd.sock lives under the rootless directory,
-                        // and its full path can exceed the 108-byte Unix domain socket limit.
-                        // To ensure the cloud-hypervisor VMM can connect to virtiofsd, create a
-                        // short symlink inside the rootless directory and point the VMM at it.
-                        let mut fs_cfg = FsConfig::try_from(settings)?;
-                        let rootless_symlink_sanbox_jailer_root =
-                            get_rootless_symlink_sandbox_jailer_root(self.id.as_str());
+                    match &device.config.fs_type as &str {
+                        VIRTIO_FS => {()}
+                        INLINE_VIRTIO_FS => {
+                            let mut options: Vec<String> = device.config.options.clone();
+                            bfs_config = self.parse_inline_virtiofs_args(&mut options)?;
+                        }
+                        _ => {
+                            return Err(anyhow!(
+                                "hypervisor isn't configured with shared_fs supported"
+                            ));
+                        }
+                    }
 
-                        create_dir_all_with_inherit_owner(
-                            rootless_symlink_sanbox_jailer_root.as_str(),
-                            0x750,
-                        )
-                        .map_err(|e| {
-                            anyhow!(
-                                "failed to create rootless sharefs symlink jailer root dir: {}",
-                                e
-                            )
-                        })?;
-                        let virtiofsd_name = fs_cfg.socket.file_name().ok_or_else(|| {
-                            anyhow!(
-                                "failed to get virtiofsd socket file name from path: {:?}",
-                                fs_cfg.socket
-                            )
-                        })?;
-                        let virtiofsd_symlink_path =
-                            PathBuf::from(rootless_symlink_sanbox_jailer_root.as_str())
-                                .join(virtiofsd_name);
+                    let settings = ShareFsSettings::new(
+                        dev.config,
+                        self.vm_path.clone(),
+                        bfs_config,
+                    );
 
-                        symlink(&fs_cfg.socket, &virtiofsd_symlink_path).map_err(|e| {
-                            anyhow!(
-                                "failed to create symlink for rootless sharefs socket: {}",
-                                e
-                            )
-                        })?;
-
-                        fs_cfg.socket = virtiofsd_symlink_path;
-
-                        fs_cfg
-                    } else {
-                        FsConfig::try_from(settings)?
-                    };
+                    let fs_cfg = FsConfig::try_from(settings)?;
 
                     shared_fs_devices.push(fs_cfg);
                 }
                 DeviceType::Network(net_device) => {
-                    let network_queues_pairs =
-                        self.hypervisor_config().network_info.network_queues as usize;
-
-                    let mut net_config = NetConfig::try_from(net_device.config.clone())?;
-                    // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
-                    net_config.tap = None;
-                    net_config.id = None;
-
-                    net_config.num_queues = network_queues_pairs * 2;
-                    info!(
-                        sl!(),
-                        "network device queue pairs {:?}", network_queues_pairs
-                    );
-
-                    // we need ensure opening network device happens in netns.
-                    let netns = self.netns.clone().unwrap_or_default();
-                    let _netns_guard = NetnsGuard::new(&netns).context("new netns guard")?;
-                    let fds = open_named_tuntap(
-                        &net_device.config.host_dev_name,
-                        network_queues_pairs as u32,
-                    )
-                    .context("open named tuntap")?
-                    .into_iter()
-                    .map(|f| f.into_raw_fd())
-                    .collect();
-                    net_config.fds = Some(fds);
+                    let mut net_config = NetConfig::try_from(NetConfigInner::new(self.config.network_info.clone(), net_device.config))?;
+                    net_config.num_queues = std::cmp::min(
+                        (self.config.cpu_info.current_vcpus * 2.0) as usize, net_config.num_queues);
                     network_devices.push(net_config);
+                }
+                DeviceType::VhostUserNetwork(vhostuser_netdev) => {
+                    let mut vhost_net_config = NetConfig::try_from(VhostUserNetDeviceInner::new(self.config.network_info.clone(), vhostuser_netdev))?;
+                    vhost_net_config.num_queues = std::cmp::min(
+                        (self.config.cpu_info.current_vcpus * 2.0) as usize, vhost_net_config.num_queues);
+                    network_devices.push(vhost_net_config);
                 }
                 DeviceType::Vfio(vfio_device) => {
                     // A device with multi-funtions, or a IOMMU group with one more
@@ -440,8 +572,12 @@ impl CloudHypervisorInner {
                     let sysfsdev = primary_device.sysfs_path.clone();
                     let device_config = DeviceConfig {
                         path: PathBuf::from(sysfsdev),
-                        iommu: false,
-                        ..Default::default()
+                        pci_common: PciDeviceCommonConfig {
+                            iommu: false,
+                            ..Default::default()
+                        },
+                        x_nv_gpudirect_clique: self.alloc_x_nv_gpudirect_clique(),
+                        x_exclude_mmap_bars: Vec::new(),
                     };
                     info!(
                         sl!(),
@@ -474,26 +610,135 @@ impl CloudHypervisorInner {
             Some(protection_device),
         ))
     }
+
+    async fn add_share_fs_mount(&mut self, config: &ShareFsMountConfig) -> Result<()> {
+        let ops = match config.op {
+            ShareFsMountOperation::Mount => "mount",
+            ShareFsMountOperation::Umount => "umount",
+            ShareFsMountOperation::Update => "update",
+        };
+
+        let fstype = match config.fstype {
+            ShareFsMountType::PASSTHROUGH => "passthroughfs",
+            ShareFsMountType::RAFS => "rafs",
+        };
+
+        let cfg = FsMountConfigInfo {
+            ops: ops.to_string(),
+            fstype: Some(fstype.to_string()),
+            old_source: None,
+            source: Some(config.source.clone()),
+            mountpoint: config.mount_point.clone(),
+            config: config.config.clone(),
+            tag: config.tag.clone(),
+            prefetch_list_path: config.prefetch_list_path.clone(),
+            dax_threshold_size_kb: None,
+        };
+
+        self.vmm_instance.vm_patch_fs(&cfg).await.map_err(|e| {
+            anyhow!(
+                "{:?} {} at {} error: {:?}",
+                config.op,
+                fstype,
+                config.mount_point.clone(),
+                e
+            )
+        })
+    }
 }
 
-impl TryFrom<NetworkConfig> for NetConfig {
+pub struct NetConfigInner {
+    pub network_info: NetworkConfigInfo,
+    pub cfg: NetworkConfig,
+}
+
+impl NetConfigInner {
+    pub fn new(network_info: NetworkConfigInfo, cfg: NetworkConfig) -> Self {
+        Self {
+            network_info,
+            cfg,
+        }
+    }
+}
+
+impl TryFrom<NetConfigInner> for NetConfig {
     type Error = anyhow::Error;
 
-    fn try_from(cfg: NetworkConfig) -> Result<Self, Self::Error> {
-        if let Some(mac) = cfg.guest_mac {
-            let net_config = NetConfig {
-                tap: Some(cfg.host_dev_name.clone()),
-                id: Some(cfg.virt_iface_name.clone()),
-                num_queues: cfg.queue_num,
-                queue_size: cfg.queue_size as u16,
+    fn try_from(net_config_inner: NetConfigInner) -> Result<Self, Self::Error> {
+        if let Some(mac) = net_config_inner.cfg.guest_mac {
+            let net_config: NetConfig = NetConfig {
+                pci_common: PciDeviceCommonConfig {
+                    id: Some(net_config_inner.cfg.virt_iface_name.clone()),
+                    ..Default::default()
+                },
+                tap: Some(net_config_inner.cfg.host_dev_name.clone()),
+                num_queues: net_config_inner.cfg.queue_num,
+                queue_size: net_config_inner.cfg.queue_size as u16,
                 mac: MacAddr { bytes: mac.0 },
-                ..Default::default()
+                offload_csum: !net_config_inner.network_info.disable_offload_csum,
+                offload_tso: !net_config_inner.network_info.disable_offload_tso,
+                offload_ufo: !net_config_inner.network_info.disable_offload_ufo,
+                ip: None,
+                mask: None,
+                host_mac: None,
+                mtu: None,
+                vhost_user: false,
+                vhost_socket: None,
+                vhost_mode: VhostMode::Client,
+                fds: None,
+                rate_limiter_config: None,
             };
 
             return Ok(net_config);
         }
 
         Err(anyhow!("Missing mac address for network device"))
+    }
+}
+
+pub struct VhostUserNetDeviceInner {
+    pub network_info: NetworkConfigInfo,
+    pub device: VhostUserNetDevice,
+}
+
+impl VhostUserNetDeviceInner {
+    pub fn new(network_info: NetworkConfigInfo, device: VhostUserNetDevice) -> Self {
+        Self {
+            network_info,
+            device,
+        }
+    }
+}
+
+impl TryFrom<VhostUserNetDeviceInner> for NetConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(vhost_user_net_device_inner: VhostUserNetDeviceInner) -> Result<Self, Self::Error> {
+        let guest_mac = MacAddr::parse_str(&vhost_user_net_device_inner.device.config.mac_address).ok().unwrap();
+        let net_config = NetConfig {
+            pci_common: PciDeviceCommonConfig {
+                id: Some(vhost_user_net_device_inner.device.device_id.clone()),
+                ..Default::default()
+            },
+            num_queues: vhost_user_net_device_inner.device.config.num_queues,
+            queue_size: vhost_user_net_device_inner.device.config.queue_size as u16,
+            vhost_user: true,
+            vhost_socket: Some(vhost_user_net_device_inner.device.config.socket_path.clone()),  
+            mac: guest_mac,
+            vhost_mode: VhostMode::Server,
+            offload_csum: !vhost_user_net_device_inner.network_info.disable_offload_csum,
+            offload_tso: !vhost_user_net_device_inner.network_info.disable_offload_tso,
+            offload_ufo: !vhost_user_net_device_inner.network_info.disable_offload_ufo,
+            tap: None,
+            ip: None,
+            mask: None,
+            host_mac: None,
+            mtu: None,
+            fds: None,
+            rate_limiter_config: None,
+        };
+
+        return Ok(net_config);
     }
 }
 
@@ -507,7 +752,21 @@ impl TryFrom<BlockConfig> for DiskConfig {
             num_queues: blkcfg.num_queues,
             queue_size: blkcfg.queue_size as u16,
             image_type: ImageType::Raw,
-            ..Default::default()
+            pci_common: PciDeviceCommonConfig {
+                ..Default::default()
+            },
+            direct: blkcfg.is_direct.unwrap_or_default(),
+            vhost_user: false,
+            vhost_socket: None,
+            rate_limit_group: None,
+            rate_limiter_config: None,
+            disable_io_uring: false,
+            disable_aio: false,
+            serial: None,
+            queue_affinity: None,
+            backing_files: false,
+            sparse: false,
+            lock_granularity: LockGranularityChoice::default(),
         };
 
         Ok(disk_config)
@@ -518,11 +777,16 @@ impl TryFrom<BlockConfig> for DiskConfig {
 pub struct ShareFsSettings {
     cfg: ShareFsConfig,
     vm_path: String,
+    backendfs_config: Option<BackendFsConfig>,
 }
 
 impl ShareFsSettings {
-    pub fn new(cfg: ShareFsConfig, vm_path: String) -> Self {
-        ShareFsSettings { cfg, vm_path }
+    pub fn new(cfg: ShareFsConfig, vm_path: String, bfs_config: Option<BackendFsConfig>) -> Self {
+        ShareFsSettings {
+            cfg,
+            vm_path,
+            backendfs_config: bfs_config,
+        }
     }
 }
 
@@ -532,21 +796,35 @@ impl TryFrom<ShareFsSettings> for FsConfig {
     fn try_from(settings: ShareFsSettings) -> Result<Self, Self::Error> {
         let cfg = settings.cfg;
         let vm_path = settings.vm_path;
+        let bfs_config = settings.backendfs_config;
+        let mut socket_path = PathBuf::new();
 
-        let num_queues = cfg.queue_num as usize;
-        let queue_size = u16::try_from(cfg.queue_size)?;
-
-        let socket_path = if cfg.sock_path.starts_with('/') {
-            PathBuf::from(cfg.sock_path)
+        let num_queues: usize = if cfg.queue_num > 0 {
+            cfg.queue_num as usize
         } else {
-            PathBuf::from(vm_path).join(cfg.sock_path)
+            DEFAULT_FS_QUEUES
         };
+
+        let queue_size: u16 = if cfg.queue_num > 0 {
+            u16::try_from(cfg.queue_size)?
+        } else {
+            DEFAULT_FS_QUEUE_SIZE
+        };
+
+        if bfs_config.is_none() {
+            socket_path = if cfg.sock_path.starts_with('/') {
+                PathBuf::from(cfg.sock_path)
+            } else {
+                PathBuf::from(vm_path).join(cfg.sock_path)
+            };
+        }
 
         let fs_cfg = FsConfig {
             tag: cfg.mount_tag,
             socket: socket_path,
             num_queues,
             queue_size,
+            backendfs_config: bfs_config,
             ..Default::default()
         };
 
@@ -573,7 +851,14 @@ mod tests {
             use_shared_irq: None,
         };
 
-        let net = NetConfig::try_from(cfg.clone());
+        let network_info = NetworkConfigInfo {
+            disable_offload_csum: false,
+            disable_offload_tso: false,
+            disable_offload_ufo: false,
+            ..Default::default()
+        };
+
+        let net = NetConfig::try_from(NetConfigInner::new(network_info.clone(), cfg.clone()));
         assert_eq!(
             net.unwrap_err().to_string(),
             "Missing mac address for network device"
@@ -584,15 +869,17 @@ mod tests {
         cfg.guest_mac = Some(mac_address.clone());
 
         let expected = NetConfig {
-            tap: Some(cfg.host_dev_name.clone()),
-            id: Some(cfg.virt_iface_name.clone()),
+            pci_common: PciDeviceCommonConfig {
+                id: Some(cfg.virt_iface_name.clone()),
+                ..Default::default()
+            },
             num_queues: cfg.queue_num,
             queue_size: cfg.queue_size as u16,
             mac: MacAddr { bytes: v },
             ..Default::default()
         };
 
-        let net = NetConfig::try_from(cfg);
+        let net = NetConfig::try_from(NetConfigInner::new(network_info.clone(), cfg.clone()));
         assert!(net.is_ok());
         assert_eq!(net.unwrap(), expected);
     }

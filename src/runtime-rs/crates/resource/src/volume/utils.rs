@@ -21,7 +21,7 @@ use kata_types::device::{
 };
 use oci_spec::runtime as oci;
 
-use hypervisor::device::DeviceType;
+use kata_hypervisor::device::DeviceType;
 
 pub const DEFAULT_VOLUME_FS_TYPE: &str = "ext4";
 pub const KATA_MOUNT_BIND_TYPE: &str = "bind";
@@ -69,7 +69,7 @@ pub(crate) async fn generate_shared_path(
 /// based on the driver type (BLK/SCSI/CCW).
 fn extract_storage_source(
     driver_option: &str,
-    pci_path: Option<&hypervisor::device::pci_path::PciPath>,
+    pci_path: Option<&kata_hypervisor::device::pci_path::PciPath>,
     scsi_addr: Option<&str>,
     ccw_addr: Option<&str>,
     virt_path: &str,

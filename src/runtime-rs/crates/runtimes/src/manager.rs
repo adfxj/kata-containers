@@ -16,7 +16,7 @@ use common::{
 };
 
 use containerd_shim_protos::events::task::{TaskCreate, TaskDelete, TaskStart};
-use hypervisor::{
+use kata_hypervisor::{
     utils::{create_dir_all_with_inherit_owner, create_vmm_user, remove_vmm_user},
     Param,
 };
@@ -419,6 +419,7 @@ impl RuntimeHandlerManager {
         let network_env = SandboxNetworkEnv {
             netns,
             network_created,
+            annotations: spec.annotations().clone().unwrap_or_default(),
         };
 
         let shm_size = get_shm_size(spec)?;
@@ -496,6 +497,13 @@ impl RuntimeHandlerManager {
                 .sandbox
                 .start()
                 .await
+                .map_err(|error| {
+                    error!(sl!(), "start sandbox error: {:?}", error);
+                    if let Err(err) = futures::executor::block_on(instance.sandbox.shutdown()) {
+                        error!(sl!(), "failed to call sandbox shutdown: {:?}", err);
+                    }
+                    error
+                })
                 .context("start sandbox in task handler")?;
 
             let bundle = container_config.bundle.clone();
@@ -807,13 +815,45 @@ fn load_config(an: &HashMap<String, String>, option: &Option<Vec<u8>>) -> Result
         TomlConfig::get_default_config_file_list()
     ))?;
     annotation.update_config_by_annotation(&mut toml_config)?;
+
+    annotation.update_runtime_config_by_xlet_annotation(&mut toml_config)?;
+
     update_agent_kernel_params(&mut toml_config)?;
+
+    update_factory_config(&mut toml_config)?;
+
+    update_network_config(&mut toml_config)?;
 
     // validate configuration and return the error
     toml_config.validate()?;
 
     info!(logger, "get config content {:?}", &toml_config);
     Ok(toml_config)
+}
+
+fn update_network_config(config: &mut TomlConfig) -> Result<()> {
+    if let Some(hypervisor_config) = config.hypervisor.get_mut(&config.runtime.hypervisor_name) {
+        if hypervisor_config.cpu_info.current_vcpus == 1.0 {
+            hypervisor_config.network_info.network_queues = 2;
+        } else {
+            hypervisor_config.network_info.network_queues *= 2;
+        }
+    }
+
+    Ok(())
+}
+
+// this update the factory config according to the settings read from configuration file
+// if enable_hugepages is true, then factory_type is direct
+fn update_factory_config(config: &mut TomlConfig) -> Result<()> {
+    if let Some(hypervisor_config) = config.hypervisor.get_mut(&config.runtime.hypervisor_name) {
+        if hypervisor_config.memory_info.enable_hugepages {
+            hypervisor_config.factory.enable_template = false;
+            hypervisor_config.factory.factory_type = String::from("direct");
+        }
+    }
+
+    Ok(())
 }
 
 // this update the agent-specfic kernel parameters into hypervisor's bootinfo
@@ -932,7 +972,7 @@ fn configure_non_root_hypervisor(config: &mut Hypervisor) -> Result<()> {
         }
     }
 
-    env::set_var("XDG_RUNTIME_DIR", user_tmp_dir);
+    unsafe { env::set_var("XDG_RUNTIME_DIR", user_tmp_dir) };
 
     // Update the rootless dir prefix for guest_swap_path
     config.memory_info.guest_swap_path = build_path("/run/kata-containers/swap");

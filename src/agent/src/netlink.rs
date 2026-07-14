@@ -4,19 +4,18 @@
 //
 
 use anyhow::{anyhow, Context, Result};
-use futures::{future, StreamExt, TryStreamExt};
+use futures::{future, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use netlink_packet_route::link::{LinkAttribute, LinkMessage};
-use netlink_packet_route::neighbour::{self, NeighbourFlag};
+use netlink_packet_route::neighbour::NeighbourFlag;
 use netlink_packet_route::route::{RouteFlag, RouteHeader, RouteProtocol, RouteScope, RouteType};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},
     route::RouteMetric,
 };
 use netlink_packet_route::{
-    neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourState},
+    neighbour::NeighbourState,
     route::{RouteAddress, RouteAttribute, RouteMessage},
-    AddressFamily,
 };
 use nix::errno::Errno;
 use protocols::types::{ARPNeighbor, IPAddress, IPFamily, Interface, Route};
@@ -510,7 +509,7 @@ impl Handle {
 
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
                     if let Some(code) = message.code {
-                        if Errno::from_i32(code.get()) != Errno::EEXIST {
+                        if Errno::from_raw(code.get()) != Errno::EEXIST {
                             return Err(anyhow!(
                                 "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
                                 route.source(),
@@ -554,7 +553,7 @@ impl Handle {
 
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
                     if let Some(code) = message.code {
-                        if Errno::from_i32(code.get()) != Errno::EEXIST {
+                        if Errno::from_raw(code.get()) != Errno::EEXIST {
                             return Err(anyhow!(
                                 "Failed to add IP v4 route (src: {}, dst: {}, gtw: {},Err: {})",
                                 route.source(),
@@ -629,33 +628,26 @@ impl Handle {
     }
 
     /// Adds an ARP neighbor.
-    /// TODO: `rtnetlink` has no neighbours API, remove this after https://github.com/little-dude/netlink/pull/135
     async fn add_arp_neighbor(&mut self, neigh: &ARPNeighbor) -> Result<()> {
         let ip_address = neigh
             .toIPAddress
             .as_ref()
-            .map(|to| to.address.as_str()) // Extract address field
-            .and_then(|addr| if addr.is_empty() { None } else { Some(addr) }) // Make sure it's not empty
+            .map(|to| to.address.as_str())
+            .and_then(|addr| if addr.is_empty() { None } else { Some(addr) })
             .ok_or_else(|| anyhow!("Unable to determine ip address of ARP neighbor"))?;
 
         let ip = IpAddr::from_str(ip_address)
             .map_err(|e| anyhow!("Failed to parse IP {}: {:?}", ip_address, e))?;
 
-        // Import rtnetlink objects that make sense only for this function
-        use libc::{NDA_UNSPEC, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
-        use neighbour::{NeighbourHeader, NeighbourMessage};
-        use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
-        use netlink_packet_route::RouteNetlinkMessage as RtnlMessage;
-        use rtnetlink::Error;
-
-        const IFA_F_PERMANENT: u16 = 0x80; // See https://github.com/little-dude/netlink/blob/0185b2952505e271805902bf175fee6ea86c42b8/netlink-packet-route/src/rtnl/constants.rs#L770
-        let state = if neigh.state != 0 {
-            neigh.state as u16
-        } else {
-            IFA_F_PERMANENT
-        };
+        const IFA_F_PERMANENT: u16 = 0x80;
 
         let link = self.find_link(LinkFilter::Name(&neigh.device)).await?;
+
+        let state = if neigh.state != 0 {
+            NeighbourState::from(neigh.state as u16)
+        } else {
+            NeighbourState::from(IFA_F_PERMANENT)
+        };
 
         let mut flags = Vec::new();
         for flag in ALL_RULE_FLAGS {
@@ -664,42 +656,22 @@ impl Handle {
             }
         }
 
-        let mut message = NeighbourMessage::default();
-
-        message.header = NeighbourHeader {
-            family: match ip {
-                IpAddr::V4(_) => AddressFamily::Inet,
-                IpAddr::V6(_) => AddressFamily::Inet6,
-            },
-            ifindex: link.index(),
-            state: NeighbourState::from(state),
-            flags,
-            kind: RouteType::from(NDA_UNSPEC as u8),
-        };
-
-        let mut nlas = vec![NeighbourAttribute::Destination(match ip {
-            IpAddr::V4(ipv4_addr) => NeighbourAddress::from(ipv4_addr),
-            IpAddr::V6(ipv6_addr) => NeighbourAddress::from(ipv6_addr),
-        })];
+        let mut request = self
+            .handle
+            .neighbours()
+            .add(link.index(), ip)
+            .state(state)
+            .flags(flags)
+            .kind(RouteType::from(libc::NDA_UNSPEC as u8));
 
         if !neigh.lladdr.is_empty() {
-            nlas.push(NeighbourAttribute::LinkLocalAddress(
-                parse_mac_address(&neigh.lladdr)?.to_vec(),
-            ));
+            request = request.link_local_address(parse_mac_address(&neigh.lladdr)?.as_slice());
         }
 
-        message.attributes = nlas;
-
-        // Send request and ACK
-        let mut req = NetlinkMessage::from(RtnlMessage::NewNeighbour(message));
-        req.header.flags = (NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE) as u16;
-
-        let mut response = self.handle.request(req)?;
-        while let Some(message) = response.next().await {
-            if let NetlinkPayload::Error(err) = message.payload {
-                return Err(anyhow!(Error::NetlinkError(err)));
-            }
-        }
+        request
+            .execute()
+            .await
+            .map_err(|err| anyhow!("Failed to add arp neighbor {}: {:?}", ip, err))?;
 
         Ok(())
     }

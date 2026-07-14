@@ -11,7 +11,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context, Result};
 use cgroups_rs::manager::is_systemd_cgroup;
 use cgroups_rs::{CgroupPid, FsManager, Manager, SystemdManager};
-use hypervisor::{Hypervisor, VcpuThreadIds};
+use kata_hypervisor::{Hypervisor, VcpuThreadIds};
 use kata_types::cpu::CpuSet;
 use nix::sched::{sched_setaffinity, CpuSet as NixCpuSet};
 use nix::unistd::Pid;

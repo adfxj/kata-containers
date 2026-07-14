@@ -1001,7 +1001,6 @@ kernel_params = "console=hvc0"
                     .replace("@PROJECT_TYPE@", "kata")
                     .replace("@RUNTIMENAME@", "kata-runtime")
                     .replace("@DEFSTATICRESOURCEMGMT_CLH@", "false")
-                    .replace("@DEFSANDBOXCGROUPONLY_CLH@", "false")
                     .replace("@DEFCREATECONTAINERTIMEOUT@", "60")
                     .replace("@DEFBINDMOUNTS@", "[]")
                     .replace("@DEFDANCONF@", "")

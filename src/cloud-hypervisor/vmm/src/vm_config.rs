@@ -586,6 +586,7 @@ pub enum ConsoleOutputMode {
     Tty,
     File,
     Socket,
+    Log,
     Null,
 }
 

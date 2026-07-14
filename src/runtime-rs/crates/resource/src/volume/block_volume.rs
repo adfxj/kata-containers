@@ -8,7 +8,7 @@ use super::Volume;
 use crate::volume::utils::{handle_block_volume, DEFAULT_VOLUME_FS_TYPE, KATA_MOUNT_BIND_TYPE};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::{
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig,

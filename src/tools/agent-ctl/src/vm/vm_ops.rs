@@ -10,8 +10,8 @@ use anyhow::{anyhow, Context, Result};
     feature = "cloud-hypervisor",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-use hypervisor::ch::CloudHypervisor;
-use hypervisor::{
+use kata_hypervisor::ch::CloudHypervisor;
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, DeviceManager},
         DeviceConfig,

@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::{do_handle_device, DeviceManager};
-use hypervisor::device::driver::NetworkConfig;
-use hypervisor::device::{DeviceConfig, DeviceType};
-use hypervisor::{Hypervisor, NetworkDevice};
+use kata_hypervisor::device::device_manager::{do_handle_device, DeviceManager};
+use kata_hypervisor::device::driver::NetworkConfig;
+use kata_hypervisor::device::{DeviceConfig, DeviceType};
+use kata_hypervisor::{Hypervisor, NetworkDevice};
 use tokio::sync::RwLock;
 
 use super::endpoint_persist::{EndpointState, VethEndpointState};
@@ -57,6 +57,7 @@ impl VethEndpoint {
             host_dev_name: iface.name.clone(),
             virt_iface_name: self.net_pair.virt_iface.name.clone(),
             guest_mac: Some(guest_mac),
+            queue_num: self.net_pair.queues,
             ..Default::default()
         })
     }

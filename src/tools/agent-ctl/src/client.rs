@@ -296,6 +296,16 @@ static AGENT_CMDS: &[AgentCmd] = &[
         fp: agent_cmd_container_write_stdin,
     },
     AgentCmd {
+        name: "GetIpvs",
+        st: ServiceType::Agent,
+        fp: agent_cmd_sandbox_get_ipvs,
+    },
+    AgentCmd {
+        name: "SetIpvs",
+        st: ServiceType::Agent,
+        fp: agent_cmd_sandbox_set_ipvs,
+    },
+    AgentCmd {
         name: "SetPolicy",
         st: ServiceType::Agent,
         fp: agent_cmd_sandbox_set_policy,
@@ -2032,6 +2042,59 @@ fn agent_cmd_sandbox_add_arp_neighbors(
 
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));
+
+    Ok(())
+}
+
+fn agent_cmd_sandbox_get_ipvs(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    let req: GetIPVSRequest = utils::make_request(args)?;
+
+    let ctx = clone_context(ctx);
+
+    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
+
+    let reply = client
+        .get_ipvs(ctx, &req)
+        .map_err(|e| anyhow!(e).context("failed to call GetIPVS"))?;
+
+    let data_str = String::from_utf8_lossy(&reply.data).to_string();
+    info!(sl!(), "response received";
+        "response" => format!("GetIPVSResponse {{ data: {} }}", data_str));
+
+    Ok(())
+}
+
+fn agent_cmd_sandbox_set_ipvs(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    debug!(sl!(), "raw args"; "args" => args);
+
+    let mut req = SetIPVSRequest::default();
+    req.data = args.as_bytes().to_vec();
+    req.is_restore = false;
+
+    debug!(sl!(), "parsed request"; "request" => format!("data: {}, is_restore: {}", String::from_utf8_lossy(&req.data), req.is_restore));
+
+    let ctx = clone_context(ctx);
+
+    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
+
+    let reply = client
+        .set_ipvs(ctx, &req)
+        .map_err(|e| anyhow!(e).context("failed to call SetIPVS"))?;
+
+    let data_str = String::from_utf8_lossy(&reply.data).to_string();
+    info!(sl!(), "response received"; "response" => format!("SetIPVSResponse {{ data: {} }}", data_str));
 
     Ok(())
 }

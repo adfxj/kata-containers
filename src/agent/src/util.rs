@@ -77,7 +77,7 @@ where
     T: Clone,
 {
     let mut result = v1.clone().map(|mut vec| {
-        if let Some(ref other) = v2 {
+        if let Some(other) = v2 {
             vec.extend(other.iter().cloned());
         }
         vec

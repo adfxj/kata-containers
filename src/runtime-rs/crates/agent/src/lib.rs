@@ -41,6 +41,7 @@ pub const AGENT_KATA: &str = "kata";
 #[async_trait]
 pub trait AgentManager: Send + Sync {
     async fn start(&self, address: &str) -> Result<()>;
+    async fn start_without_log_forwarder(&self, address: &str) -> Result<()>;
     async fn stop(&self);
     async fn disconnect(&self) -> Result<()>;
 
@@ -98,6 +99,7 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
     async fn get_volume_stats(&self, req: VolumeStatsRequest) -> Result<VolumeStatsResponse>;
     async fn resize_volume(&self, req: ResizeVolumeRequest) -> Result<Empty>;
     async fn get_guest_details(&self, req: GetGuestDetailsRequest) -> Result<GuestDetailsResponse>;
+    async fn set_guest_date_time(&self, req: SetGuestDateTimeRequest) -> Result<Empty>;
     async fn add_swap(&self, req: AddSwapRequest) -> Result<Empty>;
     async fn add_swap_path(&self, req: AddSwapPathRequest) -> Result<Empty>;
     async fn set_policy(&self, req: SetPolicyRequest) -> Result<Empty>;

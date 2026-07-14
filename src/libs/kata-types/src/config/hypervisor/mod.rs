@@ -654,6 +654,10 @@ pub struct CpuInfo {
     /// - On ARM with GICv2, max is 8
     #[serde(default)]
     pub default_maxvcpus: u32,
+
+    /// Current number of vCPUs per SB/VM.
+    #[serde(default)]
+    pub current_vcpus: f32,
 }
 
 impl CpuInfo {
@@ -679,6 +683,9 @@ impl CpuInfo {
         if self.default_vcpus > self.default_maxvcpus as f32 {
             self.default_vcpus = self.default_maxvcpus as f32;
         }
+
+        // adjust current_vcpus
+        self.current_vcpus = self.default_vcpus;
 
         Ok(())
     }
@@ -1255,6 +1262,18 @@ pub struct NetworkInfo {
     /// Configures the number of network queues.
     #[serde(default)]
     pub network_queues: u32,
+
+    /// network offload checksum
+    #[serde(default)]
+    pub disable_offload_csum: bool,
+
+    /// network offload tso
+    #[serde(default)]
+    pub disable_offload_tso: bool,
+
+    /// network offload ufo
+    #[serde(default)]
+    pub disable_offload_ufo: bool,
 }
 
 impl NetworkInfo {
@@ -1677,6 +1696,14 @@ pub struct Factory {
     /// Example: "/run/vc/vm/template"
     #[serde(default)]
     pub template_path: String,
+
+    /// factory type: direct/template
+    #[serde(default = "default_factory_type")]
+    pub factory_type: String,
+}
+
+fn default_factory_type() -> String {
+    String::from(default::FACTORY_DIRECT)
 }
 
 /// Common configuration information for hypervisors.
@@ -1975,8 +2002,8 @@ mod tests {
     #[test]
     fn test_cpu_info_adjust_config() {
         // get CPU cores of the test node
-        let node_cpus = num_cpus::get() as f32;
-        let default_vcpus = default::DEFAULT_GUEST_VCPUS as f32;
+        let node_cpus = num_cpus::get() as i32;
+        let default_vcpus = default::DEFAULT_GUEST_VCPUS as i32;
 
         struct TestData<'a> {
             desc: &'a str,
@@ -1989,39 +2016,45 @@ mod tests {
                 desc: "all with default values",
                 input: &mut CpuInfo {
                     cpu_features: "".to_string(),
-                    default_vcpus: 0.0,
+                    default_vcpus: 0,
                     default_maxvcpus: 0,
+                    ..Default::default()
                 },
                 output: CpuInfo {
                     cpu_features: "".to_string(),
                     default_vcpus,
                     default_maxvcpus: node_cpus as u32,
+                    ..Default::default()
                 },
             },
             TestData {
                 desc: "all with big values",
                 input: &mut CpuInfo {
                     cpu_features: "a,b,c".to_string(),
-                    default_vcpus: 9999999.0,
+                    default_vcpus: 9999999,
                     default_maxvcpus: 9999999,
+                    ..Default::default()
                 },
                 output: CpuInfo {
                     cpu_features: "a,b,c".to_string(),
                     default_vcpus: node_cpus,
                     default_maxvcpus: node_cpus as u32,
+                    ..Default::default()
                 },
             },
             TestData {
                 desc: "default_vcpus lager than default_maxvcpus",
                 input: &mut CpuInfo {
                     cpu_features: "a, b ,c".to_string(),
-                    default_vcpus: -1.0,
+                    default_vcpus: -1,
                     default_maxvcpus: 1,
+                    ..Default::default()
                 },
                 output: CpuInfo {
                     cpu_features: "a,b,c".to_string(),
-                    default_vcpus: 1.0,
+                    default_vcpus: 1,
                     default_maxvcpus: 1,
+                    ..Default::default()
                 },
             },
         ];

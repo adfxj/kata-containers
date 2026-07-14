@@ -12,7 +12,8 @@ mod utils;
 
 use anyhow::{anyhow, Result};
 use cgroups_rs::manager::is_systemd_cgroup;
-use hypervisor::HYPERVISOR_DRAGONBALL;
+use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
+use kata_hypervisor::HYPERVISOR_DRAGONBALL;
 use kata_sys_util::spec::load_oci_spec;
 use kata_types::config::TomlConfig;
 
@@ -30,6 +31,7 @@ pub struct CgroupConfig {
     pub overhead_path: String,
     pub sandbox_cgroup_only: bool,
     pub enable_vcpus_pinning: bool,
+    pub enable_pool_cgroup: bool,
 }
 
 impl CgroupConfig {
@@ -52,9 +54,10 @@ impl CgroupConfig {
 
         let overhead_path = utils::gen_overhead_path(is_systemd_cgroup(&path), sid);
 
-        // Dragonball and runtime are the same process, so that the
+        // Dragonball/Clh and runtime are the same process, so that the
         // sandbox_cgroup_only is overwriten to true.
-        let sandbox_cgroup_only = if toml_config.runtime.hypervisor_name == HYPERVISOR_DRAGONBALL {
+        let sandbox_cgroup_only = if toml_config.runtime.hypervisor_name == HYPERVISOR_DRAGONBALL
+                                            || toml_config.runtime.hypervisor_name == HYPERVISOR_NAME_CH {
             true
         } else {
             toml_config.runtime.sandbox_cgroup_only
@@ -67,6 +70,7 @@ impl CgroupConfig {
             overhead_path,
             sandbox_cgroup_only,
             enable_vcpus_pinning,
+            enable_pool_cgroup: toml_config.runtime.enable_pool_cgroup,
         })
     }
 
@@ -85,6 +89,7 @@ impl CgroupConfig {
             overhead_path: overhead_path.clone(),
             sandbox_cgroup_only: state.sandbox_cgroup_only,
             enable_vcpus_pinning: state.enable_vcpus_pinning,
+            enable_pool_cgroup: state.enable_pool_cgroup,
         })
     }
 }

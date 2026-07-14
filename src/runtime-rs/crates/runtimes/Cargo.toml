@@ -20,18 +20,19 @@ opentelemetry = { version = "0.18.0", features = [
     "trace",
     "rt-tokio",
 ] }
-opentelemetry-jaeger = { version = "0.17.0", features = [
+opentelemetry-jaeger = { workspace = true, features = [
     "rt-tokio",
-    "hyper_collector_client",
     "collector_client",
+    "isahc_collector_client",
 ] }
-tracing-subscriber = { version = "0.3", features = ["registry", "std"] }
+tracing-subscriber = { workspace = true, features = ["registry", "std"] }
 hyper = { workspace = true, features = ["stream", "server", "http1"] }
 serde_json = { workspace = true }
-nix = "0.25.0"
+nix = { workspace = true }
 url = { workspace = true }
-procfs = "0.12.0"
-prometheus = { version = "0.14.0", features = ["process"] }
+procfs = { workspace = true }
+futures = { workspace = true }
+prometheus = { workspace = true }
 oci-spec = { workspace = true }
 
 # Local dependencies
@@ -45,7 +46,7 @@ logging = { workspace = true }
 runtime-spec = { workspace = true }
 shim-interface = { workspace = true }
 persist = { workspace = true }
-hypervisor = { workspace = true }
+kata-hypervisor = { workspace = true }
 resource = { workspace = true }
 
 # Local dependencies: runtime handler

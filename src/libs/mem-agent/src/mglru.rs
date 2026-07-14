@@ -138,33 +138,33 @@ fn lru_gen_seq_lines_parse(reader: &mut BufReader<File>) -> Result<(String, Opti
         #[allow(deprecated)]
         let birth = Utc::now() - Duration::milliseconds(msecs);
 
-        let mut gen = GenLRU::new();
-        gen.birth = birth;
+        let mut r#gen: GenLRU = GenLRU::new();
+        r#gen.birth = birth;
 
-        gen.seq = words[0]
+        r#gen.seq = words[0]
             .parse::<u64>()
             .map_err(|e| anyhow!("parse line {line} failed: {e}"))?;
-        gen.anon = str_to_u64(words[2 + WORKINGSET_ANON])
+        r#gen.anon = str_to_u64(words[2 + WORKINGSET_ANON])
             .map_err(|e| anyhow!("parse line {line} failed: {e}"))?;
-        gen.file = str_to_u64(words[2 + WORKINGSET_FILE])
+        r#gen.file = str_to_u64(words[2 + WORKINGSET_FILE])
             .map_err(|e| anyhow!("parse line {line} failed: {e}"))?;
 
         if !got {
-            ret.min_seq = gen.seq;
-            ret.max_seq = gen.seq;
+            ret.min_seq = r#gen.seq;
+            ret.max_seq = r#gen.seq;
             ret.last_birth = birth;
             got = true;
         } else {
-            ret.min_seq = std::cmp::min(ret.min_seq, gen.seq);
-            ret.max_seq = std::cmp::max(ret.max_seq, gen.seq);
+            ret.min_seq = std::cmp::min(ret.min_seq, r#gen.seq);
+            ret.max_seq = std::cmp::max(ret.max_seq, r#gen.seq);
             if ret.last_birth < birth {
                 ret.last_birth = birth;
             }
         }
-        if gen.seq == ret.min_seq {
+        if r#gen.seq == ret.min_seq {
             ret.min_lru_index = ret.lru.len();
         }
-        ret.lru.push(gen);
+        ret.lru.push(r#gen);
 
         line.clear();
     }

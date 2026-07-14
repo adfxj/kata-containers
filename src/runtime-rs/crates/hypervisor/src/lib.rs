@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use hypervisor_persist::HypervisorState;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+use kata_types::config::hypervisor::NetworkInfo as NetworkConfigInfo;
 
 pub use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 
@@ -87,6 +88,7 @@ pub const HYPERVISOR_REMOTE: &str = "remote";
 
 pub const DEFAULT_HYBRID_VSOCK_NAME: &str = "kata.hvsock";
 pub const JAILER_ROOT: &str = "root";
+pub const VM_TEMPLATE_SIZE: u32 = 128;
 
 /// default hotplug timeout
 #[allow(dead_code)]
@@ -103,6 +105,7 @@ pub(crate) enum VmmState {
     NotReady,
     VmmServerReady,
     VmRunning,
+    VmPaused,
 }
 
 // vcpu mapping from vcpu number to thread number
@@ -161,4 +164,5 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn set_guest_memory_block_size(&self, size: u32);
     async fn guest_memory_block_size(&self) -> u32;
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)>;
+    async fn get_overlayfs_block_device(&self) -> Option<DeviceType>;
 }

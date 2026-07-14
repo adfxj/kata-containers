@@ -5,8 +5,8 @@
 // Description: Helper to setup virtio-fs shared path between host & guest
 
 use anyhow::{anyhow, Context, Result};
-use hypervisor::Hypervisor;
-use hypervisor::{
+use kata_hypervisor::Hypervisor;
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, DeviceManager},
         DeviceConfig,

@@ -18,7 +18,8 @@ use std::os::unix::io::RawFd;
 use packet::VsockPacket;
 
 pub use self::device::Vsock;
-pub use self::unix::{VsockUnixBackend, VsockUnixError};
+pub use self::unix::VsockUnixBackend;
+pub use self::unix::Error as VsockUnixError;
 
 mod defs {
 

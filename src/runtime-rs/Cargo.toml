@@ -24,8 +24,10 @@ cloud-hypervisor = ["runtimes/cloud-hypervisor"]
 anyhow = { workspace = true }
 containerd-shim-protos = { workspace = true }
 go-flag = { workspace = true }
+libc = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+vmm-sys-util = { workspace = true }
 shim = { path = "crates/shim" }
 common = { workspace = true }
 runtimes = { workspace = true }

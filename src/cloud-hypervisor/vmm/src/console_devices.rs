@@ -63,6 +63,7 @@ pub enum ConsoleTransport {
     Null,
     Socket(Arc<UnixListener>),
     Off,
+    Log,
 }
 
 #[derive(Clone)]
@@ -229,6 +230,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
+            ConsoleOutputMode::Log => ConsoleTransport::Log,
         },
         serial: match vmconfig.serial.common.mode {
             ConsoleOutputMode::File => {
@@ -266,6 +268,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
+            ConsoleOutputMode::Log => ConsoleTransport::Log,
         },
         #[cfg(target_arch = "x86_64")]
         debug: match vmconfig.debug_console.mode {
@@ -292,6 +295,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
+            ConsoleOutputMode::Log => ConsoleTransport::Log,
         },
     };
 

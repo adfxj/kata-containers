@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use agent::{types::Device, ARPNeighbor, Agent, OnlineCPUMemRequest, Storage};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::{
+use kata_hypervisor::{
     device::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         util::{get_host_path, DEVICE_TYPE_CHAR},
@@ -17,6 +17,7 @@ use hypervisor::{
     },
     utils::uses_native_ccw_bus,
     BlockConfig, BlockDeviceAio, Hypervisor, VfioConfig,
+    HYPERVISOR_NAME_CH,
 };
 use kata_types::mount::{kata_guest_sandbox_dir, Mount, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DIR};
 use kata_types::{
@@ -332,10 +333,12 @@ impl ResourceManagerInner {
     }
 
     pub async fn setup_after_start_vm(&mut self) -> Result<()> {
-        self.cgroups_resource
-            .setup_after_start_vm(self.hypervisor.as_ref())
-            .await
-            .context("setup cgroups after start vm")?;
+        if !self.hypervisor.hypervisor_config().await.vm_template.boot_to_be_template {
+            self.cgroups_resource
+                .setup_after_start_vm(self.hypervisor.as_ref())
+                .await
+                .context("setup cgroups after start vm")?;
+        }
 
         if let Some(share_fs) = self.share_fs.as_ref() {
             share_fs
@@ -547,6 +550,11 @@ impl ResourceManagerInner {
                         continue;
                     }
 
+                    if self.toml_config.runtime.hypervisor_name.as_str() == HYPERVISOR_NAME_CH && 
+                        host_path.starts_with("/dev/vfio/vfio") {
+                        continue;
+                    }
+
                     let bus_type = if uses_native_ccw_bus() {
                         "ccw".to_string()
                     } else {
@@ -720,11 +728,13 @@ impl ResourceManagerInner {
     }
 
     pub async fn cleanup(&self) -> Result<()> {
-        // clean up cgroup
-        self.cgroups_resource
-            .delete()
-            .await
-            .context("delete cgroup")?;
+        let hypervisor_config = self.hypervisor.hypervisor_config().await;
+        if !hypervisor_config.vm_template.boot_to_be_template {
+            self.cgroups_resource
+                .delete()
+                .await
+                .context("delete cgroup")?;
+        }
 
         // cleanup sandbox bind mounts: setup = false
         self.handle_sandbox_bindmounts(false)

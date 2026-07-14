@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use super::Volume;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use kata_sys_util::mount::{get_mount_path, get_mount_type};
 use kata_types::mount::{kata_guest_sandbox_dir, KATA_EPHEMERAL_VOLUME_TYPE};
 use nix::sys::stat::stat;

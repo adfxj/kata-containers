@@ -245,6 +245,10 @@ impl Hypervisor for Dragonball {
         let inner = self.inner.read().await;
         inner.get_passfd_listener_addr().await
     }
+
+    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
+        None
+    }
 }
 
 #[async_trait]

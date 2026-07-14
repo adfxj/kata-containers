@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hypervisor::Hypervisor;
+use kata_hypervisor::Hypervisor;
 use kata_types::config::TomlConfig;
 use oci_spec::runtime::LinuxResources;
 use persist::sandbox_persist::Persist;
@@ -47,6 +47,10 @@ impl CgroupsResource {
 
 impl CgroupsResource {
     pub async fn delete(&self) -> Result<()> {
+        if self.cgroup_config.enable_pool_cgroup {
+            return Ok(());
+        }
+
         let mut inner = self.inner.write().await;
         inner.delete().await
     }
@@ -79,6 +83,7 @@ impl Persist for CgroupsResource {
             overhead_path: Some(self.cgroup_config.overhead_path.clone()),
             sandbox_cgroup_only: self.cgroup_config.sandbox_cgroup_only,
             enable_vcpus_pinning: self.cgroup_config.enable_vcpus_pinning,
+            enable_pool_cgroup: self.cgroup_config.enable_pool_cgroup,
         })
     }
 

@@ -6,6 +6,7 @@
 
 mod nydus_rootfs;
 mod share_fs_rootfs;
+mod overlay_rootfs;
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ mod block_rootfs;
 mod erofs_rootfs;
 pub mod virtual_volume;
 
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 use virtual_volume::{is_kata_virtual_volume, VirtualVolume};
 
 use std::{collections::HashMap, sync::Arc, vec::Vec};
@@ -22,7 +23,7 @@ use tokio::sync::RwLock;
 
 use self::{
     block_rootfs::is_block_rootfs, erofs_rootfs::ErofsMultiLayerRootfs,
-    nydus_rootfs::NYDUS_ROOTFS_TYPE,
+    nydus_rootfs::NYDUS_ROOTFS_TYPE, overlay_rootfs::{OVERLAY_ROOTFS_TYPE, OVERLAY_ROOTFS_SIZE},
 };
 use crate::{rootfs::erofs_rootfs::is_erofs_multi_layer, share_fs::ShareFs};
 use oci_spec::runtime as oci;
@@ -79,17 +80,39 @@ impl RootFsResource {
             // if rootfs_mounts is empty
             [] => {
                 if let Some(share_fs) = share_fs {
-                    // handle share fs rootfs
-                    Ok(Arc::new(
-                        share_fs_rootfs::ShareFsRootfs::new(
-                            share_fs,
-                            cid,
-                            root.path().display().to_string().as_str(),
-                            None,
-                        )
-                        .await
-                        .context("new share fs rootfs")?,
-                    ))
+                    if let Some(template_storage) = annotations.get(OVERLAY_ROOTFS_TYPE) {
+                        let dst_storage_size = if let Some(dst_size) = annotations.get(OVERLAY_ROOTFS_SIZE) {
+                            let size: u64 = dst_size.parse().expect("Failed to parse number");
+                            size
+                        } else {
+                            0u64
+                        };
+                        Ok(Arc::new(
+                            overlay_rootfs::OverlayRootfs::new(
+                                device_manager,
+                                share_fs,
+                                cid,
+                                sid,
+                                root.path().display().to_string().as_str(),
+                                None,
+                                template_storage,
+                                dst_storage_size,
+                            )
+                            .await
+                            .context("new overlay rootfs")?,
+                        ))
+                    } else {
+                        Ok(Arc::new(
+                            share_fs_rootfs::ShareFsRootfs::new(
+                                share_fs,
+                                cid,
+                                root.path().display().to_string().as_str(),
+                                None,
+                            )
+                            .await
+                            .context("new share fs rootfs")?,
+                        ))
+                    }
                 } else {
                     Err(anyhow!("share fs is unavailable"))
                 }
@@ -136,7 +159,6 @@ impl RootFsResource {
                     );
                     Ok(block_rootfs)
                 } else if let Some(share_fs) = share_fs {
-                    // handle nydus rootfs
                     let share_rootfs: Arc<dyn Rootfs> = if layer.fs_type == NYDUS_ROOTFS_TYPE {
                         Arc::new(
                             nydus_rootfs::NydusRootfs::new(
@@ -149,6 +171,27 @@ impl RootFsResource {
                             )
                             .await
                             .context("new nydus rootfs")?,
+                        )
+                    } else if let Some(template_storage) = annotations.get(OVERLAY_ROOTFS_TYPE) {
+                        let dst_storage_size = if let Some(dst_size) = annotations.get(OVERLAY_ROOTFS_SIZE) {
+                            let size: u64 = dst_size.parse().expect("Failed to parse number");
+                            size
+                        } else {
+                            0u64
+                        };
+                        Arc::new(
+                            overlay_rootfs::OverlayRootfs::new(
+                                device_manager,
+                                share_fs,
+                                cid,
+                                sid,
+                                bundle_path,
+                                Some(layer),
+                                template_storage,
+                                dst_storage_size,
+                            )
+                            .await
+                            .context("new overlay rootfs")?,
                         )
                     }
                     // handle sharefs rootfs

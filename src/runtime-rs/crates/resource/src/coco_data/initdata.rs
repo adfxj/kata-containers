@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use hypervisor::BlockConfig;
+use kata_hypervisor::BlockConfig;
 use kata_types::build_path;
 
 /// The path /run/kata-containers/shared/initdata, combined with the sandbox ID,

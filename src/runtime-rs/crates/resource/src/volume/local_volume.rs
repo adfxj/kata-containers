@@ -10,7 +10,7 @@ use crate::share_fs::{kata_guest_share_dir, PASSTHROUGH_FS_DIR};
 use super::Volume;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use kata_sys_util::mount::{get_mount_path, get_mount_type};
 use kata_types::mount::KATA_K8S_LOCAL_STORAGE_TYPE;
 use nix::sys::stat::stat;

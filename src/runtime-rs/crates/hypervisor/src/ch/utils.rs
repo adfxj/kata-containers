@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs;
 use std::path::Path;
-
-use anyhow::{Ok, Result};
-use kata_types::build_path;
-
-use crate::{utils::get_sandbox_path, JAILER_ROOT};
+use std::collections::HashSet;
+use anyhow::Result;
+use crate::utils::get_sandbox_path;
+use serde::Deserialize;
+use kata_sys_util::protection::GuestProtection;
 
 // The socket used to connect to CH. This is used for CH API communications.
 const CH_API_SOCKET_NAME: &str = "ch-api.sock";
@@ -38,16 +39,43 @@ pub fn get_vsock_path(id: &str) -> Result<String> {
     Ok(path)
 }
 
-/// Returns the symlink path of the sandbox for the virtio-fs socket in rootless mode.
-pub fn get_rootless_symlink_sandbox_path(id: &str) -> String {
-    Path::new(build_path(id).as_str())
-        .to_string_lossy()
-        .to_string()
+pub fn get_child_threads(pid: u32) -> HashSet<u32> {
+    let mut result = HashSet::new();
+    let path_name = format!("/proc/{}/task", pid);
+    let path = Path::new(&path_name);
+
+    if path.is_dir() {
+        if let Ok(dir) = path.read_dir() {
+            for entity in dir.flatten() {
+                let tid_path = entity.path();
+                let file_name = tid_path.file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_default();
+
+                if let Ok(tid) = file_name.parse::<u32>() {
+                    let comm_path = tid_path.join("comm");
+                    if let Ok(comm_content) = fs::read_to_string(comm_path) {
+                        let thread_name = comm_content.trim();
+                        if !thread_name.starts_with("vcpu") {
+                            result.insert(tid);
+                        }
+                    } else {
+                        result.insert(tid);
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
-/// Returns the symlink path of the sandbox's jailer root for the virtio-fs socket in rootless mode.
-pub fn get_rootless_symlink_sandbox_jailer_root(id: &str) -> String {
-    let sandbox_path = get_rootless_symlink_sandbox_path(id);
+#[derive(Deserialize, Debug)]
+pub struct PciDeviceInfo {
+    pub id: String,
+    pub bdf: String,
+}
 
-    [&sandbox_path, JAILER_ROOT].join("/")
+// Returns true if the enabled guest protection is Intel TDX.
+pub fn guest_protection_is_tdx(guest_protection_to_use: GuestProtection) -> bool {
+    matches!(guest_protection_to_use, GuestProtection::Tdx)
 }

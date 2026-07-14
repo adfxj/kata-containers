@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::{do_handle_device, DeviceManager};
-use hypervisor::device::DeviceConfig;
-use hypervisor::{device::driver, Hypervisor};
-use hypervisor::{get_vfio_device, VfioConfig};
+use kata_hypervisor::device::device_manager::{do_handle_device, DeviceManager};
+use kata_hypervisor::device::DeviceConfig;
+use kata_hypervisor::{device::driver, Hypervisor};
+use kata_hypervisor::{get_vfio_device, VfioConfig};
 use tokio::sync::RwLock;
 
 use super::endpoint_persist::{EndpointState, PhysicalEndpointState};

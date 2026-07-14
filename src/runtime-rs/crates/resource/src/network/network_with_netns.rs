@@ -16,7 +16,7 @@ use super::endpoint::endpoint_persist::EndpointState;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
 use kata_sys_util::netns;
 use netns_rs::get_from_path;
 use scopeguard::defer;

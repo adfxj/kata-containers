@@ -25,7 +25,7 @@ pub const EMPTYDIR_MODE_SHARED_FS: &str = "shared-fs";
 pub const EMPTYDIR_MODE_BLOCK_ENCRYPTED: &str = "block-encrypted";
 
 /// Kata runtime configuration information.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct Runtime {
     /// Runtime name: Plan to support virt-container, linux-container, wasm-container
     #[serde(default)]
@@ -225,6 +225,14 @@ pub struct Runtime {
     ///              based cold plug.
     #[serde(default)]
     pub pod_resource_api_sock: String,
+
+    /// Used to signal support for PCIe P2P traffic between NVIDIA VFIO endpoints.
+    #[serde(default)]
+    pub enable_gpudirect: bool,
+
+    /// If enabled, sandbox will not remove cgroup created.
+    #[serde(default)]
+    pub enable_pool_cgroup: bool,
 }
 
 fn default_passfd_listener_port() -> u32 {
@@ -322,7 +330,7 @@ mod vendor {
     use super::*;
 
     /// Vendor customization runtime configuration.
-    #[derive(Debug, Default, Deserialize, Serialize)]
+    #[derive(Debug, Default, Deserialize, Serialize, Clone)]
     pub struct RuntimeVendor {}
 
     impl ConfigOps for RuntimeVendor {}

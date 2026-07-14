@@ -8,7 +8,8 @@ use crate::health_check::HealthCheck;
 use agent::kata::KataAgent;
 use agent::types::{KernelModule, SetPolicyRequest};
 use agent::{
-    self, Agent, GetGuestDetailsRequest, GetIPTablesRequest, SetIPTablesRequest, VolumeStatsRequest,
+    self, Agent, GetGuestDetailsRequest, GetIPTablesRequest, OnlineCPUMemRequest,
+    SetGuestDateTimeRequest, SetIPTablesRequest, VolumeStatsRequest,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -28,31 +29,35 @@ use containerd_shim_protos::events::task::{TaskExit, TaskOOM};
     feature = "cloud-hypervisor",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-use hypervisor::ch::CloudHypervisor;
-use hypervisor::device::topology::PCIePort;
-use hypervisor::remote::Remote;
-use hypervisor::VfioDeviceBase;
-use hypervisor::VsockConfig;
-use hypervisor::HYPERVISOR_REMOTE;
+use kata_hypervisor::ch::CloudHypervisor;
+use kata_hypervisor::device::topology::PCIePort;
+use kata_hypervisor::remote::Remote;
+use kata_hypervisor::VfioDeviceBase;
+use kata_hypervisor::VsockConfig;
+use kata_hypervisor::HYPERVISOR_REMOTE;
 #[cfg(all(
     feature = "dragonball",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
+use kata_hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
-use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
-use hypervisor::{
+use kata_hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
+use kata_hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
+use kata_hypervisor::{
     utils::{get_hvsock_path, uses_native_ccw_bus},
     HybridVsockConfig, DEFAULT_GUEST_VSOCK_CID,
 };
-use hypervisor::{BlockConfig, Hypervisor};
-use hypervisor::{BlockDeviceAio, PortDeviceConfig};
-use hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
+use kata_hypervisor::{BlockConfig, Hypervisor};
+use kata_hypervisor::{BlockDeviceAio, PortDeviceConfig};
+use kata_hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
 use kata_sys_util::hooks::HookStates;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_sys_util::spec::load_oci_spec;
 use kata_types::capabilities::CapabilityBits;
+use kata_types::annotations::{
+    FAAS_XLET_DEVICE_HWADDR, FAAS_XLET_DEVICE_IP, FAAS_XLET_DEVICE_MTU, FAAS_XLET_DEVICE_NAME,
+    FAAS_XLET_NEIGHS, FAAS_XLET_ROUTES, FAAS_XLET_NETWORK_QUEUES,
+};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 #[cfg(all(
     feature = "cloud-hypervisor",
@@ -70,11 +75,12 @@ use resource::coco_data::initdata::{
 };
 use resource::coco_data::initdata_block;
 use resource::manager::ManagerArgs;
-use resource::network::{dan_config_path, DanNetworkConfig, NetworkConfig, NetworkWithNetNsConfig};
+use resource::network::{dan_config_path, DanNetworkConfig, NetworkConfig, NetworkWithNetNsConfig, XletNetworkConfig};
 use resource::{ResourceConfig, ResourceManager};
 use runtime_spec as spec;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use strum::Display;
 use tokio::sync::{mpsc::Sender, Mutex, RwLock};
 use tracing::instrument;
@@ -175,7 +181,7 @@ impl VirtSandbox {
     }
 
     #[instrument]
-    async fn prepare_for_start_sandbox(
+    pub async fn prepare_for_start_sandbox(
         &self,
         id: &str,
         sandbox_config: &SandboxConfig,
@@ -362,6 +368,46 @@ impl VirtSandbox {
             Some(ResourceConfig::Network(NetworkConfig::Dan(
                 DanNetworkConfig {
                     dan_conf_path: dan_path,
+                },
+            )))
+        } else if network_env.annotations.contains_key(FAAS_XLET_DEVICE_NAME) {
+            Some(ResourceConfig::Network(NetworkConfig::Xlet(
+                XletNetworkConfig {
+                    device_name: network_env
+                        .annotations
+                        .get(FAAS_XLET_DEVICE_NAME)
+                        .unwrap()
+                        .clone(),
+                    device_hwaddr: network_env
+                        .annotations
+                        .get(FAAS_XLET_DEVICE_HWADDR)
+                        .unwrap()
+                        .clone(),
+                    device_ip: network_env
+                        .annotations
+                        .get(FAAS_XLET_DEVICE_IP)
+                        .unwrap()
+                        .clone(),
+                    mtu: network_env
+                        .annotations
+                        .get(FAAS_XLET_DEVICE_MTU)
+                        .unwrap()
+                        .clone(),
+                    routes: network_env
+                        .annotations
+                        .get(FAAS_XLET_ROUTES)
+                        .unwrap()
+                        .clone(),
+                    neighs: network_env
+                        .annotations
+                        .get(FAAS_XLET_NEIGHS)
+                        .unwrap()
+                        .clone(),
+                    queues: network_env
+                        .annotations
+                        .get(FAAS_XLET_NETWORK_QUEUES)
+                        .unwrap_or(&"1".to_string())
+                        .clone(),
                 },
             )))
         } else if let Some(netns_path) = network_env.netns.as_ref() {
@@ -815,6 +861,32 @@ impl Sandbox for VirtSandbox {
             .await
             .context("setup device after start vm")?;
 
+        let hypervisor_config = self.hypervisor.hypervisor_config().await;
+        if hypervisor_config.vm_template.boot_from_template {
+            if hypervisor_config.memory_info.default_memory > 128 {
+                if let Err(error) = self.resize_memory(hypervisor_config.memory_info.default_memory).await {
+                    error!(sl!(), "resize memory error: {:?}", error);
+                }
+            }
+
+            if hypervisor_config.cpu_info.default_vcpus > 1.0 {
+                if let Err(error) = self.resize_vcpu(1, hypervisor_config.cpu_info.default_vcpus as u32).await {
+                    error!(sl!(), "resize vcpu error: {:?}", error);
+                }
+            }
+
+            let mut guest_date_time = SetGuestDateTimeRequest::default();
+            guest_date_time.sec = SystemTime::now().duration_since(UNIX_EPOCH).context("get system time")?.as_secs() as i64;
+            guest_date_time.usec = SystemTime::now().duration_since(UNIX_EPOCH).context("get system time")?.subsec_micros() as i64;
+
+            if let Err(e) = self.agent
+                .set_guest_date_time(guest_date_time)
+                .await
+            {
+                error!(sl!(), "set guest date time error: {:?}", e);
+            }
+        }
+
         // create sandbox in vm
         let agent_config = self.agent.agent_config().await;
         let kernel_modules = KernelModule::set_kernel_modules(agent_config.kernel_modules)?;
@@ -972,6 +1044,30 @@ impl Sandbox for VirtSandbox {
             info!(sl!(), "sandbox stopped");
         }
 
+        Ok(())
+    }
+
+    async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<()> {
+        info!(sl!(), "begin resize vcpu");
+        self.hypervisor.resize_vcpu(old_vcpus, new_vcpus).await.context("failed to resize")?;
+        let req = OnlineCPUMemRequest {
+            wait: false,
+            nb_cpus: new_vcpus,
+            cpu_only: false,
+        };
+        self.agent.online_cpu_mem(req).await.context("online vcpus")?;
+        Ok(())
+    }
+
+    async fn resize_memory(&self, new_mem_mb: u32) -> Result<()> {
+        info!(sl!(), "begin resize memory");
+        self.hypervisor.resize_memory(new_mem_mb).await.context("failed to resize")?;
+        let req = OnlineCPUMemRequest {
+            wait: false,
+            nb_cpus: 0,
+            cpu_only: false,
+        };
+        self.agent.online_cpu_mem(req).await.context("online memory")?;
         Ok(())
     }
 

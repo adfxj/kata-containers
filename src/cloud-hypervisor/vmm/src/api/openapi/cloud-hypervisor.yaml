@@ -1473,6 +1473,7 @@ components:
         destination_url:
           type: string
         snapshot_type:
+          enum: [full, incremental, soft-dirty]
           type: string
           default: full
         memory_vol_url:
@@ -1510,6 +1511,51 @@ components:
         path:
           type: string
           description: Path to the file system source.
+    
+    RestoreTapConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Restore tap identifier.
+        tap:
+          type: string
+          description: Restore tap name.
+        ip:
+          type: string
+          description: Restore tap IP address.
+        mac:
+          type: string
+          description: Restore tap MAC address.
+        mask:
+          type: string
+          description: Restore tap subnet mask.
+
+    RestoreDiskConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Restore identifier.
+        path:
+          type: string
+          description: Restore disk path.
+        rate_limit_group:
+          type: string
+          description: Restore disk rate limit group.
+        rate_limiter_config:
+          $ref: "#/components/schemas/RateLimiterConfig"
+
+    RestorePmemConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Restore identifier.
+        path:
+          type: string
+          description: Restore pmem path.
+      
 
     RestoreConfig:
       required:
@@ -1541,9 +1587,29 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FsSourceConfig"
+        restore_taps:
+          type: array
+          items:
+            $ref: "#/components/schemas/RestoreTapConfig"
+        disks:
+          type: array
+          items:
+            $ref: "#/components/schemas/RestoreDiskConfig"
+        pmem:
+          type: array
+          items:
+            $ref: "#/components/schemas/RestorePmemConfig"
         memory_vol_url:
           type: string
           description: Optional existing memory blob path for reading memory range data from a separate volume. Accepts /dev/... and file:///dev/... forms.
+        serial_socket:
+          type: string
+          description: Path to UNIX domain socket, used to proxy serial port connections.
+        rate_limit_groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/RateLimitGroupConfig"
+          description: Rate limit groups to replace or add during restore.
 
     ReceiveMigrationData:
       required:

@@ -3,6 +3,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use super::HypervisorState;
 use crate::device::DeviceType;
 use crate::{Hypervisor, MemoryConfig, VcpuThreadIds};
@@ -11,23 +14,14 @@ use async_trait::async_trait;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use persist::sandbox_persist::Persist;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
-
-// Convenience macro to obtain the scope logger
-#[macro_export]
-macro_rules! sl {
-      () => {
-          slog_scope::logger().new(o!("subsystem" => "cloud-hypervisor"))
-      };
-  }
 
 mod inner;
 mod inner_device;
 mod inner_hypervisor;
 mod utils;
-mod vmm_instance;
+mod errors;
+pub mod convert;
+pub mod vmm_instance;
 
 use inner::CloudHypervisorInner;
 
@@ -42,20 +36,24 @@ impl CloudHypervisor {
         let (exit_notify, exit_waiter) = mpsc::channel(1);
 
         Self {
-            inner: Arc::new(RwLock::new(CloudHypervisorInner::new(Some(exit_notify)))),
+            inner: Arc::new(RwLock::new(CloudHypervisorInner::new(exit_notify))),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         }
     }
 
-    pub async fn set_hypervisor_config(&self, config: HypervisorConfig) {
+    pub async fn set_hypervisor_config(&mut self, config: HypervisorConfig) {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
-}
 
-impl Default for CloudHypervisor {
-    fn default() -> Self {
-        Self::new()
+    pub async fn set_passfd_listener_port(&mut self, port: u32) {
+        let mut inner = self.inner.write().await;
+        inner.set_passfd_listener_port(port)
+    }
+
+    pub async fn set_vfio_config(&mut self, enable_gpudirect: bool) {
+        let mut inner = self.inner.write().await;
+        inner.set_vfio_config(enable_gpudirect)
     }
 }
 
@@ -93,17 +91,17 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn pause_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
-        inner.pause_vm()
+        let mut inner = self.inner.write().await;
+        inner.pause_vm().await
     }
 
     async fn resume_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
-        inner.resume_vm()
+        let mut inner = self.inner.write().await;
+        inner.resume_vm().await
     }
 
     async fn save_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
+        let mut inner = self.inner.write().await;
         inner.save_vm().await
     }
 
@@ -148,7 +146,7 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn resize_vcpu(&self, old_vcpu: u32, new_vcpu: u32) -> Result<(u32, u32)> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.resize_vcpu(old_vcpu, new_vcpu).await
     }
 
@@ -207,12 +205,18 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.resize_memory(new_mem_mb).await
     }
 
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
-        Err(anyhow::anyhow!("Not yet supported"))
+        let inner = self.inner.read().await;
+        inner.get_passfd_listener_addr().await
+    }
+
+    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
+        let inner = self.inner.read().await;
+        inner.get_overlayfs_block_device().await
     }
 }
 

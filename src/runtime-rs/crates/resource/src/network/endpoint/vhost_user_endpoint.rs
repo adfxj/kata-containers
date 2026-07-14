@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::{do_handle_device, DeviceManager};
-use hypervisor::device::{DeviceConfig, DeviceType};
-use hypervisor::{Hypervisor, VhostUserConfig, VhostUserNetDevice, VhostUserType};
+use kata_hypervisor::device::device_manager::{do_handle_device, DeviceManager};
+use kata_hypervisor::device::{DeviceConfig, DeviceType};
+use kata_hypervisor::{Hypervisor, VhostUserConfig, VhostUserNetDevice, VhostUserType};
 use tokio::sync::RwLock;
 
 use super::endpoint_persist::VhostUserEndpointState;

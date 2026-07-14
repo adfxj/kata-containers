@@ -4,35 +4,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::HypervisorState;
+use super::vmm_instance::VmmInstance;
 use crate::device::DeviceType;
 use crate::VmmState;
 use anyhow::Result;
 use async_trait::async_trait;
-use ch_config::ch_api::ApiSocket;
 use kata_sys_util::protection::GuestProtection;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use persist::sandbox_persist::Persist;
 use std::collections::HashMap;
-use tokio::sync::watch::{channel, Receiver, Sender};
-use tokio::task::JoinHandle;
-use tokio::{process::Child, sync::mpsc};
+use tokio::sync::mpsc;
 
+/// Cloud Hypervisor inner state
 #[derive(Debug)]
 pub struct CloudHypervisorInner {
     pub(crate) state: VmmState,
     pub(crate) id: String,
 
-    pub(crate) api_socket: ApiSocket,
-    pub(crate) extra_args: Option<Vec<String>>,
-
     pub(crate) config: HypervisorConfig,
 
-    pub(crate) process: Option<Child>,
-    pub(crate) pid: Option<u32>,
+    /// the hotplug memory size
+    pub(crate) mem_hotplug_size_mb: u32,
 
     pub(crate) timeout_secs: i32,
+
+    pub(crate) x_nv_gpudirect_clique_id: u8,
 
     pub(crate) netns: Option<String>,
 
@@ -49,10 +47,6 @@ pub struct CloudHypervisorInner {
     pub(crate) pending_devices: Vec<DeviceType>,
 
     pub(crate) _capabilities: Capabilities,
-
-    pub(crate) shutdown_tx: Option<Sender<bool>>,
-    pub(crate) shutdown_rx: Option<Receiver<bool>>,
-    pub(crate) tasks: Option<Vec<JoinHandle<Result<()>>>>,
 
     // Set if the hardware supports creating a protected guest *AND* if the
     // user has requested creating a protected guest.
@@ -77,30 +71,34 @@ pub struct CloudHypervisorInner {
     /// Size of memory block of guest OS in MB
     pub(crate) guest_memory_block_size_mb: u32,
 
-    pub(crate) exit_notify: Option<mpsc::Sender<i32>>,
+    /// vmm instance
+    pub(crate) vmm_instance: VmmInstance,
+
+    /// guest-side fd passthrough io listener port, used to initialize
+    /// connections for io
+    pub(crate) passfd_listener_port: Option<u32>,
+
+    /// gpudirect
+    pub(crate) enable_gpudirect: bool,
+
+    /// overlayfs block device
+    pub(crate) overlayfs_block_device: Option<DeviceType>,
 }
 
 const CH_DEFAULT_TIMEOUT_SECS: u32 = 10;
 
 impl CloudHypervisorInner {
-    pub fn new(exit_notify: Option<mpsc::Sender<i32>>) -> Self {
+    pub fn new(exit_notify: mpsc::Sender<i32>) -> Self {
         let mut capabilities = Capabilities::new();
         capabilities.set(
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
                 | CapabilityBits::FsSharingSupport
-                | CapabilityBits::HybridVsockSupport,
+                | CapabilityBits::HybridVsockSupport
+                | CapabilityBits::GuestMemoryProbe,
         );
 
-        let (tx, rx) = channel(true);
-
         Self {
-            api_socket: ApiSocket::new(None),
-            extra_args: None,
-
-            process: None,
-            pid: None,
-
             config: Default::default(),
             state: VmmState::NotReady,
             timeout_secs: CH_DEFAULT_TIMEOUT_SECS as i32,
@@ -112,34 +110,41 @@ impl CloudHypervisorInner {
             pending_devices: vec![],
             device_ids: HashMap::<String, String>::new(),
             _capabilities: capabilities,
-            shutdown_tx: Some(tx),
-            shutdown_rx: Some(rx),
-            tasks: None,
             guest_protection_to_use: GuestProtection::NoProtection,
             ch_features: None,
             guest_memory_block_size_mb: 0,
-
-            exit_notify,
+            vmm_instance: VmmInstance::new("", exit_notify),
+            passfd_listener_port: None,
+            mem_hotplug_size_mb: 0,
+            enable_gpudirect: false,
+            x_nv_gpudirect_clique_id: 0,
+            overlayfs_block_device: None,
         }
     }
 
-    pub fn set_hypervisor_config(&mut self, mut config: HypervisorConfig) {
-        // virtio-pmem is not supported for Cloud Hypervisor.
-        if config.boot_info.vm_rootfs_driver == crate::VM_ROOTFS_DRIVER_PMEM {
-            config.boot_info.vm_rootfs_driver = crate::VM_ROOTFS_DRIVER_BLK.to_string();
-        }
-
+    pub fn set_hypervisor_config(&mut self, config: HypervisorConfig) {
         self.config = config;
     }
 
     pub fn hypervisor_config(&self) -> HypervisorConfig {
         self.config.clone()
     }
-}
 
-impl Default for CloudHypervisorInner {
-    fn default() -> Self {
-        Self::new(None)
+    pub fn set_passfd_listener_port(&mut self, port: u32) {
+        self.passfd_listener_port = Some(port);
+    }
+
+    pub fn set_vfio_config(&mut self, enable_gpudirect: bool) {
+        self.enable_gpudirect = enable_gpudirect;
+    }
+
+    pub fn alloc_x_nv_gpudirect_clique(&mut self) -> Option<u8> {
+        if self.enable_gpudirect {
+            let x_nv_gpudirect_clique_id = self.x_nv_gpudirect_clique_id;
+            Some(x_nv_gpudirect_clique_id)
+        } else {
+            None
+        }
     }
 }
 
@@ -160,7 +165,8 @@ impl Persist for CloudHypervisorInner {
             config: self.hypervisor_config(),
             run_dir: self.run_dir.clone(),
             guest_protection_to_use: self.guest_protection_to_use.clone(),
-
+            passfd_listener_port: self.passfd_listener_port,
+            enable_gpudirect: self.enable_gpudirect,
             ..Default::default()
         })
     }
@@ -170,8 +176,6 @@ impl Persist for CloudHypervisorInner {
         exit_notify: mpsc::Sender<i32>,
         hypervisor_state: Self::State,
     ) -> Result<Self> {
-        let (tx, rx) = channel(true);
-
         let mut ch = Self {
             config: hypervisor_state.config,
             state: VmmState::NotReady,
@@ -183,15 +187,17 @@ impl Persist for CloudHypervisorInner {
 
             pending_devices: vec![],
             device_ids: HashMap::<String, String>::new(),
-            tasks: None,
-            shutdown_tx: Some(tx),
-            shutdown_rx: Some(rx),
             timeout_secs: CH_DEFAULT_TIMEOUT_SECS as i32,
             jailer_root: String::default(),
             ch_features: None,
-            exit_notify: Some(exit_notify),
-
-            ..Default::default()
+            vmm_instance: VmmInstance::new("", exit_notify),
+            passfd_listener_port: hypervisor_state.passfd_listener_port,
+            enable_gpudirect: hypervisor_state.enable_gpudirect,
+            mem_hotplug_size_mb: 0,
+            x_nv_gpudirect_clique_id: 0,
+            _capabilities: Capabilities::new(),
+            guest_memory_block_size_mb: 0,
+            overlayfs_block_device: None,
         };
         ch._capabilities = ch.capabilities().await?;
 

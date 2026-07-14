@@ -6,7 +6,7 @@
 // found in the THIRD-PARTY file.
 
 mod ctrl_queue;
-mod mac;
+pub mod mac;
 mod open_tap;
 mod queue_pair;
 mod tap;

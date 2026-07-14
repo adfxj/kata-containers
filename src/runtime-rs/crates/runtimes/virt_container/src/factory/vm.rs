@@ -1,64 +1,115 @@
 // Copyright 2025 Kata Contributors
+// Copyright (c) 2019-2022 Alibaba Cloud
+// Copyright (c) 2019-2022 Ant Group
 //
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use agent::{kata::KataAgent, Agent, AGENT_KATA};
 use anyhow::{anyhow, Context, Result};
-use common::{message::Message, types::SandboxConfig, Sandbox, SandboxNetworkEnv};
-use hypervisor::device::driver::{VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_PCI};
-use hypervisor::{qemu::Qemu, Hypervisor, HYPERVISOR_QEMU};
+use kata_hypervisor::device::driver::{VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_PCI};
+use kata_hypervisor::{qemu::Qemu, Hypervisor, HYPERVISOR_QEMU};
 use kata_types::config::{
     default, Agent as AgentConfig, Hypervisor as HypervisorConfig, TomlConfig,
 };
 use kata_types::machine_type::MACHINE_TYPE_S390X_TYPE;
-use resource::{cpu_mem::initial_size::InitialSizeManager, ResourceManager};
-use runtime_spec;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::channel;
-use uuid::Uuid;
 
-use crate::sandbox::VirtSandbox;
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use kata_hypervisor::ch::CloudHypervisor;
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 
-const MESSAGE_BUFFER_SIZE: usize = 8;
-
-/// VM is an abstraction of a virtual machine.
-#[derive(Clone)]
-pub struct TemplateVm {
-    /// The hypervisor responsible for managing the virtual machine lifecycle.
-    pub hypervisor: Arc<dyn Hypervisor>,
-
-    /// The guest agent that communicates with the virtual machine.
-    pub agent: Arc<dyn Agent>,
-
-    /// Unique identifier of the virtual machine.
-    pub id: String,
-
-    /// Number of vCPUs assigned to the VM.
-    pub cpu: f32,
-
-    /// Amount of memory (in MB) assigned to the VM.
-    pub memory: u32,
-
-    /// Tracks the difference in vCPU count since last update.
-    pub cpu_delta: i32,
+pub struct BareVM {
+    hypervisor: Arc<dyn Hypervisor>,
+    agent: Arc<dyn Agent>,
 }
 
-/// VmConfig holds all configuration information required to start a new VM instance.
+impl BareVM {
+    pub fn new(hypervisor: Arc<dyn Hypervisor>, agent: Arc<dyn Agent>) -> Self {
+        Self { hypervisor, agent }
+    }
+
+    pub fn get_hypervisor(&self) -> Arc<dyn Hypervisor> {
+        self.hypervisor.clone()
+    }
+
+    pub fn get_agent(&self) -> Arc<dyn Agent> {
+        self.agent.clone()
+    }
+
+    pub async fn ncpus(&self) -> f32 {
+        self.hypervisor
+            .hypervisor_config()
+            .await
+            .cpu_info
+            .default_vcpus
+    }
+
+    pub async fn mem_size(&self) -> u32 {
+        self.hypervisor
+            .hypervisor_config()
+            .await
+            .memory_info
+            .default_memory
+    }
+}
+
+#[derive(Debug)]
+pub struct VMConfig {
+    pub config: Arc<TomlConfig>,
+}
+
+impl VMConfig {
+    pub fn new(config: Arc<TomlConfig>) -> Self {
+        Self { config }
+    }
+
+    pub fn hypervisor_name(&self) -> String {
+        self.config.runtime.hypervisor_name.clone()
+    }
+
+    pub fn agent_name(&self) -> String {
+        self.config.runtime.agent_name.clone()
+    }
+
+    pub fn hypervisor_config(&self) -> Result<&HypervisorConfig> {
+        let hypervisor_name = self.hypervisor_name();
+        let hypervisor_config = self
+            .config
+            .hypervisor
+            .get(&hypervisor_name)
+            .ok_or_else(|| anyhow!("failed to get hypervisor for {}", &hypervisor_name))?;
+        Ok(hypervisor_config)
+    }
+
+    pub fn agent_config(&self) -> Result<&AgentConfig> {
+        let agent_name = self.agent_name();
+        let agent_config = self
+            .config
+            .agent
+            .get(&agent_name)
+            .ok_or_else(|| anyhow!("failed to get agent for {}", &agent_name))?;
+        Ok(agent_config)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VmConfig {
-    /// Type of hypervisor to be used (e.g., qemu, clh).
     #[serde(default)]
     pub hypervisor_name: String,
     #[serde(default)]
     pub agent_name: String,
-    /// Configuration for the guest agent.
     #[serde(default)]
     pub agent_config: AgentConfig,
-
-    /// Configuration for the hypervisor.
     #[serde(default)]
     pub hypervisor_config: HypervisorConfig,
 }
@@ -88,7 +139,6 @@ impl VmConfig {
         }
     }
 
-    /// Validates boot configuration based on security mode
     fn validate_boot_configuration(conf: &HypervisorConfig) -> Result<()> {
         let is_secure_execution = conf.security_info.confidential_guest
             && conf.machine_info.machine_type == MACHINE_TYPE_S390X_TYPE;
@@ -96,7 +146,6 @@ impl VmConfig {
         let has_image = !conf.boot_info.image.is_empty();
         let has_initrd = !conf.boot_info.initrd.is_empty();
 
-        // Secure execution mode does not allow image or initrd
         if is_secure_execution {
             if has_image || has_initrd {
                 return Err(anyhow!(
@@ -106,7 +155,6 @@ impl VmConfig {
             return Ok(());
         }
 
-        // Standard mode: must have exactly one of image or initrd
         if !has_image && !has_initrd {
             return Err(anyhow!("missing image and initrd path"));
         }
@@ -119,35 +167,28 @@ impl VmConfig {
     }
 
     pub fn validate_hypervisor_config(conf: &mut HypervisorConfig) -> Result<()> {
-        // remote hypervisor_socket
         if !conf.remote_info.hypervisor_socket.is_empty() {
             return Ok(());
         }
 
-        // kernel_path
         if conf.boot_info.kernel.is_empty() {
             return Err(anyhow!("missing kernel path"));
         }
 
-        // Validate boot configuration based on security mode
         Self::validate_boot_configuration(conf)?;
 
-        // vcpus
         if conf.cpu_info.default_vcpus == 0.0 {
             conf.cpu_info.default_vcpus = default::DEFAULT_GUEST_VCPUS as f32;
         }
 
-        // memory_size
         if conf.memory_info.default_memory == 0 {
             conf.memory_info.default_memory = default::DEFAULT_QEMU_MEMORY_SIZE_MB;
         }
 
-        // default_bridges
         if conf.device_info.default_bridges == 0 {
             conf.device_info.default_bridges = default::DEFAULT_QEMU_PCI_BRIDGES;
         }
 
-        // block_device_driver
         if conf.blockdev_info.block_device_driver.is_empty() {
             conf.blockdev_info.block_device_driver = default::DEFAULT_BLOCK_DEVICE_TYPE.to_string();
         } else if conf.blockdev_info.block_device_driver == VIRTIO_BLOCK_PCI
@@ -156,7 +197,6 @@ impl VmConfig {
             conf.blockdev_info.block_device_driver = VIRTIO_BLOCK_CCW.to_string();
         }
 
-        // default_maxvcpus
         if conf.cpu_info.default_maxvcpus == 0
             || conf.cpu_info.default_maxvcpus > default::MAX_QEMU_VCPUS
         {
@@ -167,9 +207,17 @@ impl VmConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct TemplateVm {
+    pub hypervisor: Arc<dyn Hypervisor>,
+    pub agent: Arc<dyn Agent>,
+    pub id: String,
+    pub cpu: f32,
+    pub memory: u32,
+    pub cpu_delta: i32,
+}
+
 impl TemplateVm {
-    /// Creates a new TemplateVm instance with the provided components and resources.
-    /// Currently, only QEMU is supported; other hypervisors are not yet implemented.
     pub fn new(
         id: String,
         hypervisor: Arc<dyn Hypervisor>,
@@ -187,7 +235,6 @@ impl TemplateVm {
         }
     }
 
-    /// Initializes the QEMU hypervisor for Kata
     async fn new_hypervisor(config: &VmConfig) -> Result<Arc<dyn Hypervisor>> {
         let hypervisor: Arc<dyn Hypervisor> = match config.hypervisor_name.as_str() {
             HYPERVISOR_QEMU => {
@@ -196,13 +243,17 @@ impl TemplateVm {
                     .await;
                 Arc::new(h)
             }
-            // TODO: Add support for additional hypervisors or proper error handling here.
+            HYPERVISOR_NAME_CH => {
+                let mut h = CloudHypervisor::new();
+                h.set_hypervisor_config(config.hypervisor_config.clone())
+                    .await;
+                Arc::new(h)
+            }
             _ => return Err(anyhow!("Unsupported hypervisor {}", config.hypervisor_name)),
         };
         Ok(hypervisor)
     }
 
-    /// Initializes the Kata agent, handling necessary configurations and setup
     fn new_agent(config: &VmConfig) -> Result<Arc<KataAgent>> {
         let agent_name = &config.agent_name;
         let agent_config = config.agent_config.clone();
@@ -216,9 +267,27 @@ impl TemplateVm {
         }
     }
 
-    /// Create an empty `sandbox_config` structure
-    fn new_empty_sandbox_config() -> SandboxConfig {
-        SandboxConfig {
+    pub async fn new_vm(config: VmConfig, toml_config: TomlConfig) -> Result<Self> {
+        use common::{message::Message, types::SandboxConfig, Sandbox, SandboxNetworkEnv};
+        use resource::{cpu_mem::initial_size::InitialSizeManager, ResourceManager};
+        use runtime_spec;
+        use std::collections::HashMap;
+        use tokio::sync::mpsc::channel;
+        use uuid::Uuid;
+
+        const MESSAGE_BUFFER_SIZE: usize = 8;
+
+        let sid = Uuid::new_v4().to_string();
+
+        let (sender, _receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
+
+        let hypervisor = Self::new_hypervisor(&config)
+            .await
+            .context("new hypervisor")?;
+
+        let agent = Self::new_agent(&config).context("new agent")?;
+
+        let sandbox_config = SandboxConfig {
             sandbox_id: String::new(),
             hostname: String::new(),
             dns: Vec::new(),
@@ -234,31 +303,10 @@ impl TemplateVm {
                 annotations: Default::default(),
             },
             shm_size: 0,
-        }
-    }
-
-    /// Creates a new VM based on the provided configuration.
-    pub async fn new_vm(config: VmConfig, toml_config: TomlConfig) -> Result<Self> {
-        let sid = Uuid::new_v4().to_string();
-
-        let (sender, _receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
-
-        let hypervisor = Self::new_hypervisor(&config)
-            .await
-            .context("new hypervisor")?;
-
-        let agent = Self::new_agent(&config).context("new agent")?;
-
-        let sandbox_config = Self::new_empty_sandbox_config();
+        };
 
         let initial_size_manager = InitialSizeManager::new_from(&sandbox_config.annotations)
             .context("failed to construct static resource manager")?;
-
-        // We need to update the `toml_config` with runtime information,
-        // but due to ownership issues with the variables, we cannot
-        // pass them as parameters.
-        // Therefore, for now, we directly set the `slot` and
-        // `maxmemory` values in the configuration file to non-zero.
 
         let factory = toml_config.get_factory();
 
@@ -276,7 +324,7 @@ impl TemplateVm {
             .context("build resource manager")?,
         );
 
-        let sandbox = VirtSandbox::new(
+        let sandbox = crate::sandbox::VirtSandbox::new(
             &sid,
             sender.clone(),
             agent.clone(),
@@ -296,13 +344,12 @@ impl TemplateVm {
             sandbox.get_sid(),
             sandbox.get_hypervisor(),
             sandbox.get_agent(),
-            hypervisor_config.cpu_info.default_vcpus,
+            hypervisor_config.cpu_info.default_vcpus as f32,
             hypervisor_config.memory_info.default_memory,
         );
         Ok(vm)
     }
 
-    /// Stop a VM
     pub async fn stop(&self) -> Result<()> {
         self.hypervisor
             .stop_vm()
@@ -310,22 +357,18 @@ impl TemplateVm {
             .map_err(|e| anyhow::anyhow!("failed to stop vm: {}", e))
     }
 
-    /// Disconnect agent
     pub async fn disconnect(&self) -> Result<()> {
         self.agent.disconnect().await.context("disconnect vm")
     }
 
-    /// Pause a VM.
     pub async fn pause(&self) -> Result<()> {
         self.hypervisor.pause_vm().await.context("pause vm")
     }
 
-    /// Save a VM to persistent disk.
     pub async fn save(&self) -> Result<()> {
         self.hypervisor.save_vm().await.context("save vm")
     }
 
-    /// Resume resumes a paused VM.
     pub async fn resume(&self) -> Result<()> {
         self.hypervisor.resume_vm().await.context("resume vm")
     }

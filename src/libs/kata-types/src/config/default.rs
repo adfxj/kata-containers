@@ -112,3 +112,6 @@ pub const DEFAULT_REMOTE_MEMORY_SLOTS: u32 = 128;
 
 // Default configuration for factory/templating
 pub const DEFAULT_TEMPLATE_PATH: &str = "/run/vc/vm/template";
+pub const DEFAULT_TEMPLATE_RS_PATH_CH: &str = "/run/vc/vm/template-rs/ch";
+pub const FACTORY_DIRECT: &str = "direct";
+pub const FACTORY_TEMPLATE: &str = "template";

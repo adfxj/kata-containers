@@ -4,25 +4,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{
-    fs::File, os::unix::prelude::AsRawFd, rc::Rc, sync::{mpsc::{channel, Sender}, Arc, Mutex, RwLock}, thread
-};
-
 use anyhow::{Context, Result};
-use vmm::{
-    api::{http::{http_api_graceful_shutdown, HttpApiHandle}, ApiAction, ApiRequest, VmRemoveDeviceData, VmResizeData, VmSnapshotConfig, VmmPingResponse},
-    config::{DeviceConfig, DiskConfig, FsConfig, FsMountConfigInfo, NetConfig, RestoreConfig, VmConfig, VsockConfig},
-    seccomp_filters::{get_seccomp_filter, Thread},
-    VmmVersionInfo,
-};  
-use nix::sched::{setns, CloneFlags};
-use vmm_sys_util_v2::eventfd::EventFd;
-use signal_hook::consts::SIGSYS;
-use seccompiler_v2::{apply_filter, SeccompAction};
-use serde::{Serialize, Deserialize};
+use std::{
+    fs::File, sync::{mpsc::{channel, Sender}, Arc, RwLock}, thread
+};
 use micro_http::Body;
+use nix::sched::{setns, CloneFlags};
+use seccompiler::{apply_filter, SeccompAction};
+use serde::{Serialize, Deserialize};
+use signal_hook::consts::SIGSYS;
+use tokio::sync::mpsc;
+use vmm::{
+    api::{http::{http_api_graceful_shutdown, HttpApiHandle}, ApiAction, ApiRequest, VmRemoveDeviceData, VmResizeData, VmmPingResponse},
+    config::RestoreConfig,
+    seccomp_filters::{get_seccomp_filter, Thread},
+    vm_config::{DeviceConfig, DiskConfig, FsConfig, FsMountConfigInfo, NetConfig, VmConfig, VsockConfig},
+    VmmVersionInfo, SnapshotConfig,
+};  
+use vmm_sys_util::eventfd::EventFd;
 
-const BUILD_VERSION: &str = "40.0.0";
+const BUILD_VERSION: &str = "52.0.0";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct InstanceInfo {
@@ -54,10 +55,11 @@ pub struct VmmInstance {
     api_sender: Option<futures::lock::Mutex<Sender<ApiRequest>>>,
     vmm_thread: Option<thread::JoinHandle<Result<i32>>>,
     http_api_handle: Option<HttpApiHandle>,
+    exit_notify: Option<mpsc::Sender<i32>>,
 }
 
 impl VmmInstance {
-    pub fn new(id: &str) -> Self {
+    pub fn new(id: &str, exit_notify: mpsc::Sender<i32>) -> Self {
         let vmm_shared_info = Arc::new(RwLock::new(InstanceInfo::new()));
         let api_event = EventFd::new(libc::EFD_NONBLOCK)
             .unwrap_or_else(|_| panic!("Failed to create eventfd for vmm {}", id));
@@ -71,6 +73,7 @@ impl VmmInstance {
             api_sender: None,
             vmm_thread: None,
             http_api_handle: None,
+            exit_notify: Some(exit_notify),
         }
     }
 
@@ -171,6 +174,7 @@ impl VmmInstance {
         let vmm_seccomp_action = seccomp_action.clone();
         let exit_event_clone = self.exit_event.try_clone().expect("Failed to dup exit_event.");
         let api_event_fd_clone = api_event_fd.try_clone().expect("Failed to dup api_event_fd.");
+        let exit_notify = self.exit_notify.take().unwrap();
 
         let mut vmm_instance = vmm::Vmm::new(
             VmmVersionInfo::new(BUILD_VERSION, env!("CARGO_PKG_VERSION")),
@@ -178,6 +182,7 @@ impl VmmInstance {
             vmm_seccomp_action,
             hypervisor,
             exit_event_clone,
+            false,
         ).expect("Failed to create vmm instance.");
         self.vmm_thread = Some(
             thread::Builder::new()
@@ -196,16 +201,19 @@ impl VmmInstance {
                             info!(sl!(), "set netns for vmm master {}", &netns_path);
                             let netns_fd = File::open(&netns_path)
                                 .with_context(|| format!("open netns path {}", &netns_path))?;
-                            setns(netns_fd.as_raw_fd(), CloneFlags::CLONE_NEWNET)
+                            setns(&netns_fd, CloneFlags::CLONE_NEWNET)
                                 .context("set netns ")?;
                         }
 
-                        vmm_instance.setup_signal_handler().expect("Failed to setup signal handler.");
+                        vmm_instance.setup_signal_handler(false).expect("Failed to setup signal handler.");
 
-                        vmm_instance.control_loop(
-                            Rc::new(api_request_receiver),
-                        ).expect("Failed to setup control loop.");
-                        Ok(0)
+                        if let Err(err) = vmm_instance.control_loop(&api_request_receiver) {
+                            error!(sl!(), "vmm control loop err. {:?}", err);
+                        }
+                        let exit_code = 0;
+                        exit_notify.try_send(exit_code).ok();
+                        
+                        Ok(exit_code)
                     }()
                     .map_err(|e| {
                         error!(sl!(), "run vmm thread err. {:?}", e);
@@ -226,6 +234,7 @@ impl VmmInstance {
                 &seccomp_action,
                 exit_event_new,
                 hypervisor_type,
+                false,
             ).expect("Failed to create http thread.");
             Some(handle)
         } else {
@@ -302,7 +311,7 @@ impl VmmInstance {
         let api_notifier = self.clone_api_notifier()?;
 
         blocking::unblock(move || {
-            vmm::api::VmCreate.send(api_notifier, api_sender, Arc::new(Mutex::new(vm_config)))
+            vmm::api::VmCreate.send(api_notifier, api_sender, Box::new(vm_config))
         })
         .await
         .map_err(api_error)?;
@@ -369,6 +378,10 @@ impl VmmInstance {
         self.vm_action(&vmm::api::VmResume, ()).await.map(|_| ())
     }
 
+    pub async fn vm_snapshot(&mut self, snapshot_config: SnapshotConfig) -> Result<()> {
+        self.vm_action(&vmm::api::VmSnapshot, snapshot_config).await.map(|_| ())
+    }
+
     pub async fn vm_restore(&mut self, restore_config: RestoreConfig) -> Result<()> {
         self.vm_action(&vmm::api::VmRestore, restore_config).await.map(|_| ())
     }
@@ -391,9 +404,18 @@ impl std::fmt::Display for Error {
     }
 }
 
-// Add this implementation to satisfy the StdError trait requirement
 impl std::error::Error for Error {}
 
-fn api_error(error: impl std::fmt::Debug + std::fmt::Display) -> Error {
-    Error::failed(format!("{error}"))
+fn format_error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = format!("{error}");
+    let mut source = error.source();
+    while let Some(err) = source {
+        message.push_str(&format!("\nCaused by: {err}"));
+        source = err.source();
+    }
+    message
+}
+
+fn api_error(error: impl std::error::Error + std::fmt::Debug + std::fmt::Display) -> Error {
+    Error::failed(format_error_chain(&error))
 }

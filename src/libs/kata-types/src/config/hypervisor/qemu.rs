@@ -95,6 +95,10 @@ impl ConfigPlugin for QemuConfig {
             if qemu.factory.template_path.is_empty() {
                 qemu.factory.template_path = default::DEFAULT_TEMPLATE_PATH.to_string();
             }
+
+            if qemu.factory.enable_template {
+                qemu.factory.factory_type = default::FACTORY_TEMPLATE.to_string();
+            }
         }
 
         Ok(())

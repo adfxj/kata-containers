@@ -2,26 +2,28 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::NamedHypervisorConfig;
-use crate::ProtectionDevConfig;
-use crate::VmConfig;
-use crate::{
-    guest_protection_is_tdx, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpuTopology,
-    CpusConfig, DiskConfig, MemoryConfig, PayloadConfig, PlatformConfig, PmemConfig, RngConfig,
-    VsockConfig,
-};
 use anyhow::Result;
+use std::convert::TryFrom;
+use std::path::{PathBuf, Path};
+use serde::{Deserialize, Serialize};
+use crate::ch::errors::*;
+use crate::ch::utils::guest_protection_is_tdx;
 use kata_sys_util::protection::GuestProtection;
 use kata_types::config::default::DEFAULT_CH_ENTROPY_SOURCE;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::{
-    CpuInfo, MachineInfo, MemoryInfo, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI,
+    CpuInfo, MachineInfo, MemoryInfo, VIRTIO_PMEM, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI,
 };
 use kata_types::config::BootInfo;
-use std::convert::TryFrom;
-use std::path::{Path, PathBuf};
-
-use crate::errors::*;
+use vmm::config::{ImageType, RestoreConfig};
+use vmm::vm_config::{
+    BalloonConfig, CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig,
+    CpuTopology, DeviceConfig, DiskConfig, FsConfig, MemoryConfig, PayloadConfig,
+    PciDeviceCommonConfig, PlatformConfig, PmemConfig, RngConfig, SerialConfig,
+    VsockConfig, VmConfig, NetConfig, default_platformconfig_iommu_address_width_bits,
+};
+#[cfg(target_arch = "x86_64")]
+use vmm::vm_config::DebugConsoleConfig;
 
 // 1 MiB
 const MIB: u64 = 1024 * 1024;
@@ -30,7 +32,7 @@ const PMEM_ALIGN_BYTES: u64 = 2 * MIB;
 
 const DEFAULT_CH_MAX_PHYS_BITS: u8 = 46;
 
-const DEFAULT_VSOCK_CID: u64 = 3;
+const DEFAULT_VSOCK_CID: u32 = 3;
 
 pub const DEFAULT_NUM_PCI_SEGMENTS: u16 = 1;
 
@@ -39,12 +41,40 @@ pub const DEFAULT_DISK_QUEUE_SIZE: u16 = 128;
 
 const MSHV_DEVICE_PATH: &str = "/dev/mshv";
 
-fn cpu_nested_config() -> Option<bool> {
+// Type used to simplify conversion from a generic Hypervisor config
+// to a CH specific VmConfig.
+#[derive(Debug, Clone, Default)]
+pub struct NamedHypervisorConfig {
+    pub kernel_params: String,
+    pub sandbox_path: String,
+    pub vsock_socket_path: String,
+    pub cfg: HypervisorConfig,
+
+    pub shared_fs_devices: Option<Vec<FsConfig>>,
+    pub network_devices: Option<Vec<NetConfig>>,
+    pub host_devices: Option<Vec<DeviceConfig>>,
+
+    // Set to the available guest protection *iff* BOTH of the following
+    // conditions are true:
+    //
+    // - The hardware supports guest protection.
+    // - The user has requested that guest protection be used.
+    pub guest_protection_to_use: GuestProtection,
+    pub protection_device: Option<ProtectionDevConfig>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProtectionDevConfig {
+    pub mrconfigid: Option<String>,
+    pub host_data: Option<String>,
+}
+
+fn cpu_nested_config() -> bool {
     if Path::new(MSHV_DEVICE_PATH).exists() {
         // Nested vCPUs are not supported on MSHV yet.
-        Some(false)
+        false
     } else {
-        None
+        true
     }
 }
 
@@ -124,18 +154,20 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
         let host_devices = n.host_devices;
         let protection_dev = n.protection_device;
 
-        let cpus = CpusConfig::try_from((cfg.cpu_info, guest_protection_to_use.clone()))
+        let cpus = CpusConfig::try_from(CpusConfigInner::new(cfg.cpu_info, guest_protection_to_use.clone()))
             .map_err(VmConfigError::CPUError)?;
 
-        let rng = RngConfig::from(cfg.machine_info);
+        let rng = RngConfig::from(RngConfigInner::new(cfg.machine_info));
 
         // Note how CH handles the different image types:
         //
+        // - A standard image is specified in PmemConfig.
         // - An initrd/initramfs is specified in PayloadConfig.
-        // - An image is specified in DiskConfig.
-        //   Note: pmem is not used as it's not properly supported by Cloud Hypervisor.
+        // - A confidential guest image is specified by a DiskConfig.
         //   - If TDX is enabled, the firmware (`td-shim` [1]) must be
         //     specified in PayloadConfig.
+        // - A confidential guest initrd is specified by a PayloadConfig with
+        //   firmware.
         //
         // [1] - https://github.com/confidential-containers/td-shim
         let boot_info = cfg.boot_info;
@@ -151,8 +183,17 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             return Err(VmConfigError::NoBootFile);
         }
 
+        let pmem = if use_initrd || guest_protection_is_tdx(guest_protection_to_use.clone())
+        || boot_info.vm_rootfs_driver != VIRTIO_PMEM {
+            None
+        } else {
+            let pmem = PmemConfig::try_from(PmemConfigInner::new(boot_info.clone())).map_err(VmConfigError::PmemError)?;
+
+            Some(vec![pmem])
+        };
+
         let payload = Some(
-            PayloadConfig::try_from((
+            PayloadConfig::try_from(PayloadConfigInner::new(
                 boot_info.clone(),
                 kernel_params,
                 guest_protection_to_use.clone(),
@@ -163,8 +204,8 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         let mut disks: Vec<DiskConfig> = vec![];
 
-        if use_image {
-            let disk = DiskConfig::try_from(boot_info).map_err(VmConfigError::DiskError)?;
+        if use_image && (guest_protection_is_tdx(guest_protection_to_use.clone()) || boot_info.vm_rootfs_driver != VIRTIO_PMEM) {
+            let disk = DiskConfig::try_from(DiskConfigInner::new(boot_info)).map_err(VmConfigError::DiskError)?;
 
             disks.push(disk);
         };
@@ -174,27 +215,34 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
         let serial = get_serial_cfg(debug, guest_protection_to_use.clone());
         let console = get_console_cfg(debug, guest_protection_to_use.clone());
 
-        let memory = MemoryConfig::try_from((cfg.memory_info, guest_protection_to_use.clone()))
+        let mut dirty_log = false;
+        let mut shared = true;
+        if cfg.vm_template.boot_to_be_template {
+            dirty_log = true;
+            shared = false;
+        }
+        let memory = MemoryConfig::try_from(MemoryConfigInner::new(cfg.memory_info, guest_protection_to_use.clone(), dirty_log, shared))
             .map_err(VmConfigError::MemoryError)?;
 
         std::fs::create_dir_all(sandbox_path.clone())
             .map_err(|e| VmConfigError::SandboxError(sandbox_path, e.to_string()))?;
 
-        let vsock = VsockConfig::try_from((vsock_socket_path, DEFAULT_VSOCK_CID))
+        let vsock = VsockConfig::try_from(VsockConfigInner::new(vsock_socket_path, DEFAULT_VSOCK_CID))
             .map_err(VmConfigError::VsockError)?;
 
         let platform = get_platform_cfg(guest_protection_to_use);
 
         let balloon = if cfg.device_info.reclaim_guest_freed_memory {
-            Some(crate::BalloonConfig {
+            Some(BalloonConfig {
                 free_page_reporting: true,
-                ..Default::default()
+                size: 0,
+                deflate_on_oom: false,
             })
         } else {
             None
         };
 
-        let cfg = VmConfig {
+        let config = VmConfig {
             cpus,
             memory,
             serial,
@@ -203,25 +251,55 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             fs,
             net,
             devices: host_devices,
+            pmem,
             disks,
             vsock: Some(vsock),
             rng,
             platform,
+            rate_limit_groups: None,
             balloon,
-
-            ..Default::default()
+            generic_vhost_user: None,
+            patch_fs: None,
+            user_devices: None,
+            vdpa: None,
+            pvmemcontrol: None,
+            pvpanic: false,
+            iommu: false,
+            numa: None,
+            watchdog: false,
+            pci_segments: None,
+            tpm: None,
+            preserved_fds: None,
+            landlock_enable: false,
+            landlock_rules: None,
+            #[cfg(target_arch = "x86_64")]
+            debug_console: DebugConsoleConfig::default(),
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: false,
         };
 
-        Ok(cfg)
+        Ok(config)
     }
 }
 
-impl TryFrom<(String, u64)> for VsockConfig {
+pub struct VsockConfigInner {
+    pub args: (String, u32),
+}
+
+impl VsockConfigInner {
+    pub fn new(arg1: String, arg2: u32) -> Self {
+        VsockConfigInner {
+            args: (arg1, arg2),
+        }
+    }
+}
+
+impl TryFrom<VsockConfigInner> for VsockConfig {
     type Error = VsockConfigError;
 
-    fn try_from(args: (String, u64)) -> Result<Self, Self::Error> {
-        let vsock_socket_path = args.0;
-        let cid = args.1;
+    fn try_from(args: VsockConfigInner) -> Result<Self, Self::Error> {
+        let vsock_socket_path = args.args.0;
+        let cid = args.args.1;
 
         let path = if vsock_socket_path.is_empty() {
             return Err(VsockConfigError::NoVsockSocketPath);
@@ -230,22 +308,37 @@ impl TryFrom<(String, u64)> for VsockConfig {
         };
 
         let cfg = VsockConfig {
+            pci_common: PciDeviceCommonConfig {
+                ..Default::default()
+            },
             cid,
             socket: PathBuf::from(path),
-
-            ..Default::default()
         };
 
         Ok(cfg)
     }
 }
 
-impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
+pub struct MemoryConfigInner {
+    pub args: (MemoryInfo, GuestProtection, bool, bool),
+}
+
+impl MemoryConfigInner {
+    pub fn new(meminfo: MemoryInfo, gp: GuestProtection, dirty_log: bool, shared: bool) -> Self {
+        MemoryConfigInner {
+            args: (meminfo, gp, dirty_log, shared),
+        }
+    }
+}
+
+impl TryFrom<MemoryConfigInner> for MemoryConfig {
     type Error = MemoryConfigError;
 
-    fn try_from(args: (MemoryInfo, GuestProtection)) -> Result<Self, Self::Error> {
-        let mem = args.0;
-        let guest_protection_to_use = args.1;
+    fn try_from(args: MemoryConfigInner) -> Result<Self, Self::Error> {
+        let mem = args.args.0;
+        let guest_protection_to_use = args.args.1;
+        let dirty_log = args.args.2;
+        let shared = args.args.3;
 
         if mem.default_memory == 0 {
             return Err(MemoryConfigError::NoDefaultMemory);
@@ -286,11 +379,15 @@ impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
             size: mem_bytes,
 
             // Required
-            shared: true,
+            shared,
 
             hotplug_size,
 
-            prefault: mem.enable_mem_prealloc,
+            dirty_log,
+
+            hugepages: mem.enable_hugepages,
+
+	        prefault: mem.enable_mem_prealloc,
 
             ..Default::default()
         };
@@ -313,20 +410,32 @@ pub fn checked_next_multiple_of(value: u64, multiple: u64) -> Option<u64> {
     }
 }
 
-impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
+pub struct CpusConfigInner {
+    pub args: (CpuInfo, GuestProtection),
+}
+
+impl CpusConfigInner {
+    pub fn new(cpuinfo: CpuInfo, gp: GuestProtection) -> Self {
+        CpusConfigInner {
+            args: (cpuinfo, gp),
+        }
+    }
+}
+
+impl TryFrom<CpusConfigInner> for CpusConfig {
     type Error = CpusConfigError;
 
-    fn try_from(args: (CpuInfo, GuestProtection)) -> Result<Self, Self::Error> {
-        let cpu = args.0;
+    fn try_from(args: CpusConfigInner) -> Result<Self, Self::Error> {
+        let cpu = args.args.0;
 
-        let guest_protection_to_use = args.1;
+        let guest_protection_to_use = args.args.1;
 
         // This can only happen if runtime-rs fails to set default values.
         if cpu.default_vcpus <= 0.0 {
             return Err(CpusConfigError::BootVCPUsTooSmall);
         }
 
-        let default_vcpus = u8::try_from(cpu.default_vcpus.ceil() as u32)
+        let default_vcpus = u16::try_from(cpu.default_vcpus.ceil() as u32)
             .map_err(CpusConfigError::BootVCPUsTooBig)?;
 
         // This can only happen if runtime-rs fails to set default values.
@@ -335,7 +444,7 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
         }
 
         let default_max_vcpus =
-            u8::try_from(cpu.default_maxvcpus).map_err(CpusConfigError::MaxVCPUsTooBig)?;
+            u16::try_from(cpu.default_maxvcpus).map_err(CpusConfigError::MaxVCPUsTooBig)?;
 
         let boot_vcpus = default_vcpus;
 
@@ -360,11 +469,11 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
 
         let max_phys_bits = DEFAULT_CH_MAX_PHYS_BITS;
 
-        let features = CpuFeatures::from(cpu.cpu_features);
+        let features = CpuFeatures::from(CpuFeaturesInner::new(cpu.cpu_features));
 
         let cfg = CpusConfig {
-            boot_vcpus,
-            max_vcpus,
+            boot_vcpus: boot_vcpus.into(),
+            max_vcpus: max_vcpus.into(),
             nested: cpu_nested_config(),
             max_phys_bits,
             topology: Some(topology),
@@ -377,17 +486,41 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
     }
 }
 
-impl From<String> for CpuFeatures {
+pub struct CpuFeaturesInner {
+    pub str: String,
+}
+
+impl CpuFeaturesInner {
+    pub fn new(str: String) -> Self {
+        CpuFeaturesInner {
+            str,
+        }
+    }
+}
+
+impl From<CpuFeaturesInner> for CpuFeatures {
     #[cfg(target_arch = "x86_64")]
-    fn from(s: String) -> Self {
-        let amx = s.split(',').any(|x| x == "amx");
+    fn from(s: CpuFeaturesInner) -> Self {
+        let amx = s.str.split(',').any(|x| x == "amx");
 
         CpuFeatures { amx }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn from(_s: String) -> Self {
+    fn from(_s: CpuFeaturesInner) -> Self {
         CpuFeatures::default()
+    }
+}
+
+pub struct PayloadConfigInner {
+    pub args: (BootInfo, Option<String>, GuestProtection, Option<ProtectionDevConfig>),
+}
+
+impl PayloadConfigInner {
+    pub fn new(info: BootInfo, str: Option<String>, gp: GuestProtection, protection_device: Option<ProtectionDevConfig>) -> Self {
+        PayloadConfigInner {
+            args: (info, str, gp, protection_device),
+        }
     }
 }
 
@@ -400,28 +533,14 @@ impl From<String> for CpuFeatures {
 //
 // - The 3rd tuple element determines if TDX is enabled.
 //
-impl
-    TryFrom<(
-        BootInfo,
-        Option<String>,
-        GuestProtection,
-        Option<ProtectionDevConfig>,
-    )> for PayloadConfig
-{
+impl TryFrom<PayloadConfigInner> for PayloadConfig {
     type Error = PayloadConfigError;
 
-    fn try_from(
-        args: (
-            BootInfo,
-            Option<String>,
-            GuestProtection,
-            Option<ProtectionDevConfig>,
-        ),
-    ) -> Result<Self, Self::Error> {
-        let boot_info = args.0;
-        let cmdline = args.1;
-        let guest_protection_to_use = args.2;
-        let protection_device = args.3;
+    fn try_from(args: PayloadConfigInner) -> Result<Self, Self::Error> {
+        let boot_info = args.args.0;
+        let cmdline = args.args.1;
+        let guest_protection_to_use = args.args.2;
+	    let protection_device = args.args.3;
 
         // The kernel is always specified here,
         // not in the top level VmConfig.kernel.
@@ -449,12 +568,6 @@ impl
             Some(PathBuf::from(boot_info.firmware))
         };
 
-        let mrconfigid = if let Some(ref data) = protection_device {
-            data.mrconfigid.clone()
-        } else {
-            None
-        };
-
         let host_data = if let Some(ref data) = protection_device {
             data.host_data.clone()
         } else {
@@ -466,22 +579,35 @@ impl
             initramfs,
             cmdline,
             firmware,
-            mrconfigid,
             host_data,
+            igvm: None,
+            fw_cfg_config: None,
         };
 
         Ok(payload)
     }
 }
 
-impl TryFrom<BootInfo> for DiskConfig {
+pub struct DiskConfigInner {
+    pub boot_info: BootInfo,
+}
+
+impl DiskConfigInner {
+    pub fn new(boot_info: BootInfo) -> Self {
+        DiskConfigInner {
+            boot_info,
+        }
+    }
+}
+
+impl TryFrom<DiskConfigInner> for DiskConfig {
     type Error = DiskConfigError;
 
-    fn try_from(boot_info: BootInfo) -> Result<Self, Self::Error> {
-        let path = if boot_info.image.is_empty() {
+    fn try_from(boot_info: DiskConfigInner) -> Result<Self, Self::Error> {
+        let path = if boot_info.boot_info.image.is_empty() {
             return Err(DiskConfigError::MissingPath);
         } else {
-            PathBuf::from(boot_info.image)
+            PathBuf::from(boot_info.boot_info.image)
         };
 
         let disk = DiskConfig {
@@ -489,18 +615,42 @@ impl TryFrom<BootInfo> for DiskConfig {
             readonly: true,
             num_queues: DEFAULT_DISK_QUEUES,
             queue_size: DEFAULT_DISK_QUEUE_SIZE,
-
-            ..Default::default()
+            pci_common: PciDeviceCommonConfig { ..Default::default() },
+            direct: false,
+            vhost_user: false,
+            vhost_socket: None,
+            rate_limit_group: None,
+            rate_limiter_config: None,
+            disable_io_uring: false,
+            disable_aio: false,
+            serial: None,
+            queue_affinity: None,
+            backing_files: false,
+            sparse: false,
+            image_type: ImageType::Raw,
+            lock_granularity: Default::default(),
         };
 
         Ok(disk)
     }
 }
 
-impl From<MachineInfo> for RngConfig {
-    fn from(m: MachineInfo) -> Self {
-        let entropy_source = if !m.entropy_source.is_empty() {
-            m.entropy_source
+pub struct RngConfigInner {
+    pub machine_info: MachineInfo,
+}
+
+impl RngConfigInner {
+    pub fn new(machine_info: MachineInfo) -> Self {
+        RngConfigInner {
+            machine_info,
+        }
+    }
+}
+
+impl From<RngConfigInner> for RngConfig {
+    fn from(m: RngConfigInner) -> Self {
+        let entropy_source = if !m.machine_info.entropy_source.is_empty() {
+            m.machine_info.entropy_source
         } else {
             DEFAULT_CH_ENTROPY_SOURCE.to_string()
         };
@@ -513,20 +663,69 @@ impl From<MachineInfo> for RngConfig {
     }
 }
 
-impl TryFrom<&BootInfo> for PmemConfig {
+pub struct PmemConfigInner {
+    pub boot_info: BootInfo,
+}
+
+impl PmemConfigInner {
+    pub fn new(boot_info: BootInfo) -> Self {
+        PmemConfigInner {
+            boot_info,
+        }
+    }
+}
+
+impl TryFrom<PmemConfigInner> for PmemConfig {
     type Error = PmemConfigError;
 
-    fn try_from(b: &BootInfo) -> Result<Self, Self::Error> {
-        let file = if b.image.is_empty() {
+    fn try_from(b: PmemConfigInner) -> Result<Self, Self::Error> {
+        let file = if b.boot_info.image.is_empty() {
             return Err(PmemConfigError::MissingImage);
         } else {
-            b.image.clone()
+            b.boot_info.image.clone()
         };
 
         let cfg = PmemConfig {
+            pci_common: PciDeviceCommonConfig { ..Default::default() },
             file: PathBuf::from(file),
             discard_writes: true,
+            size: None,
+        };
 
+        Ok(cfg)
+    }
+}
+
+pub struct RestoreConfigInner {
+    pub restore_path: Option<String>,
+    pub vsock_path: String,
+}
+
+impl RestoreConfigInner {
+    pub fn new(restore_path: Option<String>, vsock_path: String) -> Self {
+        Self {
+            restore_path,
+            vsock_path,
+        }
+    }
+}
+
+impl TryFrom<RestoreConfigInner> for RestoreConfig {
+    type Error = RestoreConfigError;
+
+    fn try_from(r: RestoreConfigInner) -> Result<Self, Self::Error> {
+        let restore_path = r.restore_path.ok_or(RestoreConfigError::MissingRestorePath)?;
+        if restore_path.is_empty() {
+            return Err(RestoreConfigError::MissingRestorePath);
+        }
+
+        if r.vsock_path.is_empty() {
+                return Err(RestoreConfigError::MissingVsockPath);
+        }
+        let cfg = RestoreConfig {
+            source_url: PathBuf::from(restore_path),
+            vsock_socket: Some(PathBuf::from(r.vsock_path.clone())),
+            resume: true,
             ..Default::default()
         };
 
@@ -534,19 +733,21 @@ impl TryFrom<&BootInfo> for PmemConfig {
     }
 }
 
-fn get_serial_cfg(debug: bool, guest_protection_to_use: GuestProtection) -> ConsoleConfig {
+fn get_serial_cfg(debug: bool, guest_protection_to_use: GuestProtection) -> SerialConfig {
     let mode = if guest_protection_is_tdx(guest_protection_to_use) {
         ConsoleOutputMode::Off
     } else if debug {
-        ConsoleOutputMode::Tty
+        ConsoleOutputMode::Log
     } else {
         ConsoleOutputMode::Off
     };
 
-    ConsoleConfig {
-        file: None,
-        mode,
-        iommu: false,
+    SerialConfig {
+        common: CommonConsoleConfig {
+            file: None,
+            mode,
+            socket: None,
+        },
     }
 }
 
@@ -562,9 +763,12 @@ fn get_console_cfg(debug: bool, guest_protection_to_use: GuestProtection) -> Con
     };
 
     ConsoleConfig {
-        file: None,
-        mode,
-        iommu: false,
+        common: CommonConsoleConfig {
+            file: None,
+            mode,
+            socket: None,
+        },
+        pci_common: PciDeviceCommonConfig::default(),
     }
 }
 
@@ -573,8 +777,14 @@ fn get_platform_cfg(guest_protection_to_use: GuestProtection) -> Option<Platform
         let platform = PlatformConfig {
             tdx: true,
             num_pci_segments: DEFAULT_NUM_PCI_SEGMENTS,
-
-            ..Default::default()
+            iommu_segments: None,
+            iommu_address_width_bits: default_platformconfig_iommu_address_width_bits(),
+            serial_number: None,
+            uuid: None,
+            oem_strings: None,
+            sev_snp: false,
+            iommufd: false,
+            vfio_p2p_dma: true,
         };
 
         Some(platform)
@@ -740,8 +950,8 @@ mod tests {
             initramfs: Some(PathBuf::from(initramfs)),
             firmware: payload_firmware,
             cmdline,
-            mrconfigid: None,
             host_data: None,
+            ..Default::default()
         };
 
         (boot_info, payload_config)
@@ -777,54 +987,72 @@ mod tests {
                 debug: false,
                 guest_protection: GuestProtection::NoProtection,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: true,
                 guest_protection: GuestProtection::NoProtection,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Tty,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: false,
                 guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: true,
                 guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: false,
                 guest_protection: GuestProtection::Pef,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: true,
                 guest_protection: GuestProtection::Pef,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Tty,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
         ];
@@ -860,54 +1088,72 @@ mod tests {
                 debug: false,
                 guest_protection: GuestProtection::NoProtection,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: true,
                 guest_protection: GuestProtection::NoProtection,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: false,
                 guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: true,
                 guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Tty,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: false,
                 guest_protection: GuestProtection::Pef,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Off,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
             TestData {
                 debug: true,
                 guest_protection: GuestProtection::Pef,
                 result: ConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Off,
-                    iommu: false,
+                    common: CommonConsoleConfig {
+                        file: None,
+                        mode: ConsoleOutputMode::Tty,
+                        socket: None,
+                    },
+                    pci_common: PciDeviceCommonConfig::default(),
                 },
             },
         ];
@@ -1398,8 +1644,8 @@ mod tests {
                     cmdline: None,
                     initramfs: Some(PathBuf::from(initramfs)),
                     firmware: Some(PathBuf::from(firmware)),
-                    mrconfigid: None,
                     host_data: None,
+                    ..Default::default()
                 }),
             },
             TestData {
@@ -1812,7 +2058,7 @@ mod tests {
             vsock: Some(valid_vsock.clone()),
 
             // rootfs image specific
-            disks: Some(vec![disk_config_with_image]),
+            pmem: Some(vec![pmem_config_with_image]),
 
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from(kernel)),

@@ -41,6 +41,22 @@ pub const KATA_ANNO_CONTAINER_PREFIX: &str = "io.katacontainers.container.";
 /// The annotation key to fetch runtime configuration file.
 pub const SANDBOX_CFG_PATH_KEY: &str = "io.katacontainers.config_path";
 
+//xlet annotation
+/// io.katacontainers.xlet-pod-device-name
+pub const FAAS_XLET_DEVICE_NAME: &str = "io.katacontainers.xlet-pod-device-name";
+/// io.katacontainers.xlet-pod-device-hwaddr
+pub const FAAS_XLET_DEVICE_HWADDR: &str = "io.katacontainers.xlet-pod-device-hwaddr";
+/// io.katacontainers.xlet-pod-device-ip
+pub const FAAS_XLET_DEVICE_IP: &str = "io.katacontainers.xlet-pod-device-ip";
+/// io.katacontainers.xlet-pod-device-mtu
+pub const FAAS_XLET_DEVICE_MTU: &str = "io.katacontainers.xlet-pod-device-mtu";
+/// io.katacontainers.xlet-pod-routes
+pub const FAAS_XLET_ROUTES: &str = "io.katacontainers.xlet-pod-routes";
+/// io.katacontainers.xlet-pod-neighs
+pub const FAAS_XLET_NEIGHS: &str = "io.katacontainers.xlet-pod-neighs";
+/// io.katacontainers.xlet-pod-network-queues
+pub const FAAS_XLET_NETWORK_QUEUES: &str = "io.katacontainers.xlet-pod-network-queues";
+
 // OCI section
 /// The annotation key to fetch the OCI configuration file path.
 pub const BUNDLE_PATH_KEY: &str = "io.katacontainers.pkg.oci.bundle_path";
@@ -250,6 +266,15 @@ pub const KATA_ANNO_CFG_HYPERVISOR_RX_RATE_LIMITER_MAX_RATE: &str =
 /// A sandbox annotation that specifies max rate on network I/O outbound bandwidth.
 pub const KATA_ANNO_CFG_HYPERVISOR_TX_RATE_LIMITER_MAX_RATE: &str =
     "io.katacontainers.config.hypervisor.tx_rate_limiter_max_rate";
+/// A sandbox annotation to specify if offload csum is not available on the host.
+pub const KATA_ANNO_CFG_HYPERVISOR_DISABLE_OFFLOAD_CSUM: &str =
+    "io.katacontainers.config.hypervisor.disable_offload_csum";
+/// A sandbox annotation to specify if offload tso is not available on the host.
+pub const KATA_ANNO_CFG_HYPERVISOR_DISABLE_OFFLOAD_TSO: &str =
+    "io.katacontainers.config.hypervisor.disable_offload_tso";
+/// A sandbox annotation to specify if offload ufo is not available on the host.
+pub const KATA_ANNO_CFG_HYPERVISOR_DISABLE_OFFLOAD_UFO: &str =
+    "io.katacontainers.config.hypervisor.disable_offload_ufo";
 
 // Hypervisor Security related annotations
 /// A sandbox annotation to specify the path within the VM that will be used for 'drop-in' hooks.
@@ -491,9 +516,48 @@ impl Annotation {
     pub fn get_container_resource_swap_in_bytes(&self) -> Option<String> {
         self.get(KATA_ANNO_CONTAINER_RES_SWAP_IN_BYTES)
     }
+
+    /// Get the annotation of xlet device name.
+    pub fn get_xlet_device_name(&self) -> Option<String> {
+        self.get(FAAS_XLET_DEVICE_NAME)
+    }
+
+    /// Get the annotation of xlet device hardware address.
+    pub fn get_xlet_device_hwaddr(&self) -> Option<String> {
+        self.get(FAAS_XLET_DEVICE_HWADDR)
+    }
+
+    /// Get the annotation of xlet device IP.
+    pub fn get_xlet_device_ip(&self) -> Option<String> {
+        self.get(FAAS_XLET_DEVICE_IP)
+    }
+
+    /// Get the annotation of xlet device MTU.
+    pub fn get_xlet_device_mtu(&self) -> Option<String> {
+        self.get(FAAS_XLET_DEVICE_MTU)
+    }
+
+    /// Get the annotation of xlet routes.
+    pub fn get_xlet_routes(&self) -> Option<String> {
+        self.get(FAAS_XLET_ROUTES)
+    }
+
+    /// Get the annotation of xlet neighbors.
+    pub fn get_xlet_neighs(&self) -> Option<String> {
+        self.get(FAAS_XLET_NEIGHS)
+    }
 }
 
 impl Annotation {
+    ///update runtimeconfig info by xlet annotation
+    pub fn update_runtime_config_by_xlet_annotation(&self, config: &mut TomlConfig) -> Result<()> {
+        if let Some(_hv) = self.annotations.get(FAAS_XLET_DEVICE_NAME) {
+            config.runtime.disable_new_netns = true;
+            config.runtime.internetworking_model = "none".to_string();
+        }
+        Ok(())
+    }
+
     /// update config info by annotation
     pub fn update_config_by_annotation(&self, config: &mut TomlConfig) -> Result<()> {
         if let Some(hv) = self.annotations.get(KATA_ANNO_CFG_RUNTIME_HYPERVISOR) {
@@ -693,6 +757,7 @@ impl Annotation {
                                 ));
                             } else {
                                 hv.cpu_info.default_vcpus = num_cpus;
+                                hv.cpu_info.current_vcpus = num_cpus;
                             }
                         }
                         Err(_e) => {
@@ -928,12 +993,42 @@ impl Annotation {
                     }
                     KATA_ANNO_CFG_HYPERVISOR_NETWORK_QUEUES => match self.get_value::<u32>(key) {
                         Ok(r) => {
-                            hv.network_info.network_queues = r.unwrap_or_default();
+                            hv.network_info.network_queues = r.unwrap_or_else(|| 2);
                         }
                         Err(_e) => {
                             return Err(u32_err);
                         }
                     },
+                    KATA_ANNO_CFG_HYPERVISOR_DISABLE_OFFLOAD_CSUM => {
+                        match self.get_value::<bool>(key) {
+                            Ok(r) => {
+                                hv.network_info.disable_offload_csum = r.unwrap_or_default();
+                            }
+                            Err(_e) => {
+                                return Err(bool_err);
+                            }
+                        }
+                    }
+                    KATA_ANNO_CFG_HYPERVISOR_DISABLE_OFFLOAD_TSO => {
+                        match self.get_value::<bool>(key) {
+                            Ok(r) => {
+                                hv.network_info.disable_offload_tso = r.unwrap_or_default();
+                            }
+                            Err(_e) => {
+                                return Err(bool_err);
+                            }
+                        }
+                    }
+                    KATA_ANNO_CFG_HYPERVISOR_DISABLE_OFFLOAD_UFO => {
+                        match self.get_value::<bool>(key) {
+                            Ok(r) => {
+                                hv.network_info.disable_offload_ufo = r.unwrap_or_default();
+                            }
+                            Err(_e) => {
+                                return Err(bool_err);
+                            }
+                        }
+                    }
                     // Hypervisor Security related annotations
                     KATA_ANNO_CFG_HYPERVISOR_GUEST_HOOK_PATH => {
                         hv.security_info.validate_path(value)?;

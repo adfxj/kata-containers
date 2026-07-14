@@ -10,6 +10,7 @@ use std::{
     path::PathBuf,
 };
 
+use std::os::fd::AsRawFd;
 use anyhow::{anyhow, Context, Result};
 use containerd_shim_protos::{
     protobuf::Message,
@@ -167,6 +168,47 @@ fn get_tokio_runtime() -> Result<tokio::runtime::Runtime> {
     Ok(rt)
 }
 
+fn expand_fdtable() {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } < 0 {
+        return;
+    }
+
+    let table_size = if limits.rlim_cur == libc::RLIM_INFINITY {
+        512
+    } else {
+        std::cmp::min(limits.rlim_cur, 512)
+    };
+
+    if table_size <= 3 {
+        return;
+    }
+
+    let dummy_evt = match vmm_sys_util::eventfd::EventFd::new(0) {
+        Ok(evt) => evt,
+        Err(_) => return,
+    };
+
+    let flags: i32 = unsafe { libc::fcntl(table_size as i32 - 1, libc::F_GETFD) };
+    if flags >= 0 {
+        return;
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EBADF) {
+        return;
+    }
+
+    if unsafe { libc::dup2(dummy_evt.as_raw_fd(), table_size as i32 - 1) } < 0 {
+        return;
+    }
+    unsafe { libc::close(table_size as i32 - 1) };
+}
+
 fn real_main() -> Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
     if args.is_empty() {
@@ -174,6 +216,8 @@ fn real_main() -> Result<()> {
             "command-line arguments".to_string()
         )));
     }
+
+    expand_fdtable();
 
     let action = parse_args(&args).context("parse args")?;
     match action {

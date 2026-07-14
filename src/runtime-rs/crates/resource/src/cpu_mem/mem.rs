@@ -5,7 +5,7 @@
 //
 
 use anyhow::{Context, Ok, Result};
-use hypervisor::Hypervisor;
+use kata_hypervisor::Hypervisor;
 use oci::LinuxResources;
 use oci_spec::runtime as oci;
 use std::collections::HashMap;
@@ -46,7 +46,15 @@ impl MemResource {
             .await
             .context("update container memory resources")?;
         // the unit here is MB
-        let mem_sb_mb = self.get_current_mb().await?;
+        // if the mem_sb_mb is equal resource memory plus orig_toml_default_mem then it always needed to hotplug memory
+        // reserve 72 + 8 * orig_toml_default_mem /128 is enough for vm
+        let mut mem_sb_mb = self.get_current_mb().await?;
+        let mem_rs = 72 + 8 * self.orig_toml_default_mem / 128;
+        mem_sb_mb = if 2 * self.orig_toml_default_mem - mem_rs >= mem_sb_mb {
+            return Ok(()) 
+        } else {
+            (mem_sb_mb - self.orig_toml_default_mem + mem_rs + 127) / 128 * 128
+        };
         info!(sl!(), "calculate mem_sb_mb {}", mem_sb_mb);
 
         let _curr_mem = self

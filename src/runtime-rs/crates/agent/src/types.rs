@@ -523,6 +523,7 @@ pub struct MemHotplugByProbeRequest {
 pub struct SetGuestDateTimeRequest {
     pub sec: i64,
     pub usec: i64,
+    pub(crate) wait: bool,
 }
 
 #[derive(PartialEq, Clone, Default)]

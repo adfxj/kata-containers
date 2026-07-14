@@ -36,6 +36,7 @@ pub struct NetworkPair {
     pub virt_iface: NetworkInterface,
     pub model: Arc<dyn network_model::NetworkModel>,
     pub network_qos: bool,
+    pub queues: usize,
 }
 
 impl NetworkPair {
@@ -127,6 +128,7 @@ impl NetworkPair {
             },
             model,
             network_qos: false,
+            queues,
         };
 
         Ok(net_pair)

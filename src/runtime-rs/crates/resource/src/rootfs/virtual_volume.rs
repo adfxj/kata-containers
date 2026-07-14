@@ -16,7 +16,7 @@ use serde_json;
 use tokio::sync::RwLock;
 
 use agent::Storage;
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use kata_types::{
     annotations,
     container::ContainerType,

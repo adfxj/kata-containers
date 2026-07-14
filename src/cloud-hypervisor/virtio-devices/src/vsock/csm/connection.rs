@@ -98,7 +98,7 @@ use super::{ConnState, Error, PendingRx, PendingRxSet, Result, defs};
 ///
 pub struct VsockConnection<S: Read + Write + AsRawFd> {
     /// The current connection state.
-    state: ConnState,
+    pub(crate) state: ConnState,
     /// The local CID. Most of the time this will be the constant `2` (the vsock host CID).
     local_cid: u64,
     /// The peer (guest) CID.
@@ -108,7 +108,9 @@ pub struct VsockConnection<S: Read + Write + AsRawFd> {
     /// The peer (guest) port.
     peer_port: u32,
     /// The (connected) host-side stream.
-    stream: S,
+    pub(crate) stream: S,
+    /// keep the connection when local peer closed.
+    keep: bool,
     /// The TX buffer for this connection.
     tx_buf: TxBuf,
     /// Total number of bytes that have been successfully written to `self.stream`, either
@@ -288,6 +290,8 @@ where
             // Most frequent case: this is an established connection that needs to forward some
             // data to the host stream. Also works for a connection that has begun shutting
             // down, but the peer still has some data to send.
+            // It also work for a hybrid connection's peer closed case, which need
+            // to active the connection's fd to generate the epollout event.
             ConnState::Established | ConnState::PeerClosed(_, false)
                 if pkt.op() == uapi::VSOCK_OP_RW =>
             {
@@ -308,7 +312,19 @@ where
                         "vsock: error writing to local stream (lp={}, pp={}): {:?}",
                         self.local_port, self.peer_port, err
                     );
-                    self.kill();
+                    match err {
+                        Error::TxBufFull => {
+                            // The hybrid pipe peer closed and the tx buf had been full,
+                            // and if want to keep the connection, thus we need drop the
+                            // data send from guest, otherwise, close the connection.
+                            if !self.keep() {
+                                self.kill();
+                            }
+                        }
+                        _ => {
+                            self.kill();
+                        }
+                    };
                     return Ok(());
                 }
 
@@ -451,17 +467,28 @@ where
                 .tx_buf
                 .flush_to(&mut self.stream)
                 .unwrap_or_else(|err| {
-                    warn!(
-                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
-                        self.local_port, self.peer_port, err
-                    );
+                    if !self.keep() {
+                        warn!(
+                            "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
+                            self.local_port, self.peer_port, err
+                        );
+                    }
+
                     match err {
                         Error::TxBufFlush(inner) if inner.kind() == ErrorKind::WouldBlock => {
                             // This should never happen (EWOULDBLOCK after EPOLLOUT), but
                             // it does, so let's absorb it.
                         }
+                        Error::TxBufFlush(inner) if (inner.kind() == ErrorKind::BrokenPipe) => {
+                            // The hybrid connection's pipe peer was closed, and we want to keep the
+                            // connection thus users can reopen the peer pipe to get the connection,
+                            // otherwise, close the connection.
+                            if !self.keep() {
+                                self.kill();
+                            }
+                        }
                         _ => self.kill(),
-                    }
+                    };
                     0
                 });
             self.fwd_cnt += Wrapping(flushed as u32);
@@ -492,6 +519,7 @@ where
         local_port: u32,
         peer_port: u32,
         peer_buf_alloc: u32,
+        keep: bool,
     ) -> Self {
         Self {
             local_cid,
@@ -499,6 +527,7 @@ where
             local_port,
             peer_port,
             stream,
+            keep,
             state: ConnState::PeerInit,
             tx_buf: TxBuf::new(),
             fwd_cnt: Wrapping(0),
@@ -519,6 +548,7 @@ where
         peer_cid: u64,
         local_port: u32,
         peer_port: u32,
+        keep: bool,
     ) -> Self {
         Self {
             local_cid,
@@ -526,6 +556,7 @@ where
             local_port,
             peer_port,
             stream,
+            keep,
             state: ConnState::LocalInit,
             tx_buf: TxBuf::new(),
             fwd_cnt: Wrapping(0),
@@ -578,6 +609,11 @@ where
         self.state
     }
 
+    /// Return the keep value.
+    pub fn keep(&self) -> bool {
+        self.keep
+    }
+
     /// Send some raw, untracked, data straight to the underlying connected stream.
     /// Returns: number of bytes written, or the error describing the write failure.
     ///
@@ -606,15 +642,22 @@ where
         // The TX buffer is empty, so we can try to write straight to the host stream.
         let written = match self.stream.write(buf) {
             Ok(cnt) => cnt,
-            Err(e) => {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // Absorb any would-block errors, since we can always try again later.
-                if e.kind() == ErrorKind::WouldBlock {
-                    0
-                } else {
-                    // We don't know how to handle any other write error, so we'll send it up
-                    // the call chain.
+                0
+            }
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                // The backed pipe peer had been closed, and we didn't want to close
+                // this connection since the peer would like to re attach on it.
+                if !self.keep() {
                     return Err(Error::StreamWrite(e));
                 }
+                0
+            }
+            Err(e) => {
+                // We don't know how to handle any other write error, so
+                // we'll send it up the call chain.
+                return Err(Error::StreamWrite(e));
             }
         };
         // Move the "forwarded bytes" counter ahead by how much we were able to send out.
@@ -833,9 +876,10 @@ mod unit_tests {
                     LOCAL_PORT,
                     PEER_PORT,
                     PEER_BUF_ALLOC,
+                    false,
                 ),
                 ConnState::LocalInit => VsockConnection::<TestStream>::new_local_init(
-                    stream, LOCAL_CID, PEER_CID, LOCAL_PORT, PEER_PORT,
+                    stream, LOCAL_CID, PEER_CID, LOCAL_PORT, PEER_PORT, false,
                 ),
                 ConnState::Established => {
                     let mut conn = VsockConnection::<TestStream>::new_peer_init(
@@ -845,6 +889,7 @@ mod unit_tests {
                         LOCAL_PORT,
                         PEER_PORT,
                         PEER_BUF_ALLOC,
+                        false,
                     );
                     assert!(conn.has_pending_rx());
                     conn.recv_pkt(&mut pkt).unwrap();

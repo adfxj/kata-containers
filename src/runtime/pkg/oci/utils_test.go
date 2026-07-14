@@ -745,7 +745,7 @@ func TestBlockDeviceSectorSizeAnnotations(t *testing.T) {
 		return vc.SandboxConfig{Annotations: make(map[string]string)}
 	}
 
-	// Valid: 0 means "use hypervisor default", no override applied
+	// Valid: 0 means "use kata_hypervisor default", no override applied
 	for _, v := range []string{"0", "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536"} {
 		spec := newSpec()
 		cfg := newConfig()

@@ -23,7 +23,7 @@ pub use vhost_user_endpoint::VhostUserEndpoint;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use hypervisor::Hypervisor;
+use kata_hypervisor::Hypervisor;
 
 use super::EndpointState;
 

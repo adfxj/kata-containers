@@ -25,7 +25,7 @@ use crate::{share_fs::ShareFs, volume::block_volume::is_block_volume};
 use agent::Agent;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::DeviceManager;
+use kata_hypervisor::device::device_manager::DeviceManager;
 use kata_sys_util::mount::get_mount_options;
 use oci_spec::runtime as oci;
 use tokio::sync::RwLock;

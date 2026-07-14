@@ -9,13 +9,22 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::ops::Deref;
 use std::path::Path;
+use std::process::Child;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::mount::{get_linux_mount_info, parse_mount_options};
 use nix::mount::MsFlags;
 use regex::Regex;
+use serde::Deserialize;
 use slog::Logger;
+use slog_scope;
 use tracing::instrument;
+
+use std::process::Command;
+use std::fs::{set_permissions, create_dir_all};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::device::online_device;
 use crate::linux_abi::*;
@@ -61,6 +70,400 @@ lazy_static! {
         InitMount{fstype: "devpts", src: "devpts", dest: "/dev/pts", options: vec!["nosuid", "noexec"]},
         InitMount{fstype: "tmpfs", src: "tmpfs", dest: "/run", options: vec!["nosuid", "nodev"]},
     ];
+}
+
+#[instrument]
+pub fn zosmount(
+    cid: &str,
+    ak: &String,
+    sk: &String,
+    zos_bucket_name: &String,
+    zos_mount_point: &String,
+    zos_url: &String,
+    zos_ronly: &String,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "zosmount"));
+
+    let passwd_file_path = format!("/run/kata-containers/{}/rootfs/.passwd-s3fs", cid);
+    let zos_mount_dir = format!("/run/kata-containers/{}/rootfs{}", cid, zos_mount_point);
+    let cache_dir = format!("/run/kata-containers/{}/rootfs/cache{}", cid, zos_mount_point);
+
+    let passwd_file_path = passwd_file_path.as_str();
+    let zos_mount_dir = zos_mount_dir.as_str();
+    let cache_dir = cache_dir.as_str();
+
+    let mut passwd_file = fs::File::create(passwd_file_path)?;
+    let aksk = format!("{}:{}", ak, sk);
+    passwd_file.write_all(aksk.as_bytes())?;
+
+    let metadata = passwd_file.metadata()?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    set_permissions(passwd_file_path, permissions)?;
+    info!(logger, "[container id: {:?}] ==> set passwd file permission mode successfully", cid);
+
+    create_dir_all(zos_mount_dir)?;
+    fs::set_permissions(zos_mount_dir, fs::Permissions::from_mode(0o777))?;
+    info!(logger, "[container id: {:?}] ==> set zos mount dir permission mode successfully", cid);
+    info!(logger, "[container id: {:?}] ==> create zos mount point: {:?} successfully", cid, zos_mount_dir);
+    create_dir_all(cache_dir)?;
+    fs::set_permissions(cache_dir, fs::Permissions::from_mode(0o777))?;
+    info!(logger, "[container id: {:?}] ==> set zos mount cache dir permission mode successfully", cid);
+    info!(logger, "[container id: {:?}] ==> create zos cache dir: {:?} successfully", cid, cache_dir);
+
+    let option_flag = "-o";
+    let zos_mounts_point = zos_mount_dir;
+    let url = format!("url={}", zos_url);
+    let passwd_files = format!("passwd_file={}", passwd_file_path);
+    let use_path_request_style = "use_path_request_style";
+    let connection_timeout = "connect_timeout=30";
+    let use_cache = format!("use_cache={}", cache_dir);
+
+    let mut cmd = Command::new("s3fs");
+    cmd.arg(zos_bucket_name)
+       .arg(zos_mounts_point)
+       .arg(option_flag)
+       .arg(url)
+       .arg(option_flag)
+       .arg(passwd_files)
+       .arg(option_flag)
+       .arg(use_path_request_style)
+       .arg(option_flag)
+       .arg(connection_timeout)
+       .arg(option_flag)
+       .arg(use_cache);
+
+    if zos_ronly.to_ascii_lowercase() == "true" {
+        cmd.arg(option_flag)
+        .arg("ro");
+    }
+
+    info!(logger, "[container id: {:?}] ==> build s3fs command: {:?} successfully", cid, cmd);
+
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                if is_mounted(zos_mounts_point).unwrap() {
+                    info!(logger, "[container id: {:?}] ==> zos bucket {:?} mounted successfully at {:?}", cid, zos_bucket_name, zos_mounts_point);
+                    match fs::remove_file(passwd_file_path) {
+                        Ok(_) => {
+                            info!(logger, "[container id: {:?}] ==> remove aksk file successfully", cid);
+                            Ok(())
+                        },
+                        Err(err) => {
+                            error!(logger, "[container id: {:?}] ==> failed to remove aksk file. Error:{:?}", cid, err);
+                            Err(anyhow!("failed to remove aksk file"))
+                        }
+                    }
+                } else {
+                    error!(logger, "[container id: {:?}] ==> mount commannd return success, but failed to mount zos bucket", cid);
+                    Err(anyhow!("failed to mount zos bucket"))
+                }
+            } else {
+                let err_msg = String::from("failed to get command stderr");
+                let stderr = String::from_utf8(output.stderr).unwrap_or(err_msg);
+                error!(logger, "[container id: {:?}] ==> failed to mount zos bucket. Error:{:?}", cid, stderr);
+                Err(anyhow!("failed to mount zos bucket"))
+            }
+        },
+        Err(e) => {
+            error!(logger, "[container id: {:?}] ==> failed to execute s3fs command: {:?}", cid, e);
+            Err(anyhow!(e))
+        },
+    }
+}
+
+pub fn create_zos_subdir(
+    cid: &str,
+    ak: &String,
+    sk: &String,
+    zos_bucket_name: &String,
+    zos_mount_point: &String,
+    zos_url: &String,
+    zos_subdir: &String,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "zosmount"));
+
+    let zos_ronly = String::from("false");
+    zosmount(&cid, &ak, &sk, &zos_bucket_name, &zos_mount_point, &zos_url, &zos_ronly)?;
+    let zos_mount_dir = format!("/run/kata-containers/{}/rootfs{}", cid, zos_mount_point);
+    let zos_mount_dir = zos_mount_dir.as_str();
+    let target_dir = format!("{}{}", zos_mount_dir, zos_subdir);
+    create_dir_all(target_dir.clone())?;
+    fs::set_permissions(target_dir, fs::Permissions::from_mode(0o777))?;
+    info!(logger, "[container id: {:?}] ==> set zos mount sub dir permission mode successfully", cid);
+
+    let mut cmd = Command::new("umount");
+    cmd.arg(zos_mount_dir);
+
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                if is_mounted(zos_mount_dir).unwrap() == false {
+                    info!(logger, "[container id: {:?}] ==> umounted successfully at {:?}", cid, zos_mount_dir);
+                    Ok(())
+                } else {
+                    error!(logger, "[container id: {:?}] ==> umount commannd return success, but failed to umount zos", cid);
+                    Err(anyhow!("failed to umount zos"))
+                }
+            } else {
+                let err_msg = String::from("failed to get command stderr");
+                let stderr = String::from_utf8(output.stderr).unwrap_or(err_msg);
+                error!(logger, "[container id: {:?}] ==> failed to umount zos. Error:{:?}", cid, stderr);
+                Err(anyhow!("failed to umount zos"))
+            }
+        },
+        Err(e) => {
+            error!(logger, "[container id: {:?}] ==> failed to execute umount command: {:?}", cid, e);
+            Err(anyhow!(e))
+        },
+    }
+}
+
+#[instrument]
+pub fn sfsmount(
+    cid: &str,
+    sfs_mount_point: &String,
+    sfs_url: &String,
+    is_custom_sfs: bool,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "sfsmount"));
+
+    let sfs_mount_dir = format!("/run/kata-containers/{}/rootfs{}", cid, sfs_mount_point);
+    let sfs_mount_dir = sfs_mount_dir.as_str();
+
+    create_dir_all(sfs_mount_dir)?;
+    fs::set_permissions(sfs_mount_dir, fs::Permissions::from_mode(0o777))?;
+    info!(logger, "[container id: {:?}] ==> set sfs mount dir permission mode successfully", cid);
+    info!(logger, "[container id: {:?}] ==> create sfs mount point: {:?} successfully", cid, sfs_mount_dir);
+
+    let type_flag = "-t";
+    let sfs_type = "nfs";
+    let option_flag = "-o";
+    let sfs_version = {
+        if is_custom_sfs {
+            "vers=3"
+        } else {
+            "vers=4"
+        }
+    };
+    let sfs_option = "tcp,async,nolock,noatime,nodiratime,noresvport,wsize=1048576,rsize=1048576,timeo=600";
+    let sfs_option = format!("{},{}", sfs_version, sfs_option);
+    let sfs_mounts_point = sfs_mount_dir;
+
+    let mut cmd = Command::new("mount");
+    cmd.arg(type_flag)
+       .arg(sfs_type)
+       .arg(option_flag)
+       .arg(sfs_option)
+       .arg(sfs_url)
+       .arg(sfs_mounts_point);
+
+    info!(logger, "[container id: {:?}] ==> build sfs command: {:?} successfully", cid, cmd);
+
+    const MOUNT_TIMEOUT_SECS: u64 = 10;
+    let timeout = Duration::from_secs(MOUNT_TIMEOUT_SECS);
+    let start_time = Instant::now();
+
+    let mut child: Child = cmd.spawn()
+        .map_err(|e| {
+            error!(logger, "[container id: {:?}] ==> failed to spawn mount command: {:?}", cid, e);
+            anyhow!("failed to spawn mount command: {}", e)
+        })?;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    if is_mounted(sfs_mounts_point).unwrap() {
+                        info!(logger, "[container id: {:?}] ==> sfs mounted successfully at {:?}", cid, sfs_mounts_point);
+                        return Ok(());
+                    } else {
+                        error!(logger, "[container id: {:?}] ==> mount command returned success, but failed to mount sfs", cid);
+                        return Err(anyhow!("failed to mount sfs"));
+                    }
+                } else {
+                    let err_msg = String::from("failed to get command stderr");
+                    let stderr = match child.wait_with_output() {
+                        Ok(o) => String::from_utf8(o.stderr).unwrap_or(err_msg),
+                        Err(_) => err_msg,
+                    };
+                    error!(logger, "[container id: {:?}] ==> failed to mount sfs. Error: {:?}", cid, stderr);
+                    return Err(anyhow!("failed to mount sfs: {}", stderr));
+                }
+            }
+            Ok(None) => {
+                if start_time.elapsed() >= timeout {
+                    let _ = child.kill();
+                    error!(logger, "[container id: {:?}] ==> sfs mount timeout after {} seconds", cid, MOUNT_TIMEOUT_SECS);
+                    return Err(anyhow!("sfs mount timeout after {} seconds", MOUNT_TIMEOUT_SECS));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                error!(logger, "[container id: {:?}] ==> failed to wait for mount command: {:?}", cid, e);
+                return Err(anyhow!("failed to wait for mount command: {}", e));
+            }
+        }
+    }
+}
+
+pub fn create_sfs_subdir(
+    cid: &str,
+    sfs_mount_point: &String,
+    sfs_url: &String,
+    sfs_subdir: &String,
+    is_custom_sfs: bool,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "sfsmount"));
+
+    sfsmount(cid, sfs_mount_point, sfs_url, is_custom_sfs)?;
+    let sfs_mount_dir = format!("/run/kata-containers/{}/rootfs{}", cid, sfs_mount_point);
+    let sfs_mount_dir = sfs_mount_dir.as_str();
+    let target_dir = format!("{}{}", sfs_mount_dir, sfs_subdir);
+    create_dir_all(target_dir.clone())?;
+    fs::set_permissions(target_dir, fs::Permissions::from_mode(0o777))?;
+    info!(logger, "[container id: {:?}] ==> set sfs mount sub dir permission mode successfully", cid);
+
+    let mut cmd = Command::new("umount");
+    cmd.arg(sfs_mount_dir);
+
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                if is_mounted(sfs_mount_dir).unwrap() == false {
+                    info!(logger, "[container id: {:?}] ==> umounted successfully at {:?}", cid, sfs_mount_dir);
+                    Ok(())
+                } else {
+                    error!(logger, "[container id: {:?}] ==> umount commannd return success, but failed to umount sfs", cid);
+                    Err(anyhow!("failed to umount sfs"))
+                }
+            } else {
+                let err_msg = String::from("failed to get command stderr");
+                let stderr = String::from_utf8(output.stderr).unwrap_or(err_msg);
+                error!(logger, "[container id: {:?}] ==> failed to umount sfs. Error:{:?}", cid, stderr);
+                Err(anyhow!("failed to umount sfs"))
+            }
+        },
+        Err(e) => {
+            error!(logger, "[container id: {:?}] ==> failed to execute umount command: {:?}", cid, e);
+            Err(anyhow!(e))
+        },
+    }
+}
+
+#[instrument]
+pub fn cgroupmount(
+    cid: &str,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "cgroupmount"));
+
+    let source_dir = "/sys/fs/cgroup";
+    let destination_dir = format!("/run/kata-containers/{}/rootfs/mnt/sys/fs/cgroup", cid);
+    let destination_dir = destination_dir.as_str();
+
+    create_dir_all(destination_dir)?;
+    info!(logger, "[container id: {:?}] ==> create cgroup mount point: {:?} successfully", cid, destination_dir);
+
+    let option_flag = "-o";
+    let cgroup_option = "ro,rbind";
+
+    let mut cmd = Command::new("mount");
+    cmd.arg(option_flag)
+       .arg(cgroup_option)
+       .arg(source_dir)
+       .arg(destination_dir);
+
+    info!(logger, "[container id: {:?}] ==> build cgroup mount command: {:?} successfully", cid, cmd);
+
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                if is_mounted(destination_dir).unwrap() {
+                    info!(logger, "[container id: {:?}] ==> cgroup mounted successfully at {:?}", cid, destination_dir);
+                    Ok(())
+                } else {
+                    error!(logger, "[container id: {:?}] ==> mount commannd return success, but failed to mount cgroup", cid);
+                    Err(anyhow!("failed to mount cgroup"))
+                }
+            } else {
+                let err_msg = String::from("failed to get command stderr");
+                let stderr = String::from_utf8(output.stderr).unwrap_or(err_msg);
+                error!(logger, "[container id: {:?}] ==> failed to mount cgroup. Error:{:?}", cid, stderr);
+                Err(anyhow!("failed to mount cgroup"))
+            }
+        },
+        Err(e) => {
+            error!(logger, "[container id: {:?}] ==> failed to execute mount command: {:?}", cid, e);
+            Err(anyhow!(e))
+        },
+    }
+}
+
+#[instrument]
+pub fn rewrite_dns_config(
+    cid: &str,
+    dns_config: &mut Vec<String>,
+    original_source: &String,
+    nameserver_len: &usize,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "dnsconfig"));
+
+    if dns_config.is_empty() {
+        info!(logger, "[container id: {:?}] ==> user did not set custom dns config", cid);
+        return Ok(());
+    }
+
+    let vm_dns_config_path = "/etc/resolv.conf";
+    let vm_dns_config_file = File::open(vm_dns_config_path)?;
+    let vm_dns_config_reader = BufReader::new(vm_dns_config_file);
+    let vm_dns_config_original_lines: Vec<String> = vm_dns_config_reader.lines().collect::<Result<_, _>>()?;
+
+    for l in &vm_dns_config_original_lines {
+        dns_config.insert(*nameserver_len, l.to_string())
+    }
+
+    let source_dir = "/run/custom_dns.conf";
+    let destination_dir = original_source;
+    let destination_dir = destination_dir.as_str();
+
+    let content = dns_config.join("\n");
+
+    fs::write(source_dir, content)?;
+
+    let option_flag = "-o";
+    let dnsconfig_option = "rw,rbind";
+
+    let mut cmd = Command::new("mount");
+    cmd.arg(option_flag)
+       .arg(dnsconfig_option)
+       .arg(source_dir)
+       .arg(destination_dir);
+
+    info!(logger, "[container id: {:?}] ==> build dns config mount command: {:?} successfully", cid, cmd);
+
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                if is_mounted(destination_dir).unwrap() {
+                    info!(logger, "[container id: {:?}] ==> dns config mounted successfully at {:?}", cid, destination_dir);
+                    Ok(())
+                } else {
+                    error!(logger, "[container id: {:?}] ==> mount commannd return success, but failed to mount dns config", cid);
+                    Err(anyhow!("failed to mount dns config"))
+                }
+            } else {
+                let err_msg = String::from("failed to get command stderr");
+                let stderr = String::from_utf8(output.stderr).unwrap_or(err_msg);
+                error!(logger, "[container id: {:?}] ==> failed to mount dns config. Error:{:?}", cid, stderr);
+                Err(anyhow!("failed to mount dns config"))
+            }
+        },
+        Err(e) => {
+            error!(logger, "[container id: {:?}] ==> failed to execute mount command: {:?}", cid, e);
+            Err(anyhow!(e))
+        },
+    }
 }
 
 #[instrument]
@@ -314,6 +717,90 @@ pub fn remove_mounts<P: AsRef<str> + std::fmt::Debug>(mounts: &[P]) -> Result<()
         nix::mount::umount(m.as_ref()).context(format!("failed to umount {:?}", m.as_ref()))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HostEntry {
+    pub ip: String,
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HostConfig {
+    pub hosts: Vec<HostEntry>,
+}
+
+#[instrument]
+pub fn rewrite_hosts_config(
+    cid: &str,
+    hosts_config: &HostConfig,
+    original_source: &String,
+) -> Result<()> {
+    let logger = slog_scope::logger().new(o!("subsystem" => "hostsconfig"));
+
+    if hosts_config.hosts.is_empty() {
+        info!(logger, "[container id: {:?}] ==> user did not set custom hosts config", cid);
+        return Ok(());
+    }
+
+    let vm_hosts_path = "/etc/hosts";
+    let vm_hosts_file = File::open(vm_hosts_path)?;
+    let vm_hosts_reader = BufReader::new(vm_hosts_file);
+    let vm_hosts_original_lines: Vec<String> = vm_hosts_reader.lines().collect::<Result<_, _>>()?;
+
+    let mut hosts_lines: Vec<String> = Vec::new();
+    for l in vm_hosts_original_lines {
+        hosts_lines.push(l);
+    }
+
+    for entry in &hosts_config.hosts {
+        if entry.domains.is_empty() {
+            info!(logger, "[container id: {:?}] ==> domain value is empty and skip: {:?}", cid, entry);
+            continue;
+        }
+
+        let line = format!("{} {}", entry.ip, entry.domains.join(" "));
+        hosts_lines.push(line);
+    }
+
+    let source_path = "/run/custom_hosts.conf";
+    let destination_path = original_source.as_str();
+    let content = hosts_lines.join("\n");
+
+    fs::write(source_path, content)?;
+
+    let option_flag = "-o";
+    let hosts_option = "rw,rbind";
+    let mut cmd = std::process::Command::new("mount");
+    cmd.arg(option_flag)
+        .arg(hosts_option)
+        .arg(source_path)
+        .arg(destination_path);
+
+    info!(logger, "[container id: {:?}] ==> build hosts config mount command: {:?} successfully", cid, cmd);
+
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                if is_mounted(destination_path).unwrap() {
+                    info!(logger, "[container id: {:?}] ==> hosts config mounted successfully at {:?}", cid, destination_path);
+                    Ok(())
+                } else {
+                    error!(logger, "[container id: {:?}] ==> mount command returned success, but failed to mount hosts config", cid);
+                    Err(anyhow!("failed to mount hosts config"))
+                }
+            } else {
+                let err_msg = String::from("failed to get command stderr");
+                let stderr = String::from_utf8(output.stderr).unwrap_or(err_msg);
+                error!(logger, "[container id: {:?}] ==> failed to mount hosts config. Error: {:?}", cid, stderr);
+                Err(anyhow!("failed to mount hosts config"))
+            }
+        },
+        Err(e) => {
+            error!(logger, "[container id: {:?}] ==> failed to execute mount command: {:?}", cid, e);
+            Err(anyhow!(e))
+        },
+    }
 }
 
 #[cfg(test)]

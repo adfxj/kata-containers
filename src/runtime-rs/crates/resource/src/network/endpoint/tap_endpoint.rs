@@ -5,12 +5,13 @@
 //
 
 use std::sync::Arc;
+use std::convert::TryInto;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hypervisor::device::device_manager::{do_handle_device, DeviceManager};
-use hypervisor::device::{DeviceConfig, DeviceType};
-use hypervisor::{Hypervisor, NetworkConfig, NetworkDevice};
+use kata_hypervisor::device::device_manager::{do_handle_device, DeviceManager};
+use kata_hypervisor::device::{DeviceConfig, DeviceType};
+use kata_hypervisor::{Hypervisor, NetworkConfig, NetworkDevice};
 use tokio::sync::RwLock;
 
 use super::endpoint_persist::TapEndpointState;
@@ -31,8 +32,7 @@ pub struct TapEndpoint {
     dev_mgr: Arc<RwLock<DeviceManager>>,
     // Virtio queue num
     queue_num: usize,
-    // Virtio queue size
-    queue_size: usize,
+    queue_size: u16,
 }
 
 impl TapEndpoint {
@@ -62,7 +62,7 @@ impl TapEndpoint {
             },
             dev_mgr: dev_mgr.clone(),
             queue_num,
-            queue_size,
+            queue_size: queue_size.try_into().unwrap(),
         })
     }
 

@@ -91,8 +91,8 @@ pub fn create_link(name: &str, link_type: LinkType, queues: usize) -> Result<()>
         LinkType::Tap => libc::IFF_TAP,
     };
 
-    let queues = if queues == 0 { 1 } else { queues };
-    if queues > 1 {
+    let queues = if queues == 0 { 2 } else { queues };
+    if queues > 2 {
         flags |= libc::IFF_MULTI_QUEUE | libc::IFF_NO_PI;
     } else {
         flags |= libc::IFF_ONE_QUEUE;

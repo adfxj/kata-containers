@@ -9,11 +9,19 @@
 //!
 //! Check out `muxer.rs` for a more detailed explanation of the inner workings of this backend.
 
+#![allow(unused)]
 mod muxer;
 mod muxer_killq;
 mod muxer_rxq;
+use std::os::unix::net::UnixStream;
+use std::fs::File;
+use std::io::{Error as IoError, Read, Write};
+use log::error;
+use nix::errno::Errno;
+use sendfd::RecvWithFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::time::Duration;
 
-pub use Error as VsockUnixError;
 pub use muxer::VsockMuxer as VsockUnixBackend;
 use thiserror::Error;
 
@@ -64,6 +72,134 @@ pub enum Error {
     #[error("Muxer connection limit reached")]
     TooManyConnections,
 }
-
 type Result<T> = std::result::Result<T, Error>;
-type MuxerConnection = super::csm::VsockConnection<std::os::unix::net::UnixStream>;
+
+pub struct HybridStream {
+    pub hybrid_stream: File,
+    pub slave_stream: Option<UnixStream>,
+}
+
+enum StreamVsock {
+    UnixStream(UnixStream),
+    HybridStream(HybridStream),
+}
+
+type MuxerConnection = super::csm::VsockConnection<StreamVsock>;
+
+impl AsRawFd for StreamVsock {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            StreamVsock::UnixStream(s) => s.as_raw_fd(),
+            StreamVsock::HybridStream(h) => h.hybrid_stream.as_raw_fd(),
+        }
+    }
+}
+
+impl Read for StreamVsock {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            StreamVsock::UnixStream(s) => s.read(buf),
+            StreamVsock::HybridStream(h) => h.hybrid_stream.read(buf),
+        }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            StreamVsock::UnixStream(s) => s.read_exact(buf),
+            StreamVsock::HybridStream(h) => h.hybrid_stream.read_exact(buf),
+        }
+    }
+}
+
+impl Write for StreamVsock {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            StreamVsock::UnixStream(s) => s.write(buf),
+            StreamVsock::HybridStream(h) => {
+                if let Some(mut stream) = h.slave_stream.take() {
+                    stream.write(buf)
+                } else {
+                    h.hybrid_stream.write(buf)
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            StreamVsock::UnixStream(s) => s.flush(),
+            StreamVsock::HybridStream(h) => h.hybrid_stream.flush(),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            StreamVsock::UnixStream(s) => s.write_all(buf),
+            StreamVsock::HybridStream(h) => {
+                if let Some(mut stream) = h.slave_stream.take() {
+                    stream.write_all(buf)
+                } else {
+                    h.hybrid_stream.write_all(buf)
+                }
+            }
+        }
+    }
+}
+
+impl StreamVsock {
+    fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            StreamVsock::UnixStream(s) => s.set_nonblocking(nonblocking),
+            StreamVsock::HybridStream(h) => {
+                let fd = h.hybrid_stream.as_raw_fd();
+                let mut flag = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+
+                if nonblocking {
+                    flag = flag | libc::O_NONBLOCK;
+                } else {
+                    flag = flag & !libc::O_NONBLOCK;
+                }
+
+                let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flag) };
+
+                if ret < 0 {
+                    error!("failed to set fcntl for fd {} with ret {}", fd, ret);
+                    return Err(IoError::last_os_error());
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            StreamVsock::UnixStream(s) => UnixStream::set_read_timeout(s, dur),
+            StreamVsock::HybridStream(_h) => {
+                error!("unsupported!");
+                Err(Errno::ENOPROTOOPT.into())
+            }
+        }
+    }
+
+    fn set_write_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            StreamVsock::UnixStream(s) => UnixStream::set_write_timeout(s, dur),
+            StreamVsock::HybridStream(_h) => {
+                error!("unsupported!");
+                Err(Errno::ENOPROTOOPT.into())
+            }
+        }
+    }
+
+    fn recv_data_fd(
+        &self,
+        bytes: &mut [u8],
+        fds: &mut [RawFd],
+    ) -> std::io::Result<(usize, usize)> {
+        match self {
+            StreamVsock::UnixStream(s) => s.recv_with_fd(bytes, fds),
+            StreamVsock::HybridStream(_h) => Err(Errno::ENOPROTOOPT.into()),
+        }
+    }
+}

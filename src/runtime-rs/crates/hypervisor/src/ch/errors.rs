@@ -57,6 +57,15 @@ pub enum PmemConfigError {
 }
 
 #[derive(Error, Debug, PartialEq)]
+pub enum RestoreConfigError {
+    #[error("Need restore path")]
+    MissingRestorePath,
+
+    #[error("Need vsock path")]
+    MissingVsockPath,
+}
+
+#[derive(Error, Debug, PartialEq)]
 pub enum DiskConfigError {
     #[error("Need path for DiskConfig")]
     MissingPath,

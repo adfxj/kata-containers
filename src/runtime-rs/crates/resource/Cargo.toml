@@ -31,7 +31,7 @@ slog = { workspace = true }
 slog-scope = { workspace = true }
 tokio = { workspace = true, features = ["process", "time"] }
 tracing = { workspace = true }
-uuid = { version = "0.4", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 oci-spec = { workspace = true }
 inotify = "0.11.0"
 walkdir = "2.5.0"
@@ -42,6 +42,8 @@ base64 = { workspace = true }
 
 ## Dependencies from `rust-netlink`
 ## 0.30+ parses IFLA_INET6_CONF on kernels 6.17+ (240-byte blob; DEVCONF_FORCE_FORWARDING).
+futures-lite = "2"
+netlink-packet-core = "0.8"
 netlink-packet-route = "0.30"
 rtnetlink = "0.21"
 

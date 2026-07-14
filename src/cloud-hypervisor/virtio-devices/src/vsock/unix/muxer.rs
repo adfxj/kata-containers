@@ -55,7 +55,9 @@ use super::super::{
 };
 use super::muxer_killq::MuxerKillQ;
 use super::muxer_rxq::MuxerRxQ;
-use super::{Error, MuxerConnection, Result, defs};
+use super::{Error, HybridStream, StreamVsock, MuxerConnection, Result, defs};
+
+use sendfd::RecvWithFd;
 
 /// A unique identifier of a `MuxerConnection` object. Connections are stored in a hash map,
 /// keyed by a `ConnMapKey` object.
@@ -76,6 +78,11 @@ pub enum MuxerRx {
     RstPkt { local_port: u32, peer_port: u32 },
 }
 
+enum ReadPortResult {
+    PassFd,
+    Connect(u32),
+}
+
 /// An epoll listener, registered under the muxer's nested epoll FD.
 ///
 enum EpollListener {
@@ -91,6 +98,9 @@ enum EpollListener {
     /// A listener interested in reading host "connect \<port>" commands from a freshly
     /// connected host socket.
     LocalStream(UnixStream),
+    /// A listener interested in recvmsg from host to get the <port> and a
+    /// socket/pipe fd.
+    PassFdStream(UnixStream),
 }
 
 const PARTIALLY_READ_COMMAND_BUF_SIZE: usize = 32;
@@ -273,6 +283,33 @@ impl VsockChannel for VsockMuxer {
 
         // Alright, everything looks in order - forward this packet to its owning connection.
         let mut res: VsockResult<()> = Ok(());
+
+        // For the hybrid connection, if it want to keep the connection
+        // when the pipe peer closed, here it needs to update the epoll
+        // listener to catch the events.
+        let mut listener = None;
+        let conn = self.conn_map.get_mut(&conn_key).unwrap();
+        let pre_state = conn.state();
+        let nfd: RawFd = conn.stream.as_raw_fd();
+
+        if pre_state == ConnState::LocalClosed && conn.keep() {
+            conn.state = ConnState::Established;
+            listener = Some(EpollListener::Connection {
+                key: conn_key,
+                evset: conn.get_polled_evset(),
+            });
+        }
+
+        if let Some(nlistener) = listener {
+            self.add_listener(nfd, nlistener).unwrap_or_else(|err| {
+                self.kill_connection(conn_key);
+                warn!(
+                    "vsock: error updating epoll listener for (lp={}, pp={}): {:?}",
+                    conn_key.local_port, conn_key.peer_port, err
+                );
+            });
+        }
+
         self.apply_conn_mutation(conn_key, |conn| {
             res = conn.send_pkt(pkt);
         });
@@ -409,6 +446,22 @@ impl VsockMuxer {
             //
             Some(EpollListener::Connection { key, evset: _ }) => {
                 let key_copy = *key;
+
+                // If the hybrid connection's local peer closed, then the epoll handler wouldn't
+                // get the epollout event even when it's reopened again, thus it should be notified
+                // when the guest send any data to try to active the epoll handler to generate the
+                // epollout event for this connection.
+
+                let mut need_rm = false;
+                if let Some(conn) = self.conn_map.get_mut(&key_copy) {
+                    if event_set.contains(epoll::Events::EPOLLERR) && conn.keep() {
+                        conn.state = ConnState::LocalClosed;
+                        need_rm = true;
+                    }
+                }
+                if need_rm {
+                    self.remove_listener(fd);
+                }
                 // The handling of this event will most probably mutate the state of the
                 // receiving connection. We'll need to check for new pending RX, event set
                 // mutation, and all that, so we're wrapping the event delivery inside those
@@ -475,8 +528,54 @@ impl VsockMuxer {
                         _ => unreachable!(),
                     };
 
-                    port.and_then(|peer_port| {
-                        let local_port = self.allocate_local_port();
+                    port.and_then(|read_port_result| match read_port_result {
+                        ReadPortResult::Connect(peer_port) => {
+                            let local_port = self.allocate_local_port();
+                            self.add_connection(
+                                ConnMapKey {
+                                    local_port,
+                                    peer_port,
+                                },
+                                MuxerConnection::new_local_init(
+                                    StreamVsock::UnixStream(stream),
+                                    uapi::VSOCK_HOST_CID,
+                                    self.cid,
+                                    local_port,
+                                    peer_port,
+                                    false,
+                                ),
+                            )
+                        }
+                        ReadPortResult::PassFd => self.add_listener(
+                            stream.as_raw_fd(),
+                            EpollListener::PassFdStream(stream),
+                        ),
+                    })
+                    .unwrap_or_else(|err| {
+                        info!("vsock: error adding local-init connection: {err:?}");
+                    });
+                }
+            }
+
+            Some(EpollListener::PassFdStream(_)) => {
+                if let Some(EpollListener::PassFdStream(mut stream)) = self.remove_listener(fd) {
+                    Self::passfd_read_port_and_fd(&mut stream)
+                        .map(|(nfd, peer_port, keep)| {
+                            (nfd, self.allocate_local_port(), peer_port, keep)
+                        })
+                        .and_then(|(nfd, local_port, peer_port, keep)| {
+                        // Here we should make sure the nfd the sole owner to convert it
+                        // into an UnixStream object, otherwise, it could cause memory unsafety.
+                        let nstream = unsafe { File::from_raw_fd(nfd) };
+
+                        let hybridstream = HybridStream {
+                            hybrid_stream: nstream,
+                            slave_stream: Some(stream),
+                        };
+
+                        let mut stream_vsock  = StreamVsock::HybridStream(hybridstream);
+
+                        stream_vsock.set_nonblocking(true).unwrap();
 
                         self.add_connection(
                             ConnMapKey {
@@ -484,17 +583,21 @@ impl VsockMuxer {
                                 peer_port,
                             },
                             MuxerConnection::new_local_init(
-                                stream,
+                                stream_vsock,
                                 uapi::VSOCK_HOST_CID,
                                 self.cid,
                                 local_port,
                                 peer_port,
+                                keep,
                             ),
                         )
                     })
                     .unwrap_or_else(|err| {
-                        info!("vsock: error adding local-init connection: {err:?}");
-                    });
+                        info!(
+                            "vsock: error adding local-init passthrough fd connection: {:?}",
+                            err
+                        );
+                    })
                 }
             }
 
@@ -504,22 +607,37 @@ impl VsockMuxer {
         }
     }
 
-    fn parse_port_from_read_command(command: &PartiallyReadCommand) -> Result<u32> {
+    fn parse_port_from_read_command(command: &PartiallyReadCommand) -> Result<ReadPortResult> {
         // normally followed by the port and a `\n`
         let connect_prefix: &str = "connect ";
+        let passfd_prefix: &str = "passfd";
 
         let opt_new_line_position = command.buf[..command.len].iter().position(|x| *x == b'\n');
 
-        // we need to read more to get a `connect ` statement
-        if command.len < connect_prefix.len() {
+        // we need to read more to determine the command type
+        if command.len < passfd_prefix.len() {
             return match opt_new_line_position {
                 Some(_) => Err(Error::InvalidPortRequest),
                 None => Err(Error::UnixRead(std::io::ErrorKind::WouldBlock.into())),
             };
         }
 
-        // check for both upper and lower case connect statements
-        if !command.buf[..connect_prefix.len()].eq_ignore_ascii_case(connect_prefix.as_bytes()) {
+        let is_passfd = command.buf[..passfd_prefix.len()]
+            .eq_ignore_ascii_case(passfd_prefix.as_bytes());
+
+        if is_passfd {
+            if opt_new_line_position.is_some() {
+                return Ok(ReadPortResult::PassFd);
+            }
+            if command.buf.len() == command.len {
+                return Err(Error::InvalidPortRequest);
+            }
+            return Err(Error::UnixRead(std::io::ErrorKind::WouldBlock.into()));
+        }
+
+        // not passfd, check if it's a valid connect statement
+        if command.len < connect_prefix.len() ||
+           !command.buf[..connect_prefix.len()].eq_ignore_ascii_case(connect_prefix.as_bytes()) {
             return Err(Error::InvalidPortRequest);
         }
 
@@ -535,11 +653,13 @@ impl VsockMuxer {
         // we now have the newline, we will treat everything in between as the port
         let port_string_as_bytes = &command.buf[connect_prefix.len()..new_line_position];
 
-        std::str::from_utf8(port_string_as_bytes)
+        let port = std::str::from_utf8(port_string_as_bytes)
             .map_err(|_| Error::InvalidPortRequest)?
             .trim()
             .parse::<u32>()
-            .map_err(|_| Error::InvalidPortRequest)
+            .map_err(|_| Error::InvalidPortRequest)?;
+
+        Ok(ReadPortResult::Connect(port))
     }
 
     /// Parse a host "connect" command, and extract the destination vsock port.
@@ -547,30 +667,68 @@ impl VsockMuxer {
     fn read_local_stream_port(
         command: &mut PartiallyReadCommand,
         stream: &mut UnixStream,
-    ) -> Result<u32> {
-        // the minimum connect statement that is still valid
-        let connect_min_statement: &str = "connect 0\n";
+    ) -> Result<ReadPortResult> {
+        // the minimum prefix length to distinguish between "connect " and "passfd"
+        let min_prefix_len: usize = "passfd".len().min("connect ".len());
 
-        // read the amount of bytes that are required for a valid connect
-        // with the minimum length (`connect_min_statement`).
-        // Then, continue with reading a single byte at a time, this is
-        // really inefficient but prevents us to read past the `\n` character
-        // which might swallow actual application data
-        // alternative: the bytes that might have been read beyond `\n` would need
-        // to be sent somehow via `MuxerConnection` prior to reading from `stream` again
-        // Another, currently unstable alternative: use UnixStream::peak to read the
-        // data without removing it from the queue.
-        // Issue: https://github.com/rust-lang/rust/issues/76923
-        let read_bytes = stream
-            .read(&mut command.buf[command.len..max(connect_min_statement.len(), command.len + 1)])
+        // first, read enough bytes to determine the command type
+        if command.len < min_prefix_len {
+            let read_bytes = stream
+                .read(&mut command.buf[command.len..min_prefix_len])
+                .map_err(Error::UnixRead)?;
+
+            if read_bytes == 0 {
+                return Err(Error::InvalidPortRequest);
+            }
+
+            command.len += read_bytes;
+
+            if command.len < min_prefix_len {
+                return Err(Error::UnixRead(std::io::ErrorKind::WouldBlock.into()));
+            }
+        }
+
+        // then, continue reading one byte at a time until we reach `\n`,
+        // this is inefficient but prevents us from reading past the `\n`
+        // character which might swallow actual application data
+        while command.buf[command.len - 1] != b'\n' && command.len < command.buf.len() {
+            let read_bytes = stream
+                .read(&mut command.buf[command.len..=command.len])
+                .map_err(Error::UnixRead)?;
+
+            if read_bytes == 0 {
+                return Err(Error::InvalidPortRequest);
+            }
+
+            command.len += read_bytes;
+        }
+
+        Self::parse_port_from_read_command(command)
+    }
+
+    fn passfd_read_port_and_fd(stream: &mut UnixStream) -> Result<(RawFd, u32, bool)> {
+        let mut buf: [u8; 32] = [0u8; 32];
+        let mut fds = [0, 1];
+        let (data_len, fd_len) = stream
+            .recv_with_fd(&mut buf, &mut fds)
             .map_err(Error::UnixRead)?;
 
-        if read_bytes == 0 {
+        if fd_len != 1 || fds[0] <= 0 {
             return Err(Error::InvalidPortRequest);
         }
 
-        command.len += read_bytes;
-        Self::parse_port_from_read_command(command)
+        let mut port_iter = std::str::from_utf8(&buf[..data_len])
+            .map_err(|_| Error::InvalidPortRequest)?
+            .split_whitespace();
+
+        let port = port_iter
+            .next()
+            .ok_or(Error::InvalidPortRequest)
+            .and_then(|word| word.parse::<u32>().map_err(|_| Error::InvalidPortRequest))?;
+
+        let keep = port_iter.next().is_some_and(|kp| kp == "keep");
+
+        Ok((fds[0], port, keep))
     }
 
     /// Add a new connection to the active connection pool.
@@ -645,6 +803,7 @@ impl VsockMuxer {
             EpollListener::Connection { evset, .. } => evset,
             EpollListener::LocalStream(_) => epoll::Events::EPOLLIN,
             EpollListener::HostSock => epoll::Events::EPOLLIN,
+            EpollListener::PassFdStream(_) => epoll::Events::EPOLLIN,
         };
 
         epoll::ctl(
@@ -724,12 +883,13 @@ impl VsockMuxer {
                         peer_port: pkt.src_port(),
                     },
                     MuxerConnection::new_peer_init(
-                        stream,
+                        StreamVsock::UnixStream(stream),
                         uapi::VSOCK_HOST_CID,
                         self.cid,
                         pkt.dst_port(),
                         pkt.src_port(),
                         pkt.buf_alloc(),
+                        false,
                     ),
                 )
             })
@@ -821,7 +981,7 @@ impl VsockMuxer {
                         );
                     });
                 }
-            } else {
+            } else if conn.state() != ConnState::LocalClosed {
                 // The connection had previously asked to be removed from the listener map (by
                 // returning an empty event set via `get_polled_fd()`), but now wants back in.
                 self.add_listener(
