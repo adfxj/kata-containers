@@ -226,6 +226,7 @@ impl RuntimeHandlerManagerInner {
         // set netns to None if we want no network for the VM
         if config.runtime.disable_new_netns || dan_path.exists() {
             sandbox_config.network_env.netns = None;
+            sandbox_config.network_env.network_created = false;
         }
 
         self.init_runtime_handler(sandbox_config, Arc::new(config), initial_size_manager)
