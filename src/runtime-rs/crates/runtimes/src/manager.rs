@@ -189,6 +189,14 @@ impl RuntimeHandlerManagerInner {
             // This makes it inaccessible to non-root users. We need to create a non-root accessible
             // netns and replace the original network namespace path in the config.
             if sandbox_config.network_env.network_created {
+                // Remove the root-owned netns created earlier before creating
+                // a rootless replacement, otherwise the original leaks under
+                // /var/run/netns/.
+                if let Some(ref old_netns_path) = sandbox_config.network_env.netns {
+                    if let Ok(ns) = netns_rs::get_from_path(old_netns_path.clone()) {
+                        let _ = ns.remove();
+                    }
+                }
                 let ns_name = generate_netns_name();
                 let rootless_raw_netns = NetNs::new_with_env(ns_name, RootlessEnv)?;
                 let path = Some(
@@ -225,6 +233,15 @@ impl RuntimeHandlerManagerInner {
         let dan_path = dan_config_path(&config, &self.id);
         // set netns to None if we want no network for the VM
         if config.runtime.disable_new_netns || dan_path.exists() {
+            // Clean up the netns that was physically created earlier if we
+            // are not going to use it, otherwise it leaks under /var/run/netns/.
+            if sandbox_config.network_env.network_created {
+                if let Some(ref netns_path) = sandbox_config.network_env.netns {
+                    if let Ok(ns) = netns_rs::get_from_path(netns_path.clone()) {
+                        let _ = ns.remove();
+                    }
+                }
+            }
             sandbox_config.network_env.netns = None;
             sandbox_config.network_env.network_created = false;
         }
