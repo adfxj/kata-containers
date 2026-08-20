@@ -57,9 +57,6 @@ pub trait Sandbox: Send + Sync {
     // between the Create and Start RPCs.
     async fn rescan_network(&self) -> Result<()>;
 
-    async fn resize_vcpu(&self, old_vcpu: u32, new_vcpu: u32) -> Result<()>;
-    async fn resize_memory(&self, new_mem_mb: u32) -> Result<()>;
-
     // metrics function
     async fn agent_metrics(&self) -> Result<String>;
     async fn hypervisor_metrics(&self) -> Result<String>;

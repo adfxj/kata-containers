@@ -8,7 +8,7 @@ use crate::health_check::HealthCheck;
 use agent::kata::KataAgent;
 use agent::types::{KernelModule, SetPolicyRequest};
 use agent::{
-    self, Agent, GetGuestDetailsRequest, GetIPTablesRequest, OnlineCPUMemRequest,
+    self, Agent, GetGuestDetailsRequest, GetIPTablesRequest,
     SetGuestDateTimeRequest, SetIPTablesRequest, VolumeStatsRequest,
 };
 use anyhow::{anyhow, Context, Result};
@@ -863,18 +863,6 @@ impl Sandbox for VirtSandbox {
 
         let hypervisor_config = self.hypervisor.hypervisor_config().await;
         if hypervisor_config.vm_template.boot_from_template {
-            if hypervisor_config.memory_info.default_memory > 128 {
-                if let Err(error) = self.resize_memory(hypervisor_config.memory_info.default_memory).await {
-                    error!(sl!(), "resize memory error: {:?}", error);
-                }
-            }
-
-            if hypervisor_config.cpu_info.default_vcpus > 1.0 {
-                if let Err(error) = self.resize_vcpu(1, hypervisor_config.cpu_info.default_vcpus as u32).await {
-                    error!(sl!(), "resize vcpu error: {:?}", error);
-                }
-            }
-
             let mut guest_date_time = SetGuestDateTimeRequest::default();
             guest_date_time.sec = SystemTime::now().duration_since(UNIX_EPOCH).context("get system time")?.as_secs() as i64;
             guest_date_time.usec = SystemTime::now().duration_since(UNIX_EPOCH).context("get system time")?.subsec_micros() as i64;
@@ -1044,30 +1032,6 @@ impl Sandbox for VirtSandbox {
             info!(sl!(), "sandbox stopped");
         }
 
-        Ok(())
-    }
-
-    async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<()> {
-        info!(sl!(), "begin resize vcpu");
-        self.hypervisor.resize_vcpu(old_vcpus, new_vcpus).await.context("failed to resize")?;
-        let req = OnlineCPUMemRequest {
-            wait: false,
-            nb_cpus: new_vcpus,
-            cpu_only: false,
-        };
-        self.agent.online_cpu_mem(req).await.context("online vcpus")?;
-        Ok(())
-    }
-
-    async fn resize_memory(&self, new_mem_mb: u32) -> Result<()> {
-        info!(sl!(), "begin resize memory");
-        self.hypervisor.resize_memory(new_mem_mb).await.context("failed to resize")?;
-        let req = OnlineCPUMemRequest {
-            wait: false,
-            nb_cpus: 0,
-            cpu_only: false,
-        };
-        self.agent.online_cpu_mem(req).await.context("online memory")?;
         Ok(())
     }
 

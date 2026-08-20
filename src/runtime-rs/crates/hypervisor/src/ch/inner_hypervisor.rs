@@ -230,6 +230,15 @@ impl CloudHypervisorInner {
 
         self.vmm_instance.vm_restore(cfg).await.context("failed to restore vm")?;
 
+        // should resize cpu and memory firstly
+        if self.config.cpu_info.default_vcpus > 1.0 {
+            self.resize_vcpu(1, self.config.cpu_info.default_vcpus.ceil() as u32).await.context("failed to resize cpu")?;
+        }
+
+        if self.config.memory_info.default_memory > VM_TEMPLATE_SIZE {
+            self.resize_memory(self.config.memory_info.default_memory).await.context("failed to resize memory")?;
+        }
+
         if let Some(mut net_configs) = network_devices {
             while let Some(net_config) = net_configs.pop() {
                 self.vmm_instance.vm_add_net(net_config).await.context("attach net")?;
