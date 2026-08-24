@@ -7,7 +7,7 @@ use std::convert::TryFrom;
 use std::path::{PathBuf, Path};
 use serde::{Deserialize, Serialize};
 use crate::ch::errors::*;
-use crate::ch::utils::guest_protection_is_tdx;
+use crate::ch::utils::{guest_protection_is_tdx, OVERLAY_BLOCK_ID};
 use kata_sys_util::protection::GuestProtection;
 use kata_types::config::default::DEFAULT_CH_ENTROPY_SOURCE;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
@@ -15,7 +15,7 @@ use kata_types::config::hypervisor::{
     CpuInfo, MachineInfo, MemoryInfo, VIRTIO_PMEM, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI,
 };
 use kata_types::config::BootInfo;
-use vmm::config::{ImageType, RestoreConfig};
+use vmm::config::{ImageType, RestoreConfig, RestoreDiskConfig};
 use vmm::vm_config::{
     BalloonConfig, CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig,
     CpuTopology, DeviceConfig, DiskConfig, FsConfig, MemoryConfig, PayloadConfig,
@@ -53,6 +53,7 @@ pub struct NamedHypervisorConfig {
     pub shared_fs_devices: Option<Vec<FsConfig>>,
     pub network_devices: Option<Vec<NetConfig>>,
     pub host_devices: Option<Vec<DeviceConfig>>,
+    pub overlay_block_devices: Option<Vec<DiskConfig>>,
 
     // Set to the available guest protection *iff* BOTH of the following
     // conditions are true:
@@ -210,6 +211,9 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             disks.push(disk);
         };
 
+        if let Some(overlay_block_devices) = n.overlay_block_devices {
+            disks.extend(overlay_block_devices);
+        }
         let disks = if !disks.is_empty() { Some(disks) } else { None };
 
         let serial = get_serial_cfg(debug, guest_protection_to_use.clone());
@@ -697,13 +701,15 @@ impl TryFrom<PmemConfigInner> for PmemConfig {
 }
 
 pub struct RestoreConfigInner {
+    pub overlay_block_devices: Option<Vec<DiskConfig>>,
     pub restore_path: Option<String>,
     pub vsock_path: String,
 }
 
 impl RestoreConfigInner {
-    pub fn new(restore_path: Option<String>, vsock_path: String) -> Self {
+    pub fn new(overlay_block_devices: Option<Vec<DiskConfig>>, restore_path: Option<String>, vsock_path: String) -> Self {
         Self {
+            overlay_block_devices,
             restore_path,
             vsock_path,
         }
@@ -720,12 +726,28 @@ impl TryFrom<RestoreConfigInner> for RestoreConfig {
         }
 
         if r.vsock_path.is_empty() {
-                return Err(RestoreConfigError::MissingVsockPath);
+            return Err(RestoreConfigError::MissingVsockPath);
         }
+
+        let mut disks = vec![];
+        if let Some(overlay_block_devices) = r.overlay_block_devices {
+            for d in overlay_block_devices {
+                let disk = RestoreDiskConfig {
+                    id: OVERLAY_BLOCK_ID.to_string(),
+                    path: d.path.unwrap(),
+                    ..Default::default()
+                };
+                disks.push(disk);
+            }
+        }
+
+        let disks = if !disks.is_empty() { Some(disks) } else { None };
+
         let cfg = RestoreConfig {
             source_url: PathBuf::from(restore_path),
             vsock_socket: Some(PathBuf::from(r.vsock_path.clone())),
             resume: true,
+            disks,
             ..Default::default()
         };
 

@@ -156,6 +156,15 @@ pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_VHOSTUSER_STORE: &str =
 pub const KATA_ANNO_CFG_HYPERVISOR_VHOSTUSER_STORE_PATH: &str =
     "io.katacontainers.config.hypervisor.vhost_user_store_path";
 
+// Hypervisor OverlayFS related annotations
+/// A sandbox annotation for passing a container guest overlayfs template disk image file path
+/// it must be a valid ext4 filesystem image in xfs format.
+pub const KATA_ANNO_CFG_HYPERVISOR_OVERLAYFS_TEMPLATE_PATH: &str =
+    "io.katacontainers.config.hypervisor.overlayfs_template_path";
+/// A sandbox annotation for passing a container guest overlayfs template disk image size in bytes.
+pub const KATA_ANNO_CFG_HYPERVISOR_OVERLAYFS_TEMPLATE_SIZE: &str =
+    "io.katacontainers.config.hypervisor.overlayfs_template_size";
+
 // Hypervisor Guest Boot related annotations
 /// A sandbox annotation for passing a per container path pointing at the kernel needed to boot
 /// the container VM.
@@ -709,6 +718,21 @@ impl Annotation {
                     KATA_ANNO_CFG_HYPERVISOR_VHOSTUSER_STORE_PATH => {
                         hv.blockdev_info.validate_vhost_user_store_path(value)?;
                         hv.blockdev_info.vhost_user_store_path = value.to_string();
+                    }
+                    // Hypervisor OverlayFS related annotations
+                    KATA_ANNO_CFG_HYPERVISOR_OVERLAYFS_TEMPLATE_PATH => {
+                        crate::config::hypervisor::validate_overlayfs_template_path(value)?;
+                        hv.overlayfs_template_path = Some(value.to_string());
+                    }
+                    KATA_ANNO_CFG_HYPERVISOR_OVERLAYFS_TEMPLATE_SIZE => {
+                        match self.get_value::<u64>(key) {
+                            Ok(r) => {
+                                hv.overlayfs_template_size = r.unwrap_or_default();
+                            }
+                            Err(_e) => {
+                                return Err(u64_err);
+                            }
+                        }
                     }
                     // Hypervisor Guest Boot related annotations
                     KATA_ANNO_CFG_HYPERVISOR_KERNEL_PATH => {

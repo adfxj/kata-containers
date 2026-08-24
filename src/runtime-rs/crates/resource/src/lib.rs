@@ -37,6 +37,7 @@ pub enum ResourceConfig {
     Network(NetworkConfig),
     ShareFs(SharedFsInfo),
     VmRootfs(BlockConfig),
+    OverlayfsTemplateBlock(BlockConfig),
     HybridVsock(HybridVsockConfig),
     Vsock(VsockConfig),
     Protection(ProtectionDeviceConfig),

@@ -178,8 +178,8 @@ impl DeviceManager {
         Ok(())
     }
 
-    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
-        self.hypervisor.get_overlayfs_block_device().await
+    async fn get_overlayfs_block_device(&self, flags: bool) -> Option<DeviceType> {
+        self.hypervisor.get_overlayfs_block_device(flags).await
     }
 
     pub async fn try_remove_device(&mut self, device_id: &str) -> Result<()> {
@@ -705,8 +705,8 @@ pub async fn do_handle_device(
     Ok(device_info)
 }
 
-pub async fn get_overlayfs_block_device(d: &RwLock<DeviceManager>) -> Option<DeviceType> {
-    d.read().await.get_overlayfs_block_device().await
+pub async fn get_overlayfs_block_device(d: &RwLock<DeviceManager>, flags: bool) -> Option<DeviceType> {
+    d.read().await.get_overlayfs_block_device(flags).await
 }
 
 pub async fn do_update_device(

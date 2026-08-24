@@ -194,7 +194,7 @@ impl Hypervisor for Remote {
         Err(anyhow::anyhow!("Not yet supported"))
     }
 
-    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
+    async fn get_overlayfs_block_device(&self, _flags: bool) -> Option<DeviceType> {
         None
     }
 }

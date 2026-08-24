@@ -185,6 +185,11 @@ block_device_driver = "virtio-blk-pci"
 # Default false
 block_device_cache_direct = false
 
+# Block storage template to be used as read-write part of overlayfs which
+# used as rootfs of containers and it must be a valid ext4 filesystem image in 
+# xfs format.
+overlayfs_template_path = ""
+
 # Bandwidth rate limiter options
 #
 # disk_rate_limiter_bw_max_rate controls disk I/O bandwidth (size in bits/sec
@@ -263,7 +268,7 @@ enable_mem_prealloc = false
 # to enable debug output where available.
 #
 # Default false
-#enable_debug = true
+enable_debug = false
 
 # The log level will be applied to hypervisor.
 # Possible values are:
@@ -274,7 +279,7 @@ enable_mem_prealloc = false
 # - error
 # - critical
 # Default: info
-#log_level = info
+log_level = "info"
 
 # Enable running clh VMM as a non-root user.
 # By default clh VMM run as root. When this is set to true, clh VMM process runs as

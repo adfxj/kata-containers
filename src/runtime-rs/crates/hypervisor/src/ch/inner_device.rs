@@ -19,7 +19,8 @@ use crate::{
 };
 use anyhow::{anyhow, Context, Result};
 use super::convert::DEFAULT_NUM_PCI_SEGMENTS;
-use crate::ch::utils::PciDeviceInfo;
+use crate::ch::utils::{get_parent_dir, OVERLAY_BLOCK_ID, PciDeviceInfo};
+use kata_sys_util::fs::reflink_copy;
 use kata_types::config::hypervisor::DEFAULT_RATE_LIMITER_REFILL_TIME;
 use vmm::api::VmRemoveDeviceData;
 use vmm::config::ImageType;
@@ -63,6 +64,16 @@ impl CloudHypervisorInner {
             // - Network details need to be saved for later application.
             //
             match device {
+                DeviceType::Block(ref dev) => {
+                    if dev.config.is_overlayfs {
+                        self.pending_devices.insert(0, device.clone()); 
+                    } else {
+                        debug!(
+                            sl!(),
+                            "ignoring early add device request for none overlayfs block device: {device}"
+                        );
+                    }
+                },
                 DeviceType::ShareFs(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
@@ -71,7 +82,7 @@ impl CloudHypervisorInner {
                 _ => {
                     debug!(
                         sl!(),
-                        "ignoring early add device request for device: {:?}", device
+                        "ignoring early add device request for device: {device}"
                     );
                 }
             }
@@ -408,8 +419,11 @@ impl CloudHypervisorInner {
 
     async fn handle_block_device(&mut self, device: BlockDevice) -> Result<DeviceType> {
         let mut block_dev = device.clone();
+        let mut device_config = device.config.clone();
+        device_config.num_queues = self.config.blockdev_info.num_queues;
+        device_config.queue_size = self.config.blockdev_info.queue_size;
 
-        let mut disk_config = DiskConfig::try_from(device.config.clone())?;
+        let mut disk_config = DiskConfig::try_from(device_config)?;
         disk_config.direct = device
             .config
             .is_direct
@@ -507,11 +521,13 @@ impl CloudHypervisorInner {
     pub(crate) async fn get_shared_devices(
         &mut self,
     ) -> Result<(
+        Option<Vec<DiskConfig>>,
         Option<Vec<FsConfig>>,
         Option<Vec<NetConfig>>,
         Option<Vec<DeviceConfig>>,
         Option<ProtectionDevConfig>,
     )> {
+        let mut overlay_block_devices = Vec::<DiskConfig>::new();
         let mut shared_fs_devices = Vec::<FsConfig>::new();
         let mut network_devices = Vec::<NetConfig>::new();
         let mut host_devices = Vec::<DeviceConfig>::new();
@@ -519,6 +535,25 @@ impl CloudHypervisorInner {
 
         while let Some(dev) = self.pending_devices.pop() {
             match dev {
+                DeviceType::Block(block_dev) => {
+                    // For overlayfs block device, we need to reflink_copy the template block to the new block
+                    let mut overlay_block_device = block_dev.clone();
+                    let parent_dir = get_parent_dir(&overlay_block_device.config.path_on_host).unwrap_or_default();
+                    let dst_template_storage = format!("{}/{}.img", parent_dir, overlay_block_device.device_id);
+                    // reflink_copy
+                    reflink_copy(&overlay_block_device.config.path_on_host, &dst_template_storage).context(format!(
+                        "reflink copy from {} to {}", overlay_block_device.config.path_on_host, dst_template_storage))?;
+
+                    overlay_block_device.config.path_on_host = dst_template_storage;
+
+                    let mut overlay_block_device_config = overlay_block_device.config.clone();
+                    overlay_block_device_config.num_queues = self.config.blockdev_info.num_queues;
+                    overlay_block_device_config.queue_size = self.config.blockdev_info.queue_size;
+
+                    let disk_config = DiskConfig::try_from(overlay_block_device_config)?;
+                    overlay_block_devices.push(disk_config);
+                    self.overlayfs_block_device = Some(DeviceType::Block(overlay_block_device.clone()));
+                }
                 DeviceType::ShareFs(dev) => {
                     let device: ShareFsDevice = dev.clone();
                     let mut bfs_config = None;
@@ -604,6 +639,7 @@ impl CloudHypervisorInner {
         }
 
         Ok((
+            Some(overlay_block_devices),
             Some(shared_fs_devices),
             Some(network_devices),
             Some(host_devices),
@@ -753,6 +789,7 @@ impl TryFrom<BlockConfig> for DiskConfig {
             queue_size: blkcfg.queue_size as u16,
             image_type: ImageType::Raw,
             pci_common: PciDeviceCommonConfig {
+                id: if blkcfg.is_overlayfs { Some(OVERLAY_BLOCK_ID.to_string()) } else { None },
                 ..Default::default()
             },
             direct: blkcfg.is_direct.unwrap_or_default(),

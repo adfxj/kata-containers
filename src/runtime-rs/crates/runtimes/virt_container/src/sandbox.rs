@@ -10,6 +10,7 @@ use agent::types::{KernelModule, SetPolicyRequest};
 use agent::{
     self, Agent, GetGuestDetailsRequest, GetIPTablesRequest,
     SetGuestDateTimeRequest, SetIPTablesRequest, VolumeStatsRequest,
+    ResizeVolumeRequest,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -48,6 +49,7 @@ use kata_hypervisor::{
     HybridVsockConfig, DEFAULT_GUEST_VSOCK_CID,
 };
 use kata_hypervisor::{BlockConfig, Hypervisor};
+use kata_hypervisor::device::DeviceType;
 use kata_hypervisor::{BlockDeviceAio, PortDeviceConfig};
 use kata_hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
 use kata_sys_util::hooks::HookStates;
@@ -216,6 +218,16 @@ impl VirtSandbox {
         {
             let vm_rootfs = ResourceConfig::VmRootfs(block_config);
             resource_configs.push(vm_rootfs);
+        }
+        
+        // prepare overlayfs template block device config
+        if let Some(block_config) = self
+            .prepare_overlayfs_template_block_config()
+            .await
+            .context("failed to prepare overlayfs template block device config")?
+        {
+            let overlayfs_template_block = ResourceConfig::OverlayfsTemplateBlock(block_config);
+            resource_configs.push(overlayfs_template_block);
         }
 
         // prepare protection device config
@@ -522,6 +534,20 @@ impl VirtSandbox {
             driver_option: boot_info.vm_rootfs_driver,
             ..Default::default()
         }))
+    }
+
+    async fn prepare_overlayfs_template_block_config(&self) -> Result<Option<BlockConfig>> {
+        let overlayfs_template_path = self.hypervisor.hypervisor_config().await.overlayfs_template_path;
+        if let Some(overlayfs_template_path) = overlayfs_template_path {
+            return Ok(Some(BlockConfig {
+                path_on_host: overlayfs_template_path.clone(),
+                driver_option: kata_types::config::default::DEFAULT_BLOCK_DEVICE_TYPE.to_string(),
+                is_overlayfs: true,
+                ..Default::default()
+            }));
+        }
+
+        Ok(None)
     }
 
     async fn set_agent_policy(&self) -> Result<()> {
@@ -862,6 +888,20 @@ impl Sandbox for VirtSandbox {
             .context("setup device after start vm")?;
 
         let hypervisor_config = self.hypervisor.hypervisor_config().await;
+        if hypervisor_config.overlayfs_template_size > 0 &&
+            let Some(DeviceType::Block(block_dev)) = self.hypervisor.get_overlayfs_block_device(false).await {
+            let virt_path = block_dev.config.virt_path;
+            if !virt_path.is_empty() {
+                let resize_req = ResizeVolumeRequest {
+                    volume_guest_path: virt_path,
+                    size: hypervisor_config.overlayfs_template_size,
+                };
+                if let Err(e) = self.agent.resize_volume(resize_req).await {
+                    error!(sl!(), "resize overlayfs block device failed: {:?}", e);
+                }
+            }
+        }
+
         if hypervisor_config.vm_template.boot_from_template {
             let mut guest_date_time = SetGuestDateTimeRequest::default();
             guest_date_time.sec = SystemTime::now().duration_since(UNIX_EPOCH).context("get system time")?.as_secs() as i64;

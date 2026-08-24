@@ -15,7 +15,7 @@ mod block_rootfs;
 mod erofs_rootfs;
 pub mod virtual_volume;
 
-use kata_hypervisor::{device::device_manager::DeviceManager, Hypervisor};
+use kata_hypervisor::{device::device_manager::{DeviceManager, get_overlayfs_block_device}, Hypervisor};
 use virtual_volume::{is_kata_virtual_volume, VirtualVolume};
 
 use std::{collections::HashMap, sync::Arc, vec::Vec};
@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 
 use self::{
     block_rootfs::is_block_rootfs, erofs_rootfs::ErofsMultiLayerRootfs,
-    nydus_rootfs::NYDUS_ROOTFS_TYPE, overlay_rootfs::{OVERLAY_ROOTFS_TYPE, OVERLAY_ROOTFS_SIZE},
+    nydus_rootfs::NYDUS_ROOTFS_TYPE,
 };
 use crate::{rootfs::erofs_rootfs::is_erofs_multi_layer, share_fs::ShareFs};
 use oci_spec::runtime as oci;
@@ -80,23 +80,15 @@ impl RootFsResource {
             // if rootfs_mounts is empty
             [] => {
                 if let Some(share_fs) = share_fs {
-                    if let Some(template_storage) = annotations.get(OVERLAY_ROOTFS_TYPE) {
-                        let dst_storage_size = if let Some(dst_size) = annotations.get(OVERLAY_ROOTFS_SIZE) {
-                            let size: u64 = dst_size.parse().expect("Failed to parse number");
-                            size
-                        } else {
-                            0u64
-                        };
+                    if let Some(block_dev) = get_overlayfs_block_device(device_manager, true).await {
                         Ok(Arc::new(
                             overlay_rootfs::OverlayRootfs::new(
-                                device_manager,
                                 share_fs,
                                 cid,
                                 sid,
                                 root.path().display().to_string().as_str(),
                                 None,
-                                template_storage,
-                                dst_storage_size,
+                                block_dev,
                             )
                             .await
                             .context("new overlay rootfs")?,
@@ -172,23 +164,15 @@ impl RootFsResource {
                             .await
                             .context("new nydus rootfs")?,
                         )
-                    } else if let Some(template_storage) = annotations.get(OVERLAY_ROOTFS_TYPE) {
-                        let dst_storage_size = if let Some(dst_size) = annotations.get(OVERLAY_ROOTFS_SIZE) {
-                            let size: u64 = dst_size.parse().expect("Failed to parse number");
-                            size
-                        } else {
-                            0u64
-                        };
+                    } else if let Some(block_dev) = get_overlayfs_block_device(device_manager, true).await {
                         Arc::new(
                             overlay_rootfs::OverlayRootfs::new(
-                                device_manager,
                                 share_fs,
                                 cid,
                                 sid,
                                 bundle_path,
                                 Some(layer),
-                                template_storage,
-                                dst_storage_size,
+                                block_dev,
                             )
                             .await
                             .context("new overlay rootfs")?,

@@ -15,7 +15,8 @@ use tokio::time::Duration;
 use super::inner::CloudHypervisorInner;
 use super::convert::{NamedHypervisorConfig, RestoreConfigInner};
 use super::utils::{
-    get_api_socket_path, get_vsock_path, guest_protection_is_tdx
+    get_api_socket_path, get_vsock_path, guest_protection_is_tdx,
+    set_template_marker, get_template_marker, OVERLAY_BLOCK_ID,
 };
 use crate::DeviceType;
 use crate::kernel_param::KernelParams;
@@ -33,7 +34,7 @@ use kata_types::config::default::DEFAULT_CH_ROOTFS_TYPE;
 use kata_types::config::PASSFD_LISTENER_PORT;
 use lazy_static::lazy_static;
 use vmm::{
-    api::{VmmPingResponse, VmResizeData},
+    api::{VmmPingResponse, VmResizeData, VmResizeDiskData},
     SnapshotConfig,
     vm_config::VmConfig,
     config::RestoreConfig,
@@ -162,7 +163,7 @@ impl CloudHypervisorInner {
     }
 
     async fn boot_vm(&mut self) -> Result<()> {
-        let (shared_fs_devices, network_devices, host_devices, protection_device) =
+        let (overlay_block_devices, shared_fs_devices, network_devices, host_devices, protection_device) =
             self.get_shared_devices().await?;
 
         create_dir_all_with_inherit_owner(&self.vm_path.clone(), 0o750)
@@ -193,6 +194,7 @@ impl CloudHypervisorInner {
             shared_fs_devices,
             network_devices,
             host_devices,
+            overlay_block_devices: overlay_block_devices.clone(),
             protection_device,
         };
 
@@ -208,12 +210,26 @@ impl CloudHypervisorInner {
         self.vmm_instance.create_vm_instance(cfg).await.context("failed to create vm")?;
 
         self.vmm_instance.start_vm_instance().await.context("failed to start vm")?;
+
+        // rm overlayfs template block and resize disk if necessary
+        if overlay_block_devices.is_some() {
+            if let Some(overlay_block_device) = overlay_block_devices.unwrap().pop() {
+                if self.config.overlayfs_template_size > 0 {
+                    let resize_disk_data = VmResizeDiskData {
+                        id: OVERLAY_BLOCK_ID.to_string(),
+                        desired_size: self.config.overlayfs_template_size,
+                    };
+                    self.vmm_instance.vm_resize_disk(resize_disk_data).await.context("failed to resize disk")?;
+                }
+                let _ = std::fs::remove_file(&overlay_block_device.path.unwrap());
+            }
+        }
  
         Ok(())
     }
 
     async fn boot_from_template(&mut self) -> Result<()> {
-        let (_shared_fs_devices, network_devices, host_devices, _protection_device) =
+        let (overlay_block_devices, _shared_fs_devices, network_devices, host_devices, _protection_device) =
             self.get_shared_devices().await?;
 
         create_dir_all_with_inherit_owner(self.vm_path.clone(), 0o750)
@@ -221,7 +237,12 @@ impl CloudHypervisorInner {
 
         info!(sl!(), "Boot from template");
 
+        let is_overlayfs_template = get_template_marker(&self.config.factory.template_path);
+
+        let overlay_blk_dev = if is_overlayfs_template { overlay_block_devices.clone() } else { None };
+
         let restore_cfg = RestoreConfigInner::new(
+            overlay_blk_dev,
             Some(self.config.factory.template_path.clone()),
             get_vsock_path(&self.id)?,
         );
@@ -248,6 +269,22 @@ impl CloudHypervisorInner {
         if let Some(mut device_configs) = host_devices {
             while let Some(device_config) = device_configs.pop() {
                 self.vmm_instance.vm_add_device(device_config).await.context("attach device")?;
+            }
+        }
+
+        if let Some(mut block_devices) = overlay_block_devices {
+            while let Some(block_config) = block_devices.pop() {
+                if !is_overlayfs_template {
+                    self.vmm_instance.vm_add_disk(block_config.clone()).await.context("attach disk")?;
+                }
+                if self.config.overlayfs_template_size > 0 {
+                    let resize_disk_data = VmResizeDiskData {
+                        id: OVERLAY_BLOCK_ID.to_string(),
+                        desired_size: self.config.overlayfs_template_size,
+                    };
+                    self.vmm_instance.vm_resize_disk(resize_disk_data).await.context("failed to resize disk")?;
+                }
+                let _ = std::fs::remove_file(&block_config.path.clone().unwrap());
             }
         }
 
@@ -451,6 +488,11 @@ impl CloudHypervisorInner {
             self.vmm_instance.shutdown_vm_instance().await.context("stop")?;
         }
 
+        // rm overlayfs block device if boot failed
+        if let Some(DeviceType::Block(overlay_block_device)) = self.overlayfs_block_device.take() {
+            let _ = std::fs::remove_file(&overlay_block_device.config.path_on_host);
+        }
+
         self.vmm_instance.stop()?;
 
         self.state = VmmState::NotReady;
@@ -502,6 +544,11 @@ impl CloudHypervisorInner {
         };
 
         self.vmm_instance.vm_snapshot(snapshot_config).await.context("save vm")?;
+
+        // save file show if overlay fs is enabled
+        if self.overlayfs_block_device.is_some() {
+            set_template_marker(&self.config.factory.template_path)?;
+        }
 
         Ok(())
     }
@@ -754,9 +801,15 @@ impl CloudHypervisorInner {
             .ok();
     }
 
-    /// Get overlayfs block device
-    pub(crate) async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
-        self.overlayfs_block_device.clone()
+    /// Get overlayfs block device, flags show if it called to get by overlayfs
+    pub(crate) async fn get_overlayfs_block_device(&mut self, flags: bool) -> Option<DeviceType> {
+        self.overlayfs_block_device.as_mut().and_then(|dev| {
+            let blk_dev = dev.clone();
+            if flags && let DeviceType::Block(block_config) = dev {
+                block_config.config.is_overlayfs = false;
+            }
+            Some(blk_dev)
+        })
     }
 }
 

@@ -762,6 +762,11 @@ pub async fn wait_for_disk_device(sandbox: &Arc<Mutex<Sandbox>>, devpath: &str) 
         }
     };
 
+    let syspath = format!("/sys/block/{}", devname);
+    if fs::metadata(&syspath).is_ok() {
+        return Ok(());
+    }
+
     let matcher = BlockMatcher::new(devname);
     let uev = wait_for_uevent(sandbox, matcher).await?;
     if uev.devname != devname {

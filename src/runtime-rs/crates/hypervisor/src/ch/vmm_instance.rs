@@ -15,7 +15,7 @@ use serde::{Serialize, Deserialize};
 use signal_hook::consts::SIGSYS;
 use tokio::sync::mpsc;
 use vmm::{
-    api::{http::{http_api_graceful_shutdown, HttpApiHandle}, ApiAction, ApiRequest, VmRemoveDeviceData, VmResizeData, VmmPingResponse},
+    api::{http::{http_api_graceful_shutdown, HttpApiHandle}, ApiAction, ApiRequest, VmRemoveDeviceData, VmResizeData, VmResizeDiskData, VmmPingResponse},
     config::RestoreConfig,
     seccomp_filters::{get_seccomp_filter, Thread},
     vm_config::{DeviceConfig, DiskConfig, FsConfig, FsMountConfigInfo, NetConfig, VmConfig, VsockConfig},
@@ -384,6 +384,10 @@ impl VmmInstance {
 
     pub async fn vm_restore(&mut self, restore_config: RestoreConfig) -> Result<()> {
         self.vm_action(&vmm::api::VmRestore, restore_config).await.map(|_| ())
+    }
+
+    pub async fn vm_resize_disk(&mut self, resize_disk_data: VmResizeDiskData) -> Result<()> {
+        self.vm_action(&vmm::api::VmResizeDisk, resize_disk_data).await.map(|_| ())
     }
 }
 

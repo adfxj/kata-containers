@@ -164,5 +164,5 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn set_guest_memory_block_size(&self, size: u32);
     async fn guest_memory_block_size(&self) -> u32;
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)>;
-    async fn get_overlayfs_block_device(&self) -> Option<DeviceType>;
+    async fn get_overlayfs_block_device(&self, flags: bool) -> Option<DeviceType>;
 }

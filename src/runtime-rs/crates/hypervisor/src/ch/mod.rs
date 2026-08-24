@@ -214,9 +214,9 @@ impl Hypervisor for CloudHypervisor {
         inner.get_passfd_listener_addr().await
     }
 
-    async fn get_overlayfs_block_device(&self) -> Option<DeviceType> {
-        let inner = self.inner.read().await;
-        inner.get_overlayfs_block_device().await
+    async fn get_overlayfs_block_device(&self, flags: bool) -> Option<DeviceType> {
+        let mut inner = self.inner.write().await;
+        inner.get_overlayfs_block_device(flags).await
     }
 }
 

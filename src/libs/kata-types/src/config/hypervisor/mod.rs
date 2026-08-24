@@ -431,6 +431,18 @@ impl BlockDeviceInfo {
     }
 }
 
+/// Validate overlayfs template path.
+pub fn validate_overlayfs_template_path(path: &str) -> Result<()> {
+    validate_path!(path, "Invalid overlayfs-template-path {}: {}")?;
+    if !Path::new(path).exists() {
+        return Err(std::io::Error::other(format!(
+            "{path} does not exist"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Validate that a block device sector size is 0 or a power of 2 in [512, 65536].
 pub fn validate_block_device_sector_size(size: u32) -> Result<()> {
     if size == 0 {
@@ -1755,6 +1767,14 @@ pub struct Hypervisor {
     /// Block device configuration information.
     #[serde(default, flatten)]
     pub blockdev_info: BlockDeviceInfo,
+
+    /// Guest overlayfs template disk image file path.
+    #[serde(default)]
+    pub overlayfs_template_path: Option<String>,
+
+    /// Guest overlayfs template disk image size in bytes.
+    #[serde(default)]
+    pub overlayfs_template_size: u64,
 
     /// Guest system boot information.
     #[serde(default, flatten)]

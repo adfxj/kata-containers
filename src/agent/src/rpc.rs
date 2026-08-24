@@ -2087,6 +2087,39 @@ impl agent_ttrpc::AgentService for AgentService {
         }
         Ok(Empty::new())
     }
+
+    async fn resize_volume(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::ResizeVolumeRequest,
+    ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "resize_volume", req);
+        is_allowed(&req).await?;
+
+        do_resize_volume(&req).await.map_ttrpc_err(same)?;
+
+        Ok(Empty::new())
+    }
+}
+
+async fn do_resize_volume(req: &protocols::agent::ResizeVolumeRequest) -> Result<()> {
+    let volume_guest_path = &req.volume_guest_path;
+    if volume_guest_path.is_empty() {
+        return Err(anyhow!("volume_guest_path is empty"));
+    }
+
+    let output = std::process::Command::new("resize2fs")
+        .arg("-f")
+        .arg(volume_guest_path)
+        .output()
+        .with_context(|| format!("Failed to execute resize2fs for {}", volume_guest_path))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("resize2fs failed for {}: {}", volume_guest_path, stderr));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
