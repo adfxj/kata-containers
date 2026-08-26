@@ -21,7 +21,7 @@ use std::{io, result};
 use anyhow::anyhow;
 use block::async_io::{AsyncIo, AsyncIoError};
 use block::disk_file::AsyncFullDiskFile;
-use block::error::BlockError;
+use block::error::{BlockError, BlockResult};
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
@@ -1112,25 +1112,41 @@ impl VirtioDevice for Block {
         let mut epoll_threads = Vec::new();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
-        for i in 0..queues.len() {
-            let (_, mut queue, queue_evt) = queues.remove(0);
-            queue.set_event_idx(event_idx);
+        let queue_data: Vec<(u16, Queue, EventFd, EventFd, EventFd)> = queues
+            .drain(..)
+            .enumerate()
+            .map(|(i, (_, mut queue, queue_evt))| {
+                queue.set_event_idx(event_idx);
+                let (kill_evt, pause_evt) = self.common.dup_eventfds();
+                (i as u16, queue, queue_evt, kill_evt, pause_evt)
+            })
+            .collect();
 
-            let queue_size = queue.size();
-            let (kill_evt, pause_evt) = self.common.dup_eventfds();
-            let queue_idx = i as u16;
+        let async_ios: Vec<BlockResult<Box<dyn AsyncIo>>> = std::thread::scope(|s| {
+            let disk_image = &self.disk_image;
+            queue_data
+                .iter()
+                .map(|(_, queue, _, _, _)| {
+                    let queue_size = queue.size() as u32;
+                    s.spawn(move || disk_image.create_async_io(queue_size))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
 
+        for ((queue_idx, queue, queue_evt, kill_evt, pause_evt), async_io) in
+            queue_data.into_iter().zip(async_ios.into_iter())
+        {
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
                 queue,
                 mem: mem.clone(),
-                disk_image: self
-                    .disk_image
-                    .create_async_io(queue_size as u32)
-                    .map_err(|e| {
-                        error!("failed to create new AsyncIo: {e}");
-                        ActivateError::BadActivate
-                    })?,
+                disk_image: async_io.map_err(|e| {
+                    error!("failed to create new AsyncIo: {e}");
+                    ActivateError::BadActivate
+                })?,
                 disk_nsectors: self.disk_nsectors.clone(),
                 interrupt_cb: interrupt_cb.clone(),
                 serial: self.serial.clone(),
@@ -1139,9 +1155,6 @@ impl VirtioDevice for Block {
                 writeback: self.writeback.clone(),
                 counters: self.counters.clone(),
                 queue_evt,
-                // Analysis during boot shows around ~40 maximum requests
-                // This gives head room for systems with slower I/O without
-                // compromising the cost of the reallocation or memory overhead
                 inflight_requests: VecDeque::with_capacity(64),
                 rate_limiter: self
                     .rate_limiter
@@ -1159,7 +1172,7 @@ impl VirtioDevice for Block {
             let paused_sync = self.common.paused_sync.clone();
 
             spawn_virtio_thread(
-                &format!("{}_q{}", self.id.clone(), i),
+                &format!("{}_q{}", self.id.clone(), queue_idx),
                 &self.seccomp_action,
                 Thread::VirtioBlock,
                 &mut epoll_threads,
