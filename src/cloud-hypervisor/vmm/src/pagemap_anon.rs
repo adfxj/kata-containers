@@ -6,11 +6,11 @@
 //!
 //! This module provides functionality for creating pagemap-anon-based snapshots
 //! that only save CoW anonymous pages (pages actually written by the Guest)
-//! by inspecting `/proc/self/pagemap` bit 61 (PM_FILE).
+//! by inspecting `/proc/self/pagemap` and `/proc/kpageflags`.
 //!
 //! In a `MAP_PRIVATE` mmap restore scenario:
-//! - Pages only read by Guest remain as file-backed page cache (PM_FILE=1)
-//! - Pages written by Guest trigger CoW and become anonymous pages (PM_FILE=0)
+//! - Pages only read by Guest remain as file-backed page cache (KPF_ANON=0)
+//! - Pages written by Guest trigger CoW and become anonymous pages (KPF_ANON=1)
 //! - Pages never accessed have no PTE (present=0)
 //!
 //! This module filters out only the anonymous pages, significantly reducing
@@ -20,7 +20,7 @@ use log::{debug, trace};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use thiserror::Error;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryError};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 
 /// Page size constant (4KB)
@@ -29,37 +29,53 @@ pub const PAGE_SIZE: u64 = 4096;
 /// Size of a pagemap entry in bytes
 const PAGEMAP_ENTRY_SIZE: u64 = 8;
 
+/// Size of a kpageflags entry in bytes
+const KPAGEFLAGS_ENTRY_SIZE: u64 = 8;
+
 /// Bit 63: page is present in RAM
 const PAGEMAP_PRESENT_BIT: u64 = 1 << 63;
 
 /// Bit 62: page is in swap
 const PAGEMAP_SWAPPED_BIT: u64 = 1 << 62;
 
-/// Bit 61 in pagemap: page is file-backed (PM_FILE).
-/// A present page with bit 61 *clear* is anonymous (CoW).
-/// Available since Linux 4.3.
-const PAGEMAP_FILE_BIT: u64 = 1 << 61;
-
 /// Mask for PFN (bits 0-54)
-pub const PAGEMAP_PFN_MASK: u64 = (1 << 55) - 1;
+const PAGEMAP_PFN_MASK: u64 = (1 << 55) - 1;
+
+/// Bit 12 in kpageflags: KPF_ANON (anonymous page)
+const KPF_ANON: u64 = 1 << 12;
 
 /// Errors related to pagemap_anon operations
 #[derive(Debug, Error)]
 pub enum PagemapAnonError {
-    #[error("Failed to open")]
-    OpenFailed(#[source] io::Error),
+    #[error("Failed to open {path}: {source}")]
+    OpenFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
-    #[error("Failed to read")]
-    ReadFailed(#[source] io::Error),
+    #[error("Failed to read {path}: {source}")]
+    ReadFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
-    #[error("Failed to seek")]
-    SeekFailed(#[source] io::Error),
+    #[error("Failed to seek in {path}: {source}")]
+    SeekFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("Failed to get host address for guest memory region")]
-    GetHostAddressFailed(#[source] GuestMemoryError),
+    GetHostAddressFailed,
 
     #[error("Memory region not aligned to page boundary")]
     NotPageAligned,
+
+    #[error("No CAP_SYS_ADMIN permission: PFN is zero for a present page, cannot read kpageflags")]
+    NoCapSysAdmin,
 }
 
 /// Result type for pagemap_anon operations
@@ -91,12 +107,7 @@ impl PagemapAnonStats {
 }
 
 /// Get the anonymous page bitmap for a memory region by reading
-/// `/proc/self/pagemap` only.
-///
-/// Anonymous page detection uses pagemap bit 61 (PM_FILE): a present page
-/// with bit 61 *clear* is anonymous (CoW).  This avoids reading
-/// `/proc/kpageflags` entirely, eliminating a second kernel pseudo-file I/O
-/// path that was the dominant cost on large memory regions.
+/// `/proc/self/pagemap` and `/proc/kpageflags`.
 ///
 /// # Arguments
 /// * `host_addr` - Host virtual address of the memory region (must be page-aligned)
@@ -113,23 +124,41 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
     let num_pages = length.div_ceil(PAGE_SIZE) as usize;
     let start_page = host_addr / PAGE_SIZE;
 
+    // Open /proc/self/pagemap and /proc/kpageflags
     let mut pagemap_file =
-        File::open("/proc/self/pagemap").map_err(PagemapAnonError::OpenFailed)?;
+        File::open("/proc/self/pagemap").map_err(|e| PagemapAnonError::OpenFailed {
+            path: "/proc/self/pagemap".to_string(),
+            source: e,
+        })?;
 
+    let mut kpageflags_file =
+        File::open("/proc/kpageflags").map_err(|e| PagemapAnonError::OpenFailed {
+            path: "/proc/kpageflags".to_string(),
+            source: e,
+        })?;
+
+    // Batch read all pagemap entries for this region
     let pagemap_offset = start_page * PAGEMAP_ENTRY_SIZE;
     pagemap_file
         .seek(SeekFrom::Start(pagemap_offset))
-        .map_err(PagemapAnonError::SeekFailed)?;
+        .map_err(|e| PagemapAnonError::SeekFailed {
+            path: "/proc/self/pagemap".to_string(),
+            source: e,
+        })?;
 
     let buf_size = num_pages * PAGEMAP_ENTRY_SIZE as usize;
     let mut pagemap_buf = vec![0u8; buf_size];
     pagemap_file
         .read_exact(&mut pagemap_buf)
-        .map_err(PagemapAnonError::ReadFailed)?;
+        .map_err(|e| PagemapAnonError::ReadFailed {
+            path: "/proc/self/pagemap".to_string(),
+            source: e,
+        })?;
 
     let mut result = vec![false; num_pages];
+    let mut kpageflags_buf = [0u8; KPAGEFLAGS_ENTRY_SIZE as usize];
 
-    for i in 0..num_pages {
+    for (i, item) in result.iter_mut().enumerate().take(num_pages) {
         let entry_offset = i * PAGEMAP_ENTRY_SIZE as usize;
         let entry = u64::from_ne_bytes(
             pagemap_buf[entry_offset..entry_offset + PAGEMAP_ENTRY_SIZE as usize]
@@ -139,15 +168,47 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
 
         let present = (entry & PAGEMAP_PRESENT_BIT) != 0;
         let swapped = (entry & PAGEMAP_SWAPPED_BIT) != 0;
-        let is_file = (entry & PAGEMAP_FILE_BIT) != 0;
 
+        // Swapped anonymous pages are also Guest-written pages that must be saved.
+        // When an anonymous page is swapped out, present=0 but swapped=1.
         if swapped {
-            result[i] = true;
+            *item = true;
             continue;
         }
 
-        if present && !is_file {
-            result[i] = true;
+        if !present {
+            continue;
+        }
+
+        let pfn = entry & PAGEMAP_PFN_MASK;
+        if pfn == 0 {
+            // PFN is zero for a present page — this means we don't have
+            // CAP_SYS_ADMIN permission to read PFN from pagemap.
+            return Err(PagemapAnonError::NoCapSysAdmin);
+        }
+
+        // Read kpageflags for this PFN
+        let kpageflags_offset = pfn * KPAGEFLAGS_ENTRY_SIZE;
+        kpageflags_file
+            .seek(SeekFrom::Start(kpageflags_offset))
+            .map_err(|e| PagemapAnonError::SeekFailed {
+                path: "/proc/kpageflags".to_string(),
+                source: e,
+            })?;
+
+        kpageflags_file
+            .read_exact(&mut kpageflags_buf)
+            .map_err(|e| PagemapAnonError::ReadFailed {
+                path: "/proc/kpageflags".to_string(),
+                source: e,
+            })?;
+
+        let flags = u64::from_ne_bytes(kpageflags_buf);
+
+        // KPF_ANON (bit 12) indicates this is an anonymous page,
+        // meaning it was created by CoW when Guest wrote to it.
+        if (flags & KPF_ANON) != 0 {
+            *item = true;
         }
     }
 
@@ -195,8 +256,9 @@ pub fn filter_memory_ranges_by_pagemap_anon<B: vm_memory::bitmap::Bitmap + 'stat
         // Get host virtual address for this guest physical address
         let host_addr = guest_memory
             .get_host_address(GuestAddress(gpa))
-            .map_err(PagemapAnonError::GetHostAddressFailed)?;
+            .map_err(|_| PagemapAnonError::GetHostAddressFailed)?;
 
+        // Get anonymous page bitmap via pagemap + kpageflags
         let anon_pages = get_anon_pages(host_addr as u64, length)?;
 
         // Convert bitmap to memory ranges (merge consecutive anonymous pages)
@@ -300,9 +362,10 @@ mod tests {
 
     #[test]
     fn test_pagemap_constants() {
+        // Verify bit positions are correct
         assert_eq!(PAGEMAP_PRESENT_BIT, 1u64 << 63);
         assert_eq!(PAGEMAP_SWAPPED_BIT, 1u64 << 62);
-        assert_eq!(PAGEMAP_FILE_BIT, 1u64 << 61);
         assert_eq!(PAGEMAP_PFN_MASK, (1u64 << 55) - 1);
+        assert_eq!(KPF_ANON, 1u64 << 12);
     }
 }

@@ -23,13 +23,13 @@
 //! Requires `CONFIG_MEM_SOFT_DIRTY=y`. On kernels without this config the
 //! caller is expected to silently fall back to the pagemap_anon path.
 
-use crate::pagemap_anon;
+use crate::pagemap_anon::{self, get_anon_pages};
 use log::{debug, info, trace};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 use thiserror::Error;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryError};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 
 /// Page size constant (4KB)
@@ -47,11 +47,6 @@ const PAGEMAP_PRESENT_BIT: u64 = 1 << 63;
 /// Bit 62: page is in swap
 const PAGEMAP_SWAPPED_BIT: u64 = 1 << 62;
 
-/// Bit 61 in pagemap: page is file-backed (PM_FILE).
-/// A present page with bit 61 *clear* is anonymous (CoW).
-/// Available since Linux 4.3 (CONFIG_TRANSPARENT_HUGEPAGE).
-const PAGEMAP_FILE_BIT: u64 = 1 << 61;
-
 /// Magic value to write to /proc/self/clear_refs to clear the soft-dirty
 /// bit on every page table entry of the current process and (re)arm the
 /// VM_SOFTDIRTY tracker.
@@ -60,26 +55,42 @@ const CLEAR_REFS_SOFT_DIRTY: &[u8] = b"4\n";
 /// Errors related to soft-dirty operations
 #[derive(Debug, Error)]
 pub enum SoftDirtyError {
-    #[error("Failed to open")]
-    OpenFailed(#[source] io::Error),
+    #[error("Failed to open {path}: {source}")]
+    OpenFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
-    #[error("Failed to read")]
-    ReadFailed(#[source] io::Error),
+    #[error("Failed to read {path}: {source}")]
+    ReadFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
-    #[error("Failed to seek")]
-    SeekFailed(#[source] io::Error),
+    #[error("Failed to seek in {path}: {source}")]
+    SeekFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
-    #[error("Failed to write")]
-    WriteFailed(#[source] io::Error),
+    #[error("Failed to write to {path}: {source}")]
+    WriteFailed {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("Failed to get host address for guest memory region")]
-    GetHostAddressFailed(#[source] GuestMemoryError),
+    GetHostAddressFailed,
 
     #[error("Memory region not aligned to page boundary")]
     NotPageAligned,
 
-    #[error("Failed to probe anonymous pages via pagemap_anon")]
-    AnonProbe(#[source] pagemap_anon::PagemapAnonError),
+    #[error("Failed to probe anonymous pages via pagemap_anon: {0}")]
+    AnonProbe(#[from] pagemap_anon::PagemapAnonError),
 }
 
 /// Result type for soft-dirty operations
@@ -141,9 +152,15 @@ pub fn clear_soft_dirty() -> Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
         .open("/proc/self/clear_refs")
-        .map_err(SoftDirtyError::OpenFailed)?;
+        .map_err(|e| SoftDirtyError::OpenFailed {
+            path: "/proc/self/clear_refs".to_string(),
+            source: e,
+        })?;
     f.write_all(CLEAR_REFS_SOFT_DIRTY)
-        .map_err(SoftDirtyError::WriteFailed)?;
+        .map_err(|e| SoftDirtyError::WriteFailed {
+            path: "/proc/self/clear_refs".to_string(),
+            source: e,
+        })?;
     let elapsed = start.elapsed();
     // The kernel walks every PTE of every anonymous VMA under mmap_lock
     // (write) here, and on large guests this is the dominant snapshot-time
@@ -182,18 +199,27 @@ pub fn get_soft_dirty_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
     let start_page = host_addr / PAGE_SIZE;
 
     let mut pagemap_file =
-        File::open("/proc/self/pagemap").map_err(SoftDirtyError::OpenFailed)?;
+        File::open("/proc/self/pagemap").map_err(|e| SoftDirtyError::OpenFailed {
+            path: "/proc/self/pagemap".to_string(),
+            source: e,
+        })?;
 
     let pagemap_offset = start_page * PAGEMAP_ENTRY_SIZE;
     pagemap_file
         .seek(SeekFrom::Start(pagemap_offset))
-        .map_err(SoftDirtyError::SeekFailed)?;
+        .map_err(|e| SoftDirtyError::SeekFailed {
+            path: "/proc/self/pagemap".to_string(),
+            source: e,
+        })?;
 
     let buf_size = num_pages * PAGEMAP_ENTRY_SIZE as usize;
     let mut pagemap_buf = vec![0u8; buf_size];
     pagemap_file
         .read_exact(&mut pagemap_buf)
-        .map_err(SoftDirtyError::ReadFailed)?;
+        .map_err(|e| SoftDirtyError::ReadFailed {
+            path: "/proc/self/pagemap".to_string(),
+            source: e,
+        })?;
 
     let mut result = vec![false; num_pages];
     for (i, item) in result.iter_mut().enumerate().take(num_pages) {
@@ -222,89 +248,6 @@ pub fn get_soft_dirty_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
     }
 
     Ok(result)
-}
-
-/// Combined result of anon + soft-dirty probing for a single memory region.
-pub struct AnonAndSoftDirtyResult {
-    /// Per-page: true if the page is anonymous (CoW).
-    pub anon: Vec<bool>,
-    /// Per-page: true if the page is soft-dirty (written since last clear_refs).
-    pub dirty: Vec<bool>,
-}
-
-/// Read `/proc/self/pagemap` **once** and extract both the anonymous-page
-/// bitmap (via pagemap bit 61 / PM_FILE) and the soft-dirty bitmap (bit 55)
-/// in a single pass.
-///
-/// This avoids the double-read that results from calling `get_anon_pages()` and
-/// `get_soft_dirty_pages()` independently on the same address range.
-///
-/// For swapped pages both `anon` and `dirty` are set to `true` — a swapped
-/// page is anonymous by definition and was written before being swapped out.
-///
-/// Anonymous page detection uses pagemap bit 61 (PM_FILE) instead of
-/// `/proc/kpageflags`, avoiding a second kernel pseudo-file read entirely.
-/// A present page with bit 61 *clear* is anonymous (CoW).  Available since
-/// Linux 4.3.
-pub fn get_anon_and_soft_dirty_pages(
-    host_addr: u64,
-    length: u64,
-) -> Result<AnonAndSoftDirtyResult> {
-    if host_addr % PAGE_SIZE != 0 {
-        return Err(SoftDirtyError::NotPageAligned);
-    }
-
-    let num_pages = length.div_ceil(PAGE_SIZE) as usize;
-    let start_page = host_addr / PAGE_SIZE;
-
-    let mut pagemap_file =
-        File::open("/proc/self/pagemap").map_err(SoftDirtyError::OpenFailed)?;
-
-    let pagemap_offset = start_page * PAGEMAP_ENTRY_SIZE;
-    pagemap_file
-        .seek(SeekFrom::Start(pagemap_offset))
-        .map_err(SoftDirtyError::SeekFailed)?;
-
-    let buf_size = num_pages * PAGEMAP_ENTRY_SIZE as usize;
-    let mut pagemap_buf = vec![0u8; buf_size];
-    pagemap_file
-        .read_exact(&mut pagemap_buf)
-        .map_err(SoftDirtyError::ReadFailed)?;
-
-    let mut anon = vec![false; num_pages];
-    let mut dirty = vec![false; num_pages];
-
-    for i in 0..num_pages {
-        let entry_offset = i * PAGEMAP_ENTRY_SIZE as usize;
-        let entry = u64::from_ne_bytes(
-            pagemap_buf[entry_offset..entry_offset + PAGEMAP_ENTRY_SIZE as usize]
-                .try_into()
-                .unwrap(),
-        );
-
-        let present = (entry & PAGEMAP_PRESENT_BIT) != 0;
-        let swapped = (entry & PAGEMAP_SWAPPED_BIT) != 0;
-        let soft_dirty = (entry & PAGEMAP_SOFT_DIRTY_BIT) != 0;
-        let is_file = (entry & PAGEMAP_FILE_BIT) != 0;
-
-        if swapped {
-            anon[i] = true;
-            dirty[i] = true;
-            continue;
-        }
-
-        if present {
-            // Present && !file-backed => anonymous (CoW page).
-            if !is_file {
-                anon[i] = true;
-            }
-            if soft_dirty {
-                dirty[i] = true;
-            }
-        }
-    }
-
-    Ok(AnonAndSoftDirtyResult { anon, dirty })
 }
 
 /// Filter memory ranges by soft-dirty, returning only ranges with pages
@@ -346,7 +289,7 @@ pub fn filter_memory_ranges_by_soft_dirty<B: vm_memory::bitmap::Bitmap + 'static
 
         let host_addr = guest_memory
             .get_host_address(GuestAddress(gpa))
-            .map_err(SoftDirtyError::GetHostAddressFailed)?;
+            .map_err(|_| SoftDirtyError::GetHostAddressFailed)?;
 
         let dirty_pages = get_soft_dirty_pages(host_addr as u64, length)?;
 
@@ -452,15 +395,18 @@ pub fn filter_memory_ranges_by_anon_and_soft_dirty<B: vm_memory::bitmap::Bitmap 
 
         let host_addr = guest_memory
             .get_host_address(GuestAddress(gpa))
-            .map_err(SoftDirtyError::GetHostAddressFailed)?;
+            .map_err(|_| SoftDirtyError::GetHostAddressFailed)?;
 
-        let result = get_anon_and_soft_dirty_pages(host_addr as u64, length)?;
+        let anon_pages = get_anon_pages(host_addr as u64, length)?;
+        let dirty_pages = get_soft_dirty_pages(host_addr as u64, length)?;
+
+        debug_assert_eq!(anon_pages.len(), dirty_pages.len());
 
         let mut current_range_start: Option<u64> = None;
         let mut current_range_length: u64 = 0;
 
         for (page_idx, (&is_anon, &is_dirty)) in
-            result.anon.iter().zip(result.dirty.iter()).enumerate()
+            anon_pages.iter().zip(dirty_pages.iter()).enumerate()
         {
             let page_gpa = gpa + (page_idx as u64 * PAGE_SIZE);
             let must_save = is_anon && is_dirty;
@@ -778,7 +724,7 @@ mod tests {
     ///
     /// Skipped silently when the host kernel lacks `CONFIG_MEM_SOFT_DIRTY=y`,
     /// or when the test process lacks CAP_SYS_ADMIN to read PFNs from
-    /// /proc/self/pagemap and classify anonymous pages through bit 61.
+    /// /proc/self/pagemap and classify anonymous pages through /proc/kpageflags.
     #[test]
     fn test_filter_memory_ranges_by_anon_and_soft_dirty_end_to_end() {
         let _guard = CLEAR_REFS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -836,7 +782,7 @@ mod tests {
         let (filtered, stats) =
             match filter_memory_ranges_by_anon_and_soft_dirty(&guest_memory, &ranges) {
                 Ok(result) => result,
-                Err(SoftDirtyError::AnonProbe) => {
+                Err(SoftDirtyError::AnonProbe(pagemap_anon::PagemapAnonError::NoCapSysAdmin)) => {
                     eprintln!(
                         "no CAP_SYS_ADMIN to read pagemap PFNs; skipping {}",
                         "test_filter_memory_ranges_by_anon_and_soft_dirty_end_to_end"
