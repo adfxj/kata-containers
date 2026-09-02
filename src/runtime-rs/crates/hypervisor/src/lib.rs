@@ -43,6 +43,15 @@ use async_trait::async_trait;
 use hypervisor_persist::HypervisorState;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+// `NetworkConfigInfo` is only consumed by the `ch` driver module, so gate it
+// with the same `cfg` as `pub mod ch;` to avoid an unused-import warning when
+// `kata-hypervisor` is built without the `cloud-hypervisor` feature (e.g. when
+// pulled in by `kata-agent-ctl`, whose own `cloud-hypervisor` feature is empty
+// and does not forward to this crate).
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use kata_types::config::hypervisor::NetworkInfo as NetworkConfigInfo;
 
 pub use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
@@ -105,6 +114,10 @@ pub(crate) enum VmmState {
     NotReady,
     VmmServerReady,
     VmRunning,
+    // `VmPaused` is currently only constructed/matched by the `ch` driver.
+    // Allow it to stay when `kata-hypervisor` is built without the
+    // `cloud-hypervisor` feature (e.g. via `kata-agent-ctl`).
+    #[allow(dead_code)]
     VmPaused,
 }
 

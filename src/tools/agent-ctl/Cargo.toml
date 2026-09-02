@@ -53,4 +53,4 @@ tokio.workspace = true
 default = ["cloud-hypervisor"]
 
 # Enable the Cloud Hypervisor driver
-cloud-hypervisor = []
+cloud-hypervisor = ["kata-hypervisor/cloud-hypervisor"]

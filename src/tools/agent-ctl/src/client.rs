@@ -21,7 +21,7 @@ use std::fs;
 use std::io::Write; // XXX: for flush()
 use std::io::{self, Read, Seek, SeekFrom};
 use std::io::{BufRead, BufReader};
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::Duration;
@@ -296,16 +296,6 @@ static AGENT_CMDS: &[AgentCmd] = &[
         fp: agent_cmd_container_write_stdin,
     },
     AgentCmd {
-        name: "GetIpvs",
-        st: ServiceType::Agent,
-        fp: agent_cmd_sandbox_get_ipvs,
-    },
-    AgentCmd {
-        name: "SetIpvs",
-        st: ServiceType::Agent,
-        fp: agent_cmd_sandbox_set_ipvs,
-    },
-    AgentCmd {
         name: "SetPolicy",
         st: ServiceType::Agent,
         fp: agent_cmd_sandbox_set_policy,
@@ -432,8 +422,8 @@ fn client_create_vsock_fd(cid: libc::c_uint, port: u32) -> Result<RawFd> {
         .map_err(|e| anyhow!(e))?;
 
         // Connect the socket to vsock server.
-        match connect(fd, &sock_addr) {
-            Ok(_) => return Ok(fd),
+        match connect(fd.as_raw_fd(), &sock_addr) {
+            Ok(_) => return Ok(fd.into_raw_fd()),
             Err(e) => {
                 debug!(
                     sl!(),
@@ -559,11 +549,11 @@ fn create_ttrpc_client(
                     }
                 };
 
-                connect(socket_fd, &unix_addr).map_err(|e| {
+                connect(socket_fd.as_raw_fd(), &unix_addr).map_err(|e| {
                     anyhow!(e).context("Failed to connect to Unix Domain abstract socket")
                 })?;
 
-                socket_fd
+                socket_fd.into_raw_fd()
             } else if hybrid_vsock {
                 let stream = setup_hybrid_vsock(&path, hybrid_vsock_port)?;
                 stream.into_raw_fd()
@@ -2039,235 +2029,6 @@ fn agent_cmd_sandbox_add_arp_neighbors(
     let reply = client
         .add_arp_neighbors(ctx, &req)
         .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
-
-    info!(sl!(), "response received";
-        "response" => format!("{:?}", reply));
-
-    Ok(())
-}
-
-fn agent_cmd_sandbox_get_ipvs(
-    ctx: &Context,
-    client: &AgentServiceClient,
-    _health: &HealthClient,
-    _options: &mut Options,
-    args: &str,
-) -> Result<()> {
-    let req: GetIPVSRequest = utils::make_request(args)?;
-
-    let ctx = clone_context(ctx);
-
-    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
-
-    let reply = client
-        .get_ipvs(ctx, &req)
-        .map_err(|e| anyhow!(e).context("failed to call GetIPVS"))?;
-
-    let data_str = String::from_utf8_lossy(&reply.data).to_string();
-    info!(sl!(), "response received";
-        "response" => format!("GetIPVSResponse {{ data: {} }}", data_str));
-
-    Ok(())
-}
-
-fn agent_cmd_sandbox_set_ipvs(
-    ctx: &Context,
-    client: &AgentServiceClient,
-    _health: &HealthClient,
-    _options: &mut Options,
-    args: &str,
-) -> Result<()> {
-    debug!(sl!(), "raw args"; "args" => args);
-
-    let mut req = SetIPVSRequest::default();
-    req.data = args.as_bytes().to_vec();
-    req.is_restore = false;
-
-    debug!(sl!(), "parsed request"; "request" => format!("data: {}, is_restore: {}", String::from_utf8_lossy(&req.data), req.is_restore));
-
-    let ctx = clone_context(ctx);
-
-    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
-
-    let reply = client
-        .set_ipvs(ctx, &req)
-        .map_err(|e| anyhow!(e).context("failed to call SetIPVS"))?;
-
-    let data_str = String::from_utf8_lossy(&reply.data).to_string();
-    info!(sl!(), "response received"; "response" => format!("SetIPVSResponse {{ data: {} }}", data_str));
-
-    Ok(())
-}
-
-fn agent_cmd_sandbox_update_container(
-    ctx: &Context,
-    client: &AgentServiceClient,
-    _health: &HealthClient,
-    options: &mut Options,
-    args: &str,
-) -> Result<()> {
-    let mut req: UpdateContainerRequest = utils::make_request(args)?;
-
-    let ctx = clone_context(ctx);
-
-    run_if_auto_values!(ctx, || -> Result<()> {
-        let cid = utils::get_option("cid", options, args)?;
-
-        req.set_container_id(cid);
-
-        Ok(())
-    });
-
-    // FIXME: Implement fully
-    eprintln!("FIXME: 'UpdateContainer' not fully implemented");
-
-    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
-
-    let reply = client
-        .update_container(ctx, &req)
-        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
-
-    info!(sl!(), "response received";
-        "response" => format!("{:?}", reply));
-
-    Ok(())
-}
-
-#[allow(clippy::redundant_closure_call)]
-fn agent_cmd_sandbox_mem_hotplug_by_probe(
-    ctx: &Context,
-    client: &AgentServiceClient,
-    _health: &HealthClient,
-    options: &mut Options,
-    args: &str,
-) -> Result<()> {
-    let mut req: MemHotplugByProbeRequest = utils::make_request(args)?;
-
-    let ctx = clone_context(ctx);
-
-    // Expected to be a comma separated list of hex addresses
-    let addr_list = utils::get_option("memHotplugProbeAddr", options, args)?;
-
-    run_if_auto_values!(ctx, || -> Result<()> {
-        if !addr_list.is_empty() {
-            let addrs: Vec<u64> = addr_list
-                // Convert into a list of string values.
-                .split(',')
-                // Convert each string element into a u8 array of bytes, ignoring
-                // those elements that fail the conversion.
-                .filter_map(|s| hex::decode(s.trim_start_matches("0x")).ok())
-                // "Stretch" the u8 byte slice into one of length 8
-                // (to allow each 8 byte chunk to be converted into a u64).
-                .map(|mut v| -> Vec<u8> {
-                    v.resize(8, 0x0);
-                    v
-                })
-                // Convert the slice of u8 bytes into a u64
-                .map(|b| byteorder::LittleEndian::read_u64(&b))
-                .collect();
-
-            req.set_memHotplugProbeAddr(addrs);
-        }
-
-        Ok(())
-    });
-
-    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
-
-    let reply = client
-        .mem_hotplug_by_probe(ctx, &req)
-        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
-
-    info!(sl!(), "response received";
-        "response" => format!("{:?}", reply));
-
-    Ok(())
-}
-
-#[inline]
-fn builtin_cmd_repeat(_args: &str) -> (Result<()>, bool) {
-    // XXX: NOP implementation. Due to the way repeat has to work, providing a
-    // handler like this is "too late" to be useful. However, a handler
-    // is required as "repeat" is a valid command.
-    //
-    // A cleaner approach would be to make `AgentCmd.fp` an `Option` which for
-    // this command would be specified as `None`, but this is the only command
-    // which doesn't need an implementation, so this approach is simpler :)
-
-    (Ok(()), false)
-}
-
-fn builtin_cmd_sleep(args: &str) -> (Result<()>, bool) {
-    let ns = match utils::human_time_to_ns(args) {
-        Ok(t) => t,
-        Err(e) => return (Err(e), false),
-    };
-
-    sleep(Duration::from_nanos(ns as u64));
-
-    (Ok(()), false)
-}
-
-fn builtin_cmd_echo(args: &str) -> (Result<()>, bool) {
-    println!("{args}");
-
-    (Ok(()), false)
-}
-
-fn builtin_cmd_quit(_args: &str) -> (Result<()>, bool) {
-    (Ok(()), true)
-}
-
-fn builtin_cmd_list(_args: &str) -> (Result<()>, bool) {
-    let cmds = get_all_cmd_details();
-
-    cmds.iter().for_each(|n| println!(" - {n}"));
-
-    println!();
-
-    (Ok(()), false)
-}
-
-fn get_repeat_count(cmdline: &str) -> i64 {
-    let default_repeat_count: i64 = 1;
-
-    let fields: Vec<&str> = cmdline.split_whitespace().collect();
-
-    if fields.len() < 2 {
-        return default_repeat_count;
-    }
-
-    if fields[0] != CMD_REPEAT {
-        return default_repeat_count;
-    }
-
-    let count = fields[1];
-
-    match count.parse::<i64>() {
-        Ok(n) => n,
-        Err(_) => default_repeat_count,
-    }
-}
-
-fn agent_cmd_sandbox_add_swap(
-    ctx: &Context,
-    client: &AgentServiceClient,
-    _health: &HealthClient,
-    _options: &mut Options,
-    _args: &str,
-) -> Result<()> {
-    let req = AddSwapRequest::default();
-
-    let ctx = clone_context(ctx);
-
-    debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
-
-    let reply = client
-        .add_swap(ctx, &req)
-        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
-
-    // FIXME: Implement 'AddSwap' fully.
-    eprintln!("FIXME: 'AddSwap' not fully implemented");
 
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));
