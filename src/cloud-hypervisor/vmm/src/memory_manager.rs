@@ -246,6 +246,12 @@ const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
 
 const MAX_PREFAULT_THREAD_COUNT: usize = 16;
 
+// Directory for cross-process shared snapshot cache files (tmpfs)
+const SHM_SNAPSHOT_DIR: &str = "/dev/shm";
+
+// Prefix for snapshot cache files in /dev/shm
+const SHM_SNAPSHOT_PREFIX: &str = "ch_snap_";
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct HotPlugState {
     base: u64,
@@ -394,6 +400,10 @@ pub struct MemoryManager {
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handler: Option<UffdHandler>,
+
+    /// Path of the /dev/shm snapshot cache file, if one was created.
+    /// Tracked so it can be unlinked when the MemoryManager is dropped.
+    shm_snapshot_path: Option<PathBuf>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -2149,6 +2159,7 @@ impl MemoryManager {
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
+            shm_snapshot_path: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
@@ -2174,6 +2185,7 @@ impl MemoryManager {
         phys_bits: u8,
         exit_evt: &EventFd,
         memory_vol_url: Option<&str>,
+        memfd_restore: bool,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
             let memory_file_target =
@@ -2184,13 +2196,31 @@ impl MemoryManager {
             dirty_log_file_path.push(String::from(DIRTY_LOG_FILENAME));
 
             let fast_restore = Self::support_fast_restore_check(config, dirty_log_file_path);
+
+            let mut shm_snapshot_path: Option<PathBuf> = None;
             let memory_file = if fast_restore {
                 info!("restore non-shared map, speed up restore by share map memory file");
-                Some(
-                    memory_file_target
-                        .open_read()
-                        .map_err(Error::SnapshotOpen)?,
-                )
+                let disk_file = memory_file_target
+                    .open_read()
+                    .map_err(Error::SnapshotOpen)?;
+
+                if memfd_restore {
+                    match Self::load_snapshot_to_memfd(&disk_file, memory_file_target.path()) {
+                        Ok((memfd, shm_path)) => {
+                            info!("Snapshot loaded into tmpfs for zero-I/O page faults");
+                            shm_snapshot_path = Some(shm_path);
+                            Some(memfd)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to load snapshot into tmpfs ({e}), falling back to disk mmap"
+                            );
+                            Some(disk_file)
+                        }
+                    }
+                } else {
+                    Some(disk_file)
+                }
             } else {
                 None
             };
@@ -2209,6 +2239,10 @@ impl MemoryManager {
                 Default::default(),
                 memory_file,
             )?;
+
+            if let Some(path) = shm_snapshot_path {
+                mm.lock().unwrap().shm_snapshot_path = Some(path);
+            }
 
             if !fast_restore {
                 info!("restore shared map, fall back to slow restore");
@@ -2244,6 +2278,398 @@ impl MemoryManager {
         } else {
             Ok(res as RawFd)
         }
+    }
+
+    /// Load a snapshot file into a tmpfs-backed file so that subsequent
+    /// `mmap(MAP_PRIVATE)` page faults are served entirely from RAM (CoW)
+    /// without any disk I/O.
+    ///
+    /// ## Cross-process sharing via /dev/shm
+    ///
+    /// Each Kata sandbox runs cloud-hypervisor as a VMM thread in a separate
+    /// process. To share the snapshot across processes, this function creates
+    /// a named file under `/dev/shm` (tmpfs) keyed by the snapshot file path.
+    ///
+    /// - **First process**: creates the file with `O_CREAT|O_EXCL`, acquires an
+    ///   exclusive `flock`, reads the disk snapshot into it (parallel), then
+    ///   downgrades to a shared lock to signal readiness.
+    /// - **Subsequent processes**: `O_CREAT|O_EXCL` fails with `EEXIST`. They
+    ///   open the file, acquire a shared `flock` (blocks until the first process
+    ///   finishes filling), then mmap it directly.
+    ///
+    /// All processes' `MAP_PRIVATE` page faults hit the same tmpfs page cache.
+    fn load_snapshot_to_memfd(src: &File, cache_key: &Path) -> Result<(File, PathBuf), Error> {
+        let src_meta = src
+            .metadata()
+            .map_err(|e| Error::SnapshotOpen(e.into()))?;
+        let file_size = src_meta.len();
+
+        // Use inode + size to uniquely identify a snapshot version.
+        // This prevents stale cache hits when the template file is recreated
+        // at the same path with different content (different inode).
+        let src_inode = Self::get_file_inode(src);
+
+        // Build a /dev/shm path from the snapshot file's identity.
+        let shm_name = Self::shm_cache_name(cache_key, src_inode, file_size);
+        let shm_path = Path::new(SHM_SNAPSHOT_DIR).join(&shm_name);
+
+        // Try to be the creator with O_CREAT|O_EXCL
+        let shm_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&shm_path)
+        {
+            Ok(f) => {
+                // We are the first process — creator path
+                info!(
+                    "Creating /dev/shm snapshot cache {:?} ({file_size} bytes) for {:?}",
+                    shm_path, cache_key
+                );
+
+                Self::fill_shm_cache_file(&f, src, file_size)?;
+
+                // Downgrade exclusive lock to shared so waiters can proceed.
+                // SAFETY: flock on a valid fd
+                let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+                if ret != 0 {
+                    warn!("flock unlock failed on {:?}: {}", shm_path, io::Error::last_os_error());
+                }
+                let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) };
+                if ret != 0 {
+                    warn!("flock shared failed on {:?}: {}", shm_path, io::Error::last_os_error());
+                }
+
+                info!("Snapshot cache {:?} ready for concurrent restores", shm_path);
+                f
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Another process already created the file — wait for it to be ready
+                info!(
+                    "Snapshot cache {:?} already exists, waiting for it to be filled",
+                    shm_path
+                );
+
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&shm_path)
+                    .map_err(|e| Error::SnapshotOpen(e.into()))?;
+
+                // Acquire shared lock — blocks until the creator finishes and
+                // downgrades/releases its exclusive lock.
+                // SAFETY: flock on a valid fd
+                let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) };
+                if ret != 0 {
+                    let err = io::Error::last_os_error();
+                    error!("flock shared failed on {:?}: {}", shm_path, err);
+                    return Err(Error::SnapshotOpen(err.into()));
+                }
+
+                // Verify the file was fully filled
+                let actual_size = f
+                    .metadata()
+                    .map_err(|e| Error::SnapshotOpen(e.into()))?
+                    .len();
+                if actual_size != file_size {
+                    return Err(Error::SnapshotOpen(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Snapshot cache size mismatch: expected {file_size}, got {actual_size}"
+                        ),
+                    )));
+                }
+
+                info!(
+                    "Snapshot cache {:?} ready (filled by another process), zero-I/O restore",
+                    shm_path
+                );
+                f
+            }
+            Err(e) => {
+                return Err(Error::SnapshotOpen(e.into()));
+            }
+        };
+
+        Ok((shm_file, shm_path))
+    }
+
+    /// Get the inode number of a file for cache key differentiation.
+    fn get_file_inode(f: &File) -> u64 {
+        // SAFETY: fstat on a valid fd
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::fstat(f.as_raw_fd(), &mut st) };
+        if ret == 0 {
+            st.st_ino
+        } else {
+            0
+        }
+    }
+
+    /// Generate a unique /dev/shm filename from the snapshot file path + inode + size.
+    /// Using inode+size ensures that a recreated template file (same path, different
+    /// inode) gets a different cache entry, preventing stale data.
+    fn shm_cache_name(cache_key: &Path, inode: u64, file_size: u64) -> String {
+        let path_str = cache_key.to_string_lossy();
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+        for &byte in path_str.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
+        }
+        // Mix in inode and size to distinguish different file versions
+        hash ^= inode;
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= file_size;
+        hash = hash.wrapping_mul(0x100000001b3);
+        format!("{SHM_SNAPSHOT_PREFIX}{hash:016x}")
+    }
+
+    /// Fill a /dev/shm cache file with snapshot data, skipping sparse holes.
+    ///
+    /// Uses `lseek(SEEK_DATA/SEEK_HOLE)` to enumerate only the populated
+    /// extents of the source file, then distributes them across multiple
+    /// threads that each call `copy_file_range` (kernel-space, no user buffer,
+    /// explicit offsets → no fd-offset contention). Holes are left as holes in
+    /// the tmpfs destination — `mmap` will serve zero pages for them (CoW from
+    /// the zero page), which is exactly the correct content.
+    fn fill_shm_cache_file(dst: &File, src: &File, file_size: u64) -> Result<(), Error> {
+        // Acquire exclusive lock — other processes opening this file with
+        // LOCK_SH will block until we release/downgrade.
+        // SAFETY: flock on a valid fd
+        let ret = unsafe { libc::flock(dst.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            error!("flock exclusive failed: {}", err);
+            return Err(Error::SnapshotOpen(err.into()));
+        }
+
+        dst.set_len(file_size)
+            .map_err(Error::SharedFileSetLen)?;
+
+        if file_size == 0 {
+            return Ok(());
+        }
+
+        // ---- Phase 1: enumerate all populated data extents ---------------
+        let mut extents: Vec<(u64, u64)> = Vec::new();
+        let mut cursor: u64 = 0;
+        loop {
+            match next_data_extent(src.as_fd(), cursor, file_size) {
+                Ok(Some((off, len))) => {
+                    extents.push((off, len));
+                    cursor = off + len;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        "SEEK_HOLE unsupported on source fd ({}), falling back to dense copy",
+                        e
+                    );
+                    return Self::fill_shm_cache_file_dense(dst, src, file_size);
+                }
+            }
+        }
+
+        let total_data: u64 = extents.iter().map(|(_, l)| *l).sum();
+        let num_extents = extents.len();
+
+        if num_extents == 0 {
+            info!(
+                "Filled /dev/shm snapshot cache ({file_size} bytes, 100% sparse — no data extents)"
+            );
+            return Ok(());
+        }
+
+        // ---- Phase 2: split work across 16 threads ----------------------
+        let num_threads = MAX_PREFAULT_THREAD_COUNT;
+
+        // Split the total data into roughly equal per-thread portions, then
+        // map each portion back to the extents it covers. This ensures all
+        // threads get work even when there are few large extents.
+        let per_thread = total_data / num_threads as u64;
+        let per_thread = if per_thread == 0 { 1 } else { per_thread };
+
+        let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); num_threads];
+        let mut thread_idx: usize = 0;
+        let mut thread_remaining: u64 = per_thread;
+
+        for (off, len) in extents {
+            let mut remaining = len;
+            let mut cur = off;
+            while remaining > 0 && thread_idx < num_threads {
+                let take = std::cmp::min(remaining, thread_remaining);
+                buckets[thread_idx].push((cur, take));
+                cur += take;
+                remaining -= take;
+                thread_remaining -= take;
+                if thread_remaining == 0 {
+                    thread_idx += 1;
+                    if thread_idx < num_threads {
+                        thread_remaining = per_thread;
+                    }
+                }
+            }
+            if thread_idx >= num_threads && remaining > 0 {
+                buckets[num_threads - 1].push((cur, remaining));
+            }
+        }
+
+        let errors: Arc<Mutex<Vec<io::Error>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // mmap both source and destination so the hot loop is pure memcpy —
+        // no syscall per chunk. pread/copy_file_range have per-call overhead
+        // and inode lock contention; mmap+mmap avoids both.
+        let map_len = file_size as usize;
+
+        // SAFETY: src fd is valid, file is at least file_size bytes.
+        // PROT_READ, MAP_PRIVATE (CoW, read-only).
+        let src_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                src.as_raw_fd(),
+                0,
+            )
+        };
+        if src_ptr == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            error!("mmap src failed: {}", err);
+            return Err(Error::SnapshotOpen(err.into()));
+        }
+
+        // SAFETY: dst fd is valid, set_len already extended it to file_size.
+        // MAP_SHARED so writes are visible to other processes that mmap the
+        // same file. PROT_WRITE for memcpy.
+        let dst_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                dst.as_raw_fd(),
+                0,
+            )
+        };
+        if dst_ptr == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            error!("mmap dst failed: {}", err);
+            // SAFETY: unmap the src mapping before returning
+            unsafe { libc::munmap(src_ptr, map_len) };
+            return Err(Error::SnapshotOpen(err.into()));
+        }
+
+        // Wrapper to make raw pointers Send + Sync, so they can be shared
+        // by scoped threads. Each thread reads/writes disjoint regions.
+        struct SyncPtr(*mut libc::c_void);
+        unsafe impl Send for SyncPtr {}
+        unsafe impl Sync for SyncPtr {}
+
+        let src_ptr = SyncPtr(src_ptr);
+        let dst_ptr = SyncPtr(dst_ptr);
+
+        thread::scope(|s| {
+            for bucket in buckets {
+                let src_ptr = &src_ptr;
+                let dst_ptr = &dst_ptr;
+                s.spawn(move || {
+                    for (data_off, data_len) in bucket {
+                        // SAFETY: src_ptr.0 is a valid read mapping of map_len
+                        // bytes. dst_ptr.0 is a valid write mapping. Both
+                        // offsets are within [0, file_size) and regions are
+                        // disjoint between threads.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (src_ptr.0 as *const u8).add(data_off as usize),
+                                (dst_ptr.0 as *mut u8).add(data_off as usize),
+                                data_len as usize,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+
+        // SAFETY: unmap both mappings
+        unsafe {
+            libc::munmap(src_ptr.0, map_len);
+            libc::munmap(dst_ptr.0, map_len);
+        }
+
+        let errs = errors.lock().unwrap();
+        if !errs.is_empty() {
+            let first_err = &errs[0];
+            return Err(Error::SnapshotRead(io::Error::new(
+                first_err.kind(),
+                format!("/dev/shm cache fill failed: {first_err}"),
+            )));
+        }
+        drop(errs);
+
+        // Flush to tmpfs (ensures data is visible to other processes)
+        dst.sync_data()
+            .map_err(|e| Error::SnapshotOpen(e.into()))?;
+
+        info!(
+            "Filled /dev/shm snapshot cache ({file_size} bytes, {num_extents} extents, {total_data} bytes data, {:.1}% sparse, {num_threads} threads)",
+            if file_size > 0 {
+                (1.0 - total_data as f64 / file_size as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Dense fallback: copy the entire file without skipping holes.
+    fn fill_shm_cache_file_dense(dst: &File, src: &File, file_size: u64) -> Result<(), Error> {
+        let mut off_in: libc::loff_t = 0;
+        let mut off_out: libc::loff_t = 0;
+        let mut copied: u64 = 0;
+        while copied < file_size {
+            // SAFETY: copy_file_range copies between two valid open fds
+            // entirely in kernel space.
+            let n = unsafe {
+                libc::copy_file_range(
+                    src.as_raw_fd(),
+                    &mut off_in,
+                    dst.as_raw_fd(),
+                    &mut off_out,
+                    (file_size - copied) as usize,
+                    0,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                error!("copy_file_range failed at offset {copied}: {}", err);
+                return Err(Error::SnapshotRead(io::Error::new(
+                    err.kind(),
+                    format!("copy_file_range failed: {err}"),
+                )));
+            }
+            if n == 0 {
+                break;
+            }
+            copied += n as u64;
+        }
+
+        if copied != file_size {
+            return Err(Error::SnapshotRead(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("copy_file_range short read: expected {file_size}, got {copied}"),
+            )));
+        }
+
+        dst.sync_data()
+            .map_err(|e| Error::SnapshotOpen(e.into()))?;
+
+        info!(
+            "Filled /dev/shm snapshot cache ({file_size} bytes via dense copy_file_range)"
+        );
+
+        Ok(())
     }
 
     fn mbind(
@@ -4225,6 +4651,19 @@ impl Pausable for MemoryManager {}
 impl Drop for MemoryManager {
     fn drop(&mut self) {
         self.stop_uffd_handler();
+
+        // Unlink the /dev/shm snapshot cache file. The file data stays alive
+        // (via mmap) until this process unmaps it, but the name is removed from
+        // the filesystem so it can't be opened by new processes. Other running
+        // VMs that already have an open fd or active mmap are unaffected —
+        // the inode persists until the last reference is released.
+        if let Some(path) = &self.shm_snapshot_path {
+            info!("Unlinking /dev/shm snapshot cache {:?}", path);
+            if let Err(e) = std::fs::remove_file(path) {
+                // EBUSY (still mapped) or ENOENT (already removed) are benign
+                debug!("Failed to remove /dev/shm cache {:?}: {e}", path);
+            }
+        }
     }
 }
 

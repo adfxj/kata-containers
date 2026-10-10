@@ -1639,6 +1639,7 @@ impl Vmm {
         memory_restore_mode: MemoryRestoreMode,
         fs_backend_init: bool,
         memory_vol_url: Option<&str>,
+        memfd_restore: bool,
     ) -> std::result::Result<(), VmError> {
         let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1688,6 +1689,7 @@ impl Vmm {
             Some(prefault),
             Some(memory_restore_mode),
             memory_vol_url,
+            memfd_restore,
         )?;
 
         if let Some(fs_mount_list_config) = &vm_config.clone().lock().unwrap().patch_fs {
@@ -1918,6 +1920,7 @@ impl RequestHandler for Vmm {
                         None,
                         None,
                         None,
+                        false,
                     )?;
 
                     if let Some(fs_mount_list_config) = &vm_config.lock().unwrap().patch_fs {
@@ -2132,6 +2135,7 @@ impl RequestHandler for Vmm {
             restore_cfg.memory_restore_mode,
             restore_cfg.fs_backend_init,
             restore_cfg.memory_vol_url.as_deref(),
+            restore_cfg.memfd_restore,
         )
         .and_then(|()| {
             if restore_cfg.resume {
@@ -2245,6 +2249,7 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            false,
         )?;
 
         if let Some(fs_mount_list_config) = &config.lock().unwrap().patch_fs {

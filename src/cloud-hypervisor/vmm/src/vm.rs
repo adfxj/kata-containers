@@ -1357,6 +1357,7 @@ impl Vm {
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
         memory_vol_url: Option<&str>,
+        memfd_restore: bool,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1415,6 +1416,7 @@ impl Vm {
                     phys_bits,
                     &exit_evt,
                     memory_vol_url,
+                    memfd_restore,
                 )
                 .map_err(Error::MemoryManager)?
             } else {

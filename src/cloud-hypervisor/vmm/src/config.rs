@@ -2862,7 +2862,7 @@ pub struct RestorePmemConfig {
     pub file: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RestoreConfig {
     pub source_url: PathBuf,
     #[serde(default)]
@@ -2898,6 +2898,12 @@ pub struct RestoreConfig {
     pub serial_socket: Option<PathBuf>,
     #[serde(default)]
     pub rate_limit_groups: Option<Vec<RateLimiterGroupConfig>>,
+    /// When enabled, the fast-restore path loads the snapshot memory
+    /// file into a tmpfs-backed file before mmap'ing it MAP_PRIVATE. This
+    /// ensures all page faults during concurrent restores are served from RAM
+    /// (CoW) without disk I/O.
+    #[serde(default)]
+    pub memfd_restore: bool,
 }
 
 impl RestoreConfig {
@@ -2906,7 +2912,8 @@ impl RestoreConfig {
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false,\
         vsock_socket=<vsock_socket>,dirty_log=on|off,fs_backend_init=on|off,\
         fs_sources=<fs_sources>,restore_taps=<restore_taps>,disks=<disks>,pmem=<pmem>,\
-        memory_vol_url=<memory_vol_url>,serial_socket=<serial_socket>,rate_limit_groups=<rate_limit_groups>\" \
+        memory_vol_url=<memory_vol_url>,serial_socket=<serial_socket>,\
+        rate_limit_groups=<rate_limit_groups>,memfd_restore=on|off\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
@@ -2921,7 +2928,8 @@ impl RestoreConfig {
         \n`pmem` is pmem devices with pattern [id1@/path/to/pmem1,id2@/path/to/pmem2] \
         \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume \
         \n`serial_socket` is socket path of serial port \
-        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...]";
+        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...] \
+        \n`memfd_restore` when on, loads the snapshot memory file into a memfd for zero-I/O page faults during concurrent restores";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2940,7 +2948,8 @@ impl RestoreConfig {
             .add("pmem")
             .add("memory_vol_url")
             .add("serial_socket")
-            .add("rate_limit_groups");
+            .add("rate_limit_groups")
+            .add("memfd_restore");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -3191,6 +3200,10 @@ impl RestoreConfig {
             })
             .transpose()?;
 
+        let memfd_restore = convert_toggle("memfd_restore")?
+            .unwrap_or(Toggle(false))
+            .0;
+
         Ok(RestoreConfig {
             source_url,
             prefault,
@@ -3207,6 +3220,7 @@ impl RestoreConfig {
             memory_vol_url,
             serial_socket,
             rate_limit_groups,
+            memfd_restore,
         })
     }
 
@@ -5280,6 +5294,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_vol_url: None,
                 serial_socket: None,
                 rate_limit_groups: None,
+                memfd_restore: false,
             }
         );
         assert_eq!(
@@ -5313,6 +5328,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_vol_url: None,
                 serial_socket: None,
                 rate_limit_groups: None,
+                memfd_restore: false,
             }
         );
         assert_eq!(
@@ -5333,6 +5349,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_vol_url: None,
                 serial_socket: None,
                 rate_limit_groups: None,
+                memfd_restore: false,
             }
         );
         assert_eq!(
@@ -5353,6 +5370,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_vol_url: None,
                 serial_socket: None,
                 rate_limit_groups: None,
+                memfd_restore: false,
             }
         );
         // Parsing should fail as source_url is a required field
@@ -5475,6 +5493,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_vol_url: None,
             serial_socket: None,
             rate_limit_groups: None,
+            memfd_restore: false,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -5550,6 +5569,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_vol_url: None,
             serial_socket: None,
             rate_limit_groups: None,
+            memfd_restore: false,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             pci_common: PciDeviceCommonConfig {
@@ -5577,6 +5597,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_vol_url: None,
             serial_socket: None,
             rate_limit_groups: None,
+            memfd_restore: false,
         };
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),

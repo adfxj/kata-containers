@@ -1610,6 +1610,10 @@ components:
           items:
             $ref: "#/components/schemas/RateLimitGroupConfig"
           description: Rate limit groups to replace or add during restore.
+        memfd_restore:
+          type: boolean
+          default: false
+          description: When enabled (default), loads the snapshot memory file into a memfd for zero-I/O page faults during concurrent restores.
 
     ReceiveMigrationData:
       required:
