@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{Read, Write, stdout};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 #[cfg(feature = "guest_debug")]
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
@@ -1110,6 +1111,7 @@ impl Vmm {
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
             None,
+            false,
         )
         .map_err(|e| {
             MigratableError::MigrateReceive(anyhow!(
@@ -1639,6 +1641,8 @@ impl Vmm {
         memory_restore_mode: MemoryRestoreMode,
         fs_backend_init: bool,
         memory_vol_url: Option<&str>,
+        memory_backend: crate::config::MemorySnapshotBackend,
+        ublk_device: Option<&str>,
     ) -> std::result::Result<(), VmError> {
         let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1688,6 +1692,8 @@ impl Vmm {
             Some(prefault),
             Some(memory_restore_mode),
             memory_vol_url,
+            memory_backend,
+            ublk_device.map(Path::new),
         )?;
 
         if let Some(fs_mount_list_config) = &vm_config.clone().lock().unwrap().patch_fs {
@@ -1918,6 +1924,8 @@ impl RequestHandler for Vmm {
                         None,
                         None,
                         None,
+                        crate::config::MemorySnapshotBackend::default(),
+                        None,
                     )?;
 
                     if let Some(fs_mount_list_config) = &vm_config.lock().unwrap().patch_fs {
@@ -2132,6 +2140,8 @@ impl RequestHandler for Vmm {
             restore_cfg.memory_restore_mode,
             restore_cfg.fs_backend_init,
             restore_cfg.memory_vol_url.as_deref(),
+            restore_cfg.memory_backend,
+            restore_cfg.ublk_device.as_deref().and_then(|p| p.to_str()),
         )
         .and_then(|()| {
             if restore_cfg.resume {
@@ -2244,6 +2254,8 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            None,
+            crate::config::MemorySnapshotBackend::default(),
             None,
         )?;
 
@@ -2856,7 +2868,7 @@ const DEVICE_MANAGER_SNAPSHOT_ID: &str = "device-manager";
 
 #[cfg(test)]
 mod unit_tests {
-    use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
     use super::*;
     #[cfg(target_arch = "x86_64")]

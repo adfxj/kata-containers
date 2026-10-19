@@ -4408,6 +4408,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lsmt"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes 1.12.1",
+ "libc",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid 1.23.5",
+ "vm-memory",
+]
+
+[[package]]
 name = "lz4"
 version = "1.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9547,6 +9564,7 @@ dependencies = [
  "libc",
  "linux-loader",
  "log",
+ "lsmt",
  "micro_http",
  "mshv-bindings",
  "net_util",

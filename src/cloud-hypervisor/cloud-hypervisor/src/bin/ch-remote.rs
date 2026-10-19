@@ -1007,12 +1007,17 @@ fn snapshot_config(sub_matches: &ArgMatches) -> Result<String, Error> {
         .unwrap_or_default();
     let memory_vol_url = sub_matches.get_one::<String>("memory_vol_url").cloned();
     let multi_snapshot = sub_matches.get_flag("multi_snapshot");
+    let lsmt_memory = sub_matches.get_flag("lsmt_memory");
+    let ublk_mem_image_dir =
+        sub_matches.get_one::<String>("ublk_mem_image_dir").cloned();
 
     let snapshot_config = SnapshotConfig {
         destination_url: String::from(url),
         snapshot_type,
         memory_vol_url,
         multi_snapshot,
+        lsmt_memory,
+        ublk_mem_image_dir,
     };
 
     let snapshot_config = serde_json::to_string(&snapshot_config).unwrap();
@@ -1195,6 +1200,18 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                     .long("multi-snapshot")
                     .help("Create multi-snapshot with dirty log conflicted with memory_vol_url")
                     .num_args(0),
+            )
+            .arg(
+                Arg::new("lsmt_memory")
+                    .long("lsmt-memory")
+                    .help("Save memory as LSMT layered format (generates memory-ranges + mem_image.json for ublk daemon)")
+                    .num_args(0),
+            )
+            .arg(
+                Arg::new("ublk_mem_image_dir")
+                    .long("ublk-mem-image-dir")
+                    .help("Directory to store LSMT memory snapshot files (memory-ranges, memory-ranges-incremental-N, mem_image.json). Required when --lsmt-memory is set")
+                    .num_args(1),
             ),
         Command::new("ping").about("Ping the VMM to check for API server availability"),
         Command::new("vm-wait-start").about("Wait for the VM to start up"),
@@ -1307,6 +1324,18 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                     .long("multi-snapshot")
                     .help("Create multi-snapshot with dirty log conflicted with memory_vol_url")
                     .num_args(0),
+            )
+            .arg(
+                Arg::new("lsmt_memory")
+                    .long("lsmt-memory")
+                    .help("Save memory as LSMT layered format (generates memory-ranges + mem_image.json for ublk daemon)")
+                    .num_args(0),
+            )
+            .arg(
+                Arg::new("ublk_mem_image_dir")
+                    .long("ublk-mem-image-dir")
+                    .help("Directory to store LSMT memory snapshot files (memory-ranges, memory-ranges-incremental-N, mem_image.json). Required when --lsmt-memory is set")
+                    .num_args(1),
             ),
     ]
     .to_vec()

@@ -211,6 +211,19 @@ pub struct SnapshotConfig {
     /// Whether to create a multi-snapshot.
     #[serde(default)]
     pub multi_snapshot: bool,
+    /// When true, save memory as LSMT layered format instead of raw file.
+    /// The ublk daemon reads the resulting mem_image.json to set up the
+    /// OverlayBD layer stack for restore.
+    #[serde(default)]
+    pub lsmt_memory: bool,
+    /// Directory to store all LSMT memory snapshot files (memory-ranges,
+    /// memory-ranges-incremental-N, mem_image.json).
+    /// Both full and incremental snapshots write to this same directory.
+    /// For incremental snapshots, the parent mem_image.json is read from
+    /// this directory automatically.
+    /// Required when lsmt_memory=true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ublk_mem_image_dir: Option<String>,
 }
 
 /// Data structure to describe snapshot data

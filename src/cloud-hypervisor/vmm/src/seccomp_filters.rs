@@ -779,6 +779,8 @@ fn vmm_thread_rules(
         (libc::SYS_getxattr, vec![]),
         (libc::SYS_linkat, vec![]),
         (libc::SYS_listxattr, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_mkdir, vec![]),
         (libc::SYS_mkdirat, vec![]),
         (libc::SYS_mknodat, vec![]),
         (libc::SYS_name_to_handle_at, vec![]),

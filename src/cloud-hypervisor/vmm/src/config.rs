@@ -382,6 +382,9 @@ pub enum ValidationError {
     /// Prefault cannot be combined with on-demand restore
     #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// ublk_device is required when memory_backend=ublk
+    #[error("{0}")]
+    InvalidRestoreConfig(String),
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
     LandlockPathDoesNotExist(PathBuf),
@@ -2802,6 +2805,37 @@ pub enum MemoryRestoreMode {
     OnDemand,
 }
 
+/// Memory snapshot backend type for restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum MemorySnapshotBackend {
+    /// Existing behavior: single raw file with mmap/uffd restore.
+    #[default]
+    Raw,
+    /// ublk backend: external ublk daemon creates /dev/ublkbN from an
+    /// OverlayBD layer stack. CH opens the block device and mmaps it
+    /// MAP_PRIVATE (fast restore). Page cache is shared across VMs
+    /// that restore from the same ublk device.
+    Ublk,
+}
+
+#[derive(Debug, Error)]
+pub enum MemorySnapshotBackendParseError {
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+}
+
+impl FromStr for MemorySnapshotBackend {
+    type Err = MemorySnapshotBackendParseError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "raw" => Ok(Self::Raw),
+            "ublk" => Ok(Self::Ublk),
+            _ => Err(MemorySnapshotBackendParseError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MemoryRestoreModeParseError {
     #[error("Invalid value: {0}")]
@@ -2898,6 +2932,16 @@ pub struct RestoreConfig {
     pub serial_socket: Option<PathBuf>,
     #[serde(default)]
     pub rate_limit_groups: Option<Vec<RateLimiterGroupConfig>>,
+    /// Memory snapshot backend type.
+    /// - "raw": existing behavior, single raw file with mmap/uffd
+    /// - "ublk": ublk block device backed by OverlayBD layer stack
+    #[serde(default)]
+    pub memory_backend: MemorySnapshotBackend,
+    /// Path to the ublk block device (e.g. /dev/ublkb0).
+    /// Required when memory_backend = "ublk".
+    /// The ublk daemon must have already created this device before restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ublk_device: Option<PathBuf>,
 }
 
 impl RestoreConfig {
@@ -2906,7 +2950,8 @@ impl RestoreConfig {
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false,\
         vsock_socket=<vsock_socket>,dirty_log=on|off,fs_backend_init=on|off,\
         fs_sources=<fs_sources>,restore_taps=<restore_taps>,disks=<disks>,pmem=<pmem>,\
-        memory_vol_url=<memory_vol_url>,serial_socket=<serial_socket>,rate_limit_groups=<rate_limit_groups>\" \
+        memory_vol_url=<memory_vol_url>,serial_socket=<serial_socket>,rate_limit_groups=<rate_limit_groups>,\
+        memory_backend=raw|ublk,ublk_device=<path_to_ublk_block_device>\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
@@ -2921,7 +2966,9 @@ impl RestoreConfig {
         \n`pmem` is pmem devices with pattern [id1@/path/to/pmem1,id2@/path/to/pmem2] \
         \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume \
         \n`serial_socket` is socket path of serial port \
-        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...]";
+        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...] \
+        \n`memory_backend` selects the memory snapshot backend: `raw` (default) for the existing single raw file path, or `ublk` for a ublk block device backed by an OverlayBD layer stack \
+        \n`ublk_device` is the path to the ublk block device (e.g. /dev/ublkb0) created by the ublk daemon; required when `memory_backend=ublk`";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2940,7 +2987,9 @@ impl RestoreConfig {
             .add("pmem")
             .add("memory_vol_url")
             .add("serial_socket")
-            .add("rate_limit_groups");
+            .add("rate_limit_groups")
+            .add("memory_backend")
+            .add("ublk_device");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -3191,6 +3240,15 @@ impl RestoreConfig {
             })
             .transpose()?;
 
+        let memory_backend = parser
+            .convert::<MemorySnapshotBackend>("memory_backend")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or_default();
+
+        let ublk_device = parser
+            .get("ublk_device")
+            .map(PathBuf::from);
+
         Ok(RestoreConfig {
             source_url,
             prefault,
@@ -3207,6 +3265,8 @@ impl RestoreConfig {
             memory_vol_url,
             serial_socket,
             rate_limit_groups,
+            memory_backend,
+            ublk_device,
         })
     }
 
@@ -3255,6 +3315,12 @@ impl RestoreConfig {
 
         if !restored_net_with_fds.is_empty() {
             warn!("Ignoring unused 'net_fds' for VM restore.");
+        }
+
+        if self.memory_backend == MemorySnapshotBackend::Ublk && self.ublk_device.is_none() {
+            return Err(ValidationError::InvalidRestoreConfig(
+                "ublk_device is required when memory_backend=ublk".to_string(),
+            ));
         }
 
         Ok(())

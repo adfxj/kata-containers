@@ -38,6 +38,7 @@ members = [
   "vm-migration",
   "vm-virtio",
   "vmm",
+  "lsmt",
 ]
 package.edition = "2024"
 # Minimum buildable version:
@@ -119,6 +120,7 @@ signal-hook = "0.4.4"
 threadpool = "1"
 thiserror = "2.0.18"
 tokio = { version = "=1.52.3", features = ["full"] }
+tracing = "0.1"
 uuid = { version = "1.23.1" }
 wait-timeout = "0.2.1"
 zerocopy = { version = "0.8.48", default-features = false }

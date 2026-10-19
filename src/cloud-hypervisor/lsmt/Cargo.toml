@@ -1,0 +1,17 @@
+[package]
+name = "lsmt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+nix = { workspace = true, features = ["fs"] }
+libc = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+async-trait = "0.1"

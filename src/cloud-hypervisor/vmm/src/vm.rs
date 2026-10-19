@@ -17,6 +17,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
 use std::num::Wrapping;
+use std::path::Path;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -1357,6 +1358,8 @@ impl Vm {
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
         memory_vol_url: Option<&str>,
+        memory_backend: crate::config::MemorySnapshotBackend,
+        ublk_device: Option<&Path>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1405,18 +1408,48 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
-                MemoryManager::new_from_snapshot(
-                    snapshot,
-                    vm.clone(),
-                    &vm_config.lock().unwrap().memory.clone(),
-                    source_url,
-                    prefault.unwrap_or(false),
-                    memory_restore_mode.unwrap_or_default(),
-                    phys_bits,
-                    &exit_evt,
-                    memory_vol_url,
-                )
-                .map_err(Error::MemoryManager)?
+                if memory_backend == crate::config::MemorySnapshotBackend::Ublk {
+                    let ublk_path = ublk_device.ok_or_else(|| {
+                        Error::MemoryManager(crate::memory_manager::Error::UblkSnapshot(
+                            anyhow::anyhow!("ublk_device required for ublk backend"),
+                        ))
+                    })?;
+                    let ublk_file = OpenOptions::new()
+                        .read(true)
+                        .open(ublk_path)
+                        .map_err(|e| Error::MemoryManager(
+                            crate::memory_manager::Error::UblkSnapshot(
+                                anyhow::anyhow!("open ublk device {}: {e}", ublk_path.display())
+                            )
+                        ))?;
+                    MemoryManager::new_from_snapshot(
+                        snapshot,
+                        vm.clone(),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        None,
+                        false,
+                        memory_restore_mode.unwrap_or_default(),
+                        phys_bits,
+                        &exit_evt,
+                        memory_vol_url,
+                        Some(ublk_file),
+                    )
+                    .map_err(Error::MemoryManager)?
+                } else {
+                    MemoryManager::new_from_snapshot(
+                        snapshot,
+                        vm.clone(),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        source_url,
+                        prefault.unwrap_or(false),
+                        memory_restore_mode.unwrap_or_default(),
+                        phys_bits,
+                        &exit_evt,
+                        memory_vol_url,
+                        None,
+                    )
+                    .map_err(Error::MemoryManager)?
+                }
             } else {
                 MemoryManager::new(
                     vm.clone(),
@@ -1428,6 +1461,7 @@ impl Vm {
                     None,
                     Default::default(),
                     None,
+                    false,
                 )
                 .map_err(Error::MemoryManager)?
             };
@@ -3580,10 +3614,25 @@ impl Transportable for Vm {
 
         // Tell the memory manager to also send/write its own snapshot.
         if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .send(&memory_manager_snapshot.clone(), &config)?;
+            if config.lsmt_memory {
+                let ublk_mem_image_dir = config.ublk_mem_image_dir.as_ref().ok_or_else(|| {
+                    MigratableError::MigrateSend(anyhow::anyhow!(
+                        "ublk_mem_image_dir is required when lsmt_memory=true"
+                    ))
+                })?;
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .send_lsmt(
+                        ublk_mem_image_dir,
+                        config.snapshot_type,
+                    )?;
+            } else {
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .send(&memory_manager_snapshot.clone(), &config)?;
+            }
         } else {
             return Err(MigratableError::Restore(anyhow!(
                 "Missing memory manager snapshot"

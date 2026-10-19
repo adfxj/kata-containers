@@ -470,6 +470,10 @@ pub enum Error {
     #[error("Cannot restore VM because source URL is missing")]
     RestoreMissingSourceUrl,
 
+    /// ublk/LSMT snapshot error
+    #[error("ublk/LSMT snapshot error")]
+    UblkSnapshot(#[source] anyhow::Error),
+
     /// Cannot create the system allocator
     #[error("Cannot create the system allocator")]
     CreateSystemAllocator,
@@ -748,6 +752,18 @@ impl BusDevice for MemoryManager {
     }
 }
 
+struct GuestMemReader<'a>(&'a vm_memory::GuestMemoryMmap<vm_memory::bitmap::AtomicBitmap>);
+
+impl lsmt::snapshot::DirtyPageSource for GuestMemReader<'_> {
+    fn read_page(&self, gpa: u64, buf: &mut [u8]) -> result::Result<(), anyhow::Error> {
+        use vm_memory::{Bytes, GuestAddress};
+        self.0
+            .read_slice(buf, GuestAddress(gpa))
+            .map_err(|e| anyhow::anyhow!("read guest memory at gpa {gpa:#x}: {e}"))?;
+        Ok(())
+    }
+}
+
 impl MemoryManager {
     /// Creates all memory regions based on the available RAM ranges defined
     /// by `ram_regions`, and based on the description of the memory zones.
@@ -913,6 +929,7 @@ impl MemoryManager {
         mut existing_memory_files: HashMap<u32, File>,
         saved_file: Option<File>,
         thp: bool,
+        ublk_restore: bool,
     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
         let mut memory_regions = Vec::new();
         let mut memory_zones = HashMap::new();
@@ -936,14 +953,23 @@ impl MemoryManager {
                     let mut file = None;
                     let mut offset = 0;
                     if let Some(ref f) = saved_file {
-                        for range in saved_regions.regions() {
-                            if guest_ram_mapping.gpa == range.gpa
-                                && guest_ram_mapping.size == range.length
-                            {
-                                file = Some(f.try_clone().map_err(Error::SnapshotDup)?);
-                                break;
+                        if ublk_restore {
+                            // ublk path: block device offset = GPA.
+                            // The LSMT layer stores data at virtual offset = GPA,
+                            // so the ublk device exposes data at GPA offsets.
+                            file = Some(f.try_clone().map_err(Error::SnapshotDup)?);
+                            offset = guest_ram_mapping.gpa;
+                        } else {
+                            // raw path: dense layout offset (accumulated lengths).
+                            for range in saved_regions.regions() {
+                                if guest_ram_mapping.gpa == range.gpa
+                                    && guest_ram_mapping.size == range.length
+                                {
+                                    file = Some(f.try_clone().map_err(Error::SnapshotDup)?);
+                                    break;
+                                }
+                                offset += range.length;
                             }
-                            offset += range.length;
                         }
                     }
                     let region = MemoryManager::create_ram_region(
@@ -1912,6 +1938,7 @@ impl MemoryManager {
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
         snap_file: Option<File>,
+        ublk_restore: bool,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
@@ -1950,6 +1977,7 @@ impl MemoryManager {
                 existing_memory_files,
                 snap_file,
                 config.thp,
+                ublk_restore,
             )?;
             let guest_memory =
                 GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestRegionCollection)?;
@@ -2174,61 +2202,83 @@ impl MemoryManager {
         phys_bits: u8,
         exit_evt: &EventFd,
         memory_vol_url: Option<&str>,
+        memory_file_override: Option<File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
-        if let Some(source_url) = source_url {
-            let memory_file_target =
-                MemorySnapshotFile::from_snapshot_url(source_url, memory_vol_url)
-                    .map_err(Error::Restore)?;
+        let mem_snapshot: MemoryManagerSnapshotData =
+            snapshot.to_state().map_err(Error::Restore)?;
 
-            let mut dirty_log_file_path = url_to_path(source_url).map_err(Error::Restore)?;
-            dirty_log_file_path.push(String::from(DIRTY_LOG_FILENAME));
+        let ublk_restore = memory_file_override.is_some();
 
-            let fast_restore = Self::support_fast_restore_check(config, dirty_log_file_path);
-            let memory_file = if fast_restore {
-                info!("restore non-shared map, speed up restore by share map memory file");
-                Some(
-                    memory_file_target
-                        .open_read()
-                        .map_err(Error::SnapshotOpen)?,
-                )
-            } else {
-                None
-            };
-
-            let mem_snapshot: MemoryManagerSnapshotData =
-                snapshot.to_state().map_err(Error::Restore)?;
-
-            let mm = MemoryManager::new(
-                vm,
-                config,
-                Some(prefault),
-                phys_bits,
-                #[cfg(feature = "tdx")]
-                false,
-                Some(&mem_snapshot),
-                Default::default(),
-                memory_file,
-            )?;
-
-            if !fast_restore {
-                info!("restore shared map, fall back to slow restore");
-                if memory_restore_mode == MemoryRestoreMode::OnDemand {
-                    mm.lock().unwrap().restore_by_uffd(
-                        source_url,
-                        &mem_snapshot.memory_ranges,
-                        exit_evt,
-                    )?;
-                } else {
-                    mm.lock()
-                        .unwrap()
-                        .fill_saved_regions(source_url, &mem_snapshot.memory_ranges)?;
+        // Determine the snap_file and whether fast restore is possible.
+        let (snap_file, fast_restore) = match memory_file_override {
+            Some(f) => {
+                // ublk path: file already opened by caller.
+                // No dirty-log, fast restore if no shared/virtio-mem.
+                let fast = !config.exist_shared() && !config.has_hotplug_virtio_mem();
+                if !fast {
+                    return Err(Error::UblkSnapshot(anyhow::anyhow!(
+                        "ublk restore requires fast restore (no shared memory, no virtio-mem)"
+                    )));
                 }
+                info!("ublk restore: fast restore with MAP_PRIVATE mmap");
+                (Some(f), true)
             }
+            None => {
+                // raw path: open from source_url
+                let url = source_url.ok_or(Error::RestoreMissingSourceUrl)?;
+                let memory_file_target =
+                    MemorySnapshotFile::from_snapshot_url(url, memory_vol_url)
+                        .map_err(Error::Restore)?;
 
-            Ok(mm)
-        } else {
-            Err(Error::RestoreMissingSourceUrl)
+                let mut dirty_log_file_path = url_to_path(url).map_err(Error::Restore)?;
+                dirty_log_file_path.push(String::from(DIRTY_LOG_FILENAME));
+
+                let fast_restore = Self::support_fast_restore_check(config, dirty_log_file_path);
+                let memory_file = if fast_restore {
+                    info!("restore non-shared map, speed up restore by share map memory file");
+                    Some(
+                        memory_file_target
+                            .open_read()
+                            .map_err(Error::SnapshotOpen)?,
+                    )
+                } else {
+                    None
+                };
+                (memory_file, fast_restore)
+            }
+        };
+
+        let mm = MemoryManager::new(
+            vm,
+            config,
+            Some(prefault),
+            phys_bits,
+            #[cfg(feature = "tdx")]
+            false,
+            Some(&mem_snapshot),
+            Default::default(),
+            snap_file,
+            ublk_restore,
+        )?;
+
+        if !fast_restore {
+            // Only raw path reaches here (ublk path returns error above)
+            info!("restore shared map, fall back to slow restore");
+            let url = source_url.unwrap();
+            if memory_restore_mode == MemoryRestoreMode::OnDemand {
+                mm.lock().unwrap().restore_by_uffd(
+                    url,
+                    &mem_snapshot.memory_ranges,
+                    exit_evt,
+                )?;
+            } else {
+                mm.lock()
+                    .unwrap()
+                    .fill_saved_regions(url, &mem_snapshot.memory_ranges)?;
+            }
         }
+
+        Ok(mm)
     }
 
     fn support_fast_restore_check(config: &MemoryConfig, dirty_log_file_path: PathBuf) -> bool {
@@ -2272,6 +2322,224 @@ impl MemoryManager {
         } else {
             Ok(())
         }
+    }
+
+    /// Save guest memory as a layered snapshot for ublk restore.
+    ///
+    /// All memory files are stored in `ublk_mem_image_dir`:
+    /// - Full:        memory-ranges (LSMT, all memory ranges) + mem_image.json
+    /// - Incremental: memory-ranges-incremental-N (LSMT, only dirty pages) + mem_image.json
+    ///
+    /// Both full and incremental layers are LSMT format so the ublk daemon can
+    /// stack them uniformly into one OverlayBD image.
+    ///
+    /// For incremental snapshots, the parent mem_image.json is read from
+    /// the same directory automatically.
+    pub fn send_lsmt(
+        &self,
+        ublk_mem_image_dir: &str,
+        snapshot_type: SnapshotType,
+    ) -> result::Result<PathBuf, MigratableError> {
+        let dest_dir = std::path::Path::new(ublk_mem_image_dir).to_path_buf();
+        std::fs::create_dir_all(&dest_dir).map_err(|e| {
+            MigratableError::MigrateSend(anyhow::anyhow!(
+                "create ublk_mem_image_dir {}: {e}",
+                dest_dir.display()
+            ))
+        })?;
+
+        let mem_image_path = dest_dir.join("mem_image.json");
+
+        let (layer_path, layer_size, parent_config) = match snapshot_type {
+            SnapshotType::Full => {
+                // Full snapshot: write memory ranges as a single LSMT layer.
+                // Must be LSMT format so the ublk daemon can stack it together
+                // with incremental layers into one OverlayBD image.
+                //
+                // When dirty_log is enabled, only write pages marked dirty by
+                // KVM dirty bitmap + VMM bitmap (sparse). When dirty_log is
+                // disabled, write all memory ranges (dense — first snapshot
+                // captures everything).
+                let layer_path = dest_dir.join("memory-ranges");
+
+                let virtual_size: u64 = self
+                    .snapshot_memory_ranges
+                    .regions()
+                    .iter()
+                    .map(|r| r.gpa + r.length)
+                    .max()
+                    .unwrap_or(0);
+
+                let all_ranges: Vec<(u64, u64)> = if self.dirty_log {
+                    self.collect_dirty_ranges()?
+                } else {
+                    self.snapshot_memory_ranges
+                        .regions()
+                        .iter()
+                        .map(|r| (r.gpa, r.length))
+                        .collect()
+                };
+
+                let guest_memory = self.guest_memory.memory();
+                let reader = GuestMemReader(&*guest_memory);
+
+                let (size, _digest) =
+                    lsmt::snapshot::capture_dirty_pages(&reader, &all_ranges, virtual_size, &layer_path)
+                        .map_err(|e| {
+                            MigratableError::MigrateSend(anyhow::anyhow!(
+                                "capture full memory to LSMT layer: {e}"
+                            ))
+                        })?;
+
+                info!(
+                    "Full snapshot saved as LSMT: {} ({} bytes, {} ranges, dirty_log={})",
+                    layer_path.display(),
+                    size,
+                    all_ranges.len(),
+                    self.dirty_log
+                );
+                (layer_path, size, None)
+            }
+            SnapshotType::SoftDirty | SnapshotType::Incremental => {
+                // Incremental: read parent config, get dirty pages, write LSMT layer.
+                let parent = lsmt::snapshot::MemImageConfig::load(&mem_image_path)
+                    .map_err(|e| {
+                        MigratableError::MigrateSend(anyhow::anyhow!(
+                            "load parent mem_image.json from {}: {e}\n\
+                             Hint: run a full snapshot (--snapshot-type full) first",
+                            mem_image_path.display()
+                        ))
+                    })?;
+
+                let incr_idx = parent.layers.len();
+                let layer_path =
+                    dest_dir.join(format!("memory-ranges-incremental-{}", incr_idx));
+
+                // Get dirty page ranges using soft-dirty or pagemap-anon
+                let guest_memory = self.guest_memory.memory();
+
+                let filtered = if snapshot_type == SnapshotType::SoftDirty
+                    && self.soft_dirty_armed.load(Ordering::Acquire)
+                {
+                    let (table, stats) =
+                        crate::soft_dirty::filter_memory_ranges_by_anon_and_soft_dirty(
+                            &guest_memory,
+                            &self.snapshot_memory_ranges,
+                        )
+                        .map_err(|e| {
+                            MigratableError::MigrateSend(anyhow::anyhow!(
+                                "soft-dirty filter failed: {e}"
+                            ))
+                        })?;
+                    info!(
+                        "Incremental: soft-dirty found {} dirty ranges ({} bytes)",
+                        table.regions().len(),
+                        stats.saved_bytes
+                    );
+                    table
+                } else {
+                    let (table, stats) =
+                        crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon(
+                            &guest_memory,
+                            &self.snapshot_memory_ranges,
+                        )
+                        .map_err(|e| {
+                            MigratableError::MigrateSend(anyhow::anyhow!(
+                                "pagemap-anon filter failed: {e}"
+                            ))
+                        })?;
+                    info!(
+                        "Incremental: pagemap-anon found {} anon ranges ({} bytes)",
+                        table.regions().len(),
+                        stats.saved_bytes
+                    );
+                    table
+                };
+
+                let dirty_ranges: Vec<(u64, u64)> = filtered
+                    .regions()
+                    .iter()
+                    .map(|r| (r.gpa, r.length))
+                    .collect();
+
+                if dirty_ranges.is_empty() {
+                    info!("Incremental snapshot: no dirty pages, creating empty LSMT layer");
+                }
+
+                // Write dirty pages to LSMT layer
+                let virtual_size: u64 = self
+                    .snapshot_memory_ranges
+                    .regions()
+                    .iter()
+                    .map(|r| r.gpa + r.length)
+                    .max()
+                    .unwrap_or(0);
+
+                let reader = GuestMemReader(&*guest_memory);
+
+                let size = lsmt::snapshot::capture_dirty_pages(
+                    &reader,
+                    &dirty_ranges,
+                    virtual_size,
+                    &layer_path,
+                )
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow::anyhow!(
+                        "capture dirty pages to LSMT layer: {e}"
+                    ))
+                })?
+                .0;
+
+                info!(
+                    "Incremental snapshot saved as LSMT: {} ({} bytes, {} dirty ranges)",
+                    layer_path.display(),
+                    size,
+                    dirty_ranges.len()
+                );
+
+                // Arm/re-arm soft-dirty tracking for next incremental
+                if snapshot_type == SnapshotType::SoftDirty {
+                    if !self.soft_dirty_armed.load(Ordering::Acquire) {
+                        if probe_soft_dirty_support() {
+                            self.soft_dirty_armed.store(true, Ordering::Release);
+                        }
+                    } else {
+                        let _ = crate::soft_dirty::clear_soft_dirty();
+                    }
+                }
+
+                (layer_path, size, Some(parent))
+            }
+        };
+
+        // Build and save mem_image.json
+        let virtual_size: u64 = self
+            .snapshot_memory_ranges
+            .regions()
+            .iter()
+            .map(|r| r.gpa + r.length)
+            .max()
+            .unwrap_or(0);
+
+        let mem_image_config = lsmt::snapshot::build_mem_image_config(
+            parent_config.as_ref(),
+            &layer_path,
+            layer_size,
+            virtual_size,
+        );
+
+        mem_image_config.save(&mem_image_path).map_err(|e| {
+            MigratableError::MigrateSend(anyhow::anyhow!("save mem image config: {e}"))
+        })?;
+
+        info!(
+            "Memory snapshot saved: layer={} ({} bytes), config={}",
+            layer_path.display(),
+            layer_size,
+            mem_image_path.display()
+        );
+
+        Ok(mem_image_path)
     }
 
     fn create_anonymous_file(
@@ -3787,6 +4055,69 @@ impl MemoryManager {
         debug_assert_eq!(file_cursor, total_len);
 
         Ok(())
+    }
+
+    /// Collect dirty memory ranges from KVM dirty log + VMM bitmap.
+    ///
+    /// Returns a list of (gpa, length) pairs for pages marked dirty since
+    /// the last call. Both bitmaps are reset after reading.
+    fn collect_dirty_ranges(&self) -> result::Result<Vec<(u64, u64)>, MigratableError> {
+        let mut dirty_ranges = Vec::new();
+
+        for range in self.snapshot_memory_ranges.regions() {
+            let vmm_dirty_bitmap = match self
+                .guest_memory
+                .memory()
+                .find_region(GuestAddress(range.gpa))
+            {
+                Some(region) => {
+                    assert!(region.start_addr().raw_value() == range.gpa);
+                    assert!(region.len() == range.length);
+                    (**region).bitmap().get_and_reset()
+                }
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest memory region' with address {:x}",
+                        range.gpa
+                    )))
+                }
+            };
+
+            let slot = match self
+                .guest_ram_mappings
+                .iter()
+                .find(|map| map.gpa == range.gpa && map.size == range.length)
+            {
+                Some(map) => map.slot,
+                None => {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Error finding 'guest ram mapping' with address {:x}",
+                        range.gpa
+                    )))
+                }
+            };
+
+            let vm_dirty_bitmap = self
+                .vm
+                .get_dirty_log(slot, range.gpa, range.length)
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e))
+                })?;
+
+            let dirty_bitmap: Vec<u64> = vm_dirty_bitmap
+                .iter()
+                .zip(vmm_dirty_bitmap.iter())
+                .map(|(x, y)| x | y)
+                .collect();
+
+            let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, range.gpa, 4096);
+
+            for r in sub_table.regions() {
+                dirty_ranges.push((r.gpa, r.length));
+            }
+        }
+
+        Ok(dirty_ranges)
     }
 
     fn send_full_dirty_log(
