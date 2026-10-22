@@ -53,7 +53,7 @@ use crate::api::{
     ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmInfoResponse,
     VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse, VmWaitStartResponse,
 };
-use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
+use crate::config::{HostMacMode, MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::landlock::Landlock;
@@ -2062,6 +2062,14 @@ impl RequestHandler for Vmm {
                         }
                         if let Some(ref mac) = restore_tap.mac {
                             net_config.mac = mac.clone();
+                        }
+                        if let Some(host_mac_mode) = restore_tap.host_mac {
+                            match host_mac_mode {
+                                HostMacMode::Tap => {
+                                    net_config.host_mac = None;
+                                }
+                                HostMacMode::Preserve => {}
+                            }
                         }
                     }
                 }

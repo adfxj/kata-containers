@@ -2862,6 +2862,33 @@ pub struct RestoreFsConfig {
     pub source: String,
 }
 
+#[derive(Debug, Error)]
+pub enum HostMacModeParseError {
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum HostMacMode {
+    /// Keep the original host_mac from the VM configuration.
+    #[default]
+    Preserve,
+    /// Use the MAC address of the tap device itself.
+    Tap,
+}
+
+impl FromStr for HostMacMode {
+    type Err = HostMacModeParseError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "preserve" => Ok(Self::Preserve),
+            "tap" => Ok(Self::Tap),
+            _ => Err(HostMacModeParseError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoreTapConfig {
     #[serde(default)]
@@ -2874,6 +2901,8 @@ pub struct RestoreTapConfig {
     pub mask: Option<IpAddr>,
     #[serde(default)]
     pub mac: Option<MacAddr>,
+    #[serde(default)]
+    pub host_mac: Option<HostMacMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -2961,7 +2990,8 @@ impl RestoreConfig {
         \n`dirty_log` used when snapshot with vm start with dirty_log \
         \n`fs_backend_init` used when virtiofs has been mounted in guest or as rootfs for guest \
         \n`fs_sources` is source dir of virtiofs with pattern [tag1@/path/to/dir,tag2@/path/to/dir] \
-        \n`restore_taps` is tap devices with pattern [id1@[tap=tap1,ip=...,mask=...,mac=...],id2@[tap=tap2,ip=...,mask=...,mac=...],...] \
+        \n`restore_taps` is tap devices with pattern [id1@[tap=tap1,ip=...,mask=...,mac=...,host_mac=tap],id2@[tap=tap2,ip=...,mask=...,mac=...],...] \
+        \n`host_mac` in restore_taps controls the tap device MAC: `tap` uses the tap device's own MAC; if not specified, the original host_mac from VM config is preserved (default) \
         \n`disks` is disk devices with pattern [id1@[path=/path/to/disk1,rate_limit_group=group1,bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...] \
         \n`pmem` is pmem devices with pattern [id1@/path/to/pmem1,id2@/path/to/pmem2] \
         \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume \
@@ -3043,7 +3073,7 @@ impl RestoreConfig {
                             .and_then(|s| s.strip_suffix(']'))
                             .unwrap_or(config_str.as_str());
                         let mut tap_parser = OptionParser::new();
-                        tap_parser.add("tap").add("ip").add("mask").add("mac");
+                        tap_parser.add("tap").add("ip").add("mask").add("mac").add("host_mac");
                         tap_parser.parse(config_str).map_err(Error::ParseRestore)?;
                         Ok(RestoreTapConfig {
                             id: id.clone(),
@@ -3051,6 +3081,7 @@ impl RestoreConfig {
                             ip: tap_parser.convert("ip").map_err(Error::ParseRestore)?,
                             mask: tap_parser.convert("mask").map_err(Error::ParseRestore)?,
                             mac: tap_parser.convert("mac").map_err(Error::ParseRestore)?,
+                            host_mac: tap_parser.convert("host_mac").map_err(Error::ParseRestore)?,
                         })
                     })
                     .collect::<Result<_>>()

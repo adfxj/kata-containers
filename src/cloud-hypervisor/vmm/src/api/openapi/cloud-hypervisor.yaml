@@ -1530,6 +1530,11 @@ components:
         mask:
           type: string
           description: Restore tap subnet mask.
+        host_mac:
+          type: string
+          enum: [preserve, tap]
+          default: preserve
+          description: Controls the tap device MAC address. "tap" uses the tap device's own MAC. If not specified, the original host_mac from VM config is preserved (default).
 
     RestoreDiskConfig:
       type: object
