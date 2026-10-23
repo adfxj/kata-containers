@@ -644,8 +644,6 @@ fn vmm_thread_rules(
         (libc::SYS_exit, vec![]),
         (libc::SYS_exit_group, vec![]),
         (libc::SYS_fallocate, vec![]),
-        #[cfg(target_arch = "x86_64")]
-        (libc::SYS_fadvise64, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_fdatasync, vec![]),
         (libc::SYS_fstat, vec![]),

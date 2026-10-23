@@ -230,26 +230,6 @@ impl BalloonEpollHandler {
                     "fallocate PUNCH_HOLE failed ({}), falling back to MADV_DONTNEED only",
                     e
                 );
-
-                // For block device backing (e.g. ublk), PUNCH_HOLE is not supported.
-                // Use posix_fadvise(POSIX_FADV_DONTNEED) to drop the page cache
-                // for this range, otherwise the host RSS will not decrease and
-                // stale PTEs may persist.
-                let res2 = unsafe {
-                    libc::posix_fadvise64(
-                        f_off.file().as_raw_fd(),
-                        (offset + f_off.start()) as libc::off64_t,
-                        len as libc::off64_t,
-                        libc::POSIX_FADV_DONTNEED,
-                    )
-                };
-                if res2 != 0 {
-                    let e2 = io::Error::last_os_error();
-                    warn!(
-                        "posix_fadvise POSIX_FADV_DONTNEED also failed ({})",
-                        e2
-                    );
-                }
             }
         }
 
