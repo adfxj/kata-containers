@@ -531,15 +531,25 @@ impl CpuidFeatureEntry {
                 CpuidCompatibleCheck::NumNotGreater => src_vm_feature <= dest_vm_feature,
             };
             if !entry_compatible {
+                // Decode the differing bits into feature names for easier diagnosis
+                let diff_bits = src_vm_feature ^ dest_vm_feature;
+                let feature_names = Self::decode_cpuid_feature_diffs(
+                    entry.function,
+                    entry.feature_reg,
+                    diff_bits,
+                );
                 error!(
                     "Detected incompatible CPUID entry: leaf={:#02x} (subleaf={:#02x}), register='{:?}', \
-                    compatible_check='{:?}', source VM feature='{:#04x}', destination VM feature'{:#04x}'.",
+                    compatible_check='{:?}', source VM feature='{:#04x}', destination VM feature='{:#04x}'. \
+                    Diff bits='{:#04x}', differing features: [{}]",
                     entry.function,
                     entry.index,
                     entry.feature_reg,
                     entry.compatible_check,
                     src_vm_feature,
-                    dest_vm_feature
+                    dest_vm_feature,
+                    diff_bits,
+                    feature_names,
                 );
 
                 compatible = false;
@@ -551,6 +561,84 @@ impl CpuidFeatureEntry {
             Ok(())
         } else {
             Err(Error::CpuidCheckCompatibility)
+        }
+    }
+
+    /// Decode differing CPUID feature bits into human-readable names.
+    fn decode_cpuid_feature_diffs(function: u32, reg: CpuidReg, diff_bits: u32) -> String {
+        let names: &[(u32, &str)] = match (function, reg) {
+            (1, CpuidReg::ECX) => &[
+                (0, "SSE3"), (1, "PCLMULQDQ"), (2, "DTES64"), (3, "MONITOR"),
+                (4, "DS-CPL"), (5, "VMX"), (6, "SMX"), (7, "EIST/TM2"),
+                (8, "SSSE3"), (9, "CNXT-ID"), (11, "SDBG"), (12, "FMA"),
+                (13, "CMPXCHG16B"), (14, "xTPR"), (15, "PDCM"), (16, "PCID"),
+                (17, "DCA"), (18, "SSE4.1"), (19, "SSE4.2"), (20, "x2APIC"),
+                (21, "MOVBE"), (22, "POPCNT"), (23, "TSC-Deadline"), (24, "AESNI"),
+                (25, "XSAVE"), (26, "OSXSAVE"), (27, "AVX"), (28, "F16C"),
+                (29, "RDRAND"), (30, "HYPERVISOR"), (31, "LA57"),
+            ],
+            (1, CpuidReg::EDX) => &[
+                (0, "FPU"), (1, "VME"), (2, "DE"), (3, "PSE"),
+                (4, "TSC"), (5, "MSR"), (6, "PAE"), (7, "MCE"),
+                (8, "CMPXCHG8B"), (9, "APIC"), (11, "SYSENTER/SYSEXIT"), (12, "MTRR"),
+                (13, "PGE"), (14, "MCA"), (15, "CMOV"), (16, "PAT"),
+                (17, "PSE-36"), (19, "CLFLUSH"), (23, "MMX"), (24, "FXSR"),
+                (25, "SSE"), (26, "SSE2"), (28, "HTT"),
+            ],
+            (7, CpuidReg::EBX) => &[
+                (0, "FSGSBASE"), (1, "TSC-ADJUST"), (3, "BMI1"), (5, "AVX2"),
+                (6, "FDPEXT"), (7, "SMEP"), (8, "BMI2"), (9, "ERMS"),
+                (10, "INVPCID"), (11, "RTM"), (12, "RDT-M"), (13, "RDT-A"),
+                (14, "FPU-CS/DS"), (16, "MPX"), (18, "RDSEED"), (19, "ADX"),
+                (21, "SMAP"), (22, "AVX512F"), (23, "AVX512DQ"), (24, "RDSEED"),
+                (25, "AVX512IFMA"), (28, "AVX512CD"), (29, "SHA"), (30, "AVX512BW"),
+                (31, "AVX512VL"),
+            ],
+            (7, CpuidReg::ECX) => &[
+                (0, "PREFETCHW"), (1, "AVX512VBMI"), (2, "UMIP"), (3, "PKU"),
+                (4, "OSPKE"), (5, "WAITPKG"), (6, "AVX512-VBMI2"), (7, "CET-SS"),
+                (8, "GFNI"), (9, "VAES"), (10, "VPCLMULQDQ"), (11, "AVX512-VNNI"),
+                (12, "AVX512-BITALG"), (13, "TME"), (14, "AVX512-VPOPCNTDQ"),
+                (15, "FZRM"), (16, "FSRS"), (17, "FSRC"), (18, "FDP"),
+                (22, "RDPID"), (24, "CLDEMOTE"), (25, "MOVDIRI"), (27, "MOVDIR64B"),
+                (28, "ENQCMD"), (29, "SGX-LC"),
+            ],
+            (7, CpuidReg::EDX) => &[
+                (0, "AVX512-4VNNIW"), (1, "AVX512-4FMAPS"), (2, "FSRM"),
+                (4, "FDP"), (5, "FUS"), (6, "FSRM"), (8, "AVX512-VP2INTERSECT"),
+                (10, "MD-CLEAR"), (14, "SERIALIZE"), (16, "TSXLDTRK"),
+                (18, "PCONFIG"), (19, "ARCH-LBR"), (22, "AMX-BF16"),
+                (23, "AVX512-FP16"), (24, "AMX-TILE"), (25, "AMX-INT8"),
+                (26, "IBRS/IBPB"), (27, "STIBP"), (28, "FLUSH_CMD"), (29, "ARCH_CAPS"),
+                (31, "SSBD"),
+            ],
+            (0x8000_0001, CpuidReg::EDX) => &[
+                (11, "SYSCALL/SYSRET"), (20, "NX"), (22, "MMXEXT"), (23, "MMX"),
+                (24, "FXSR"), (25, "FFXSR"), (26, "1GB-PAGES"), (27, "RDTSCP"),
+                (29, "LM"), (30, "3DNowExt"), (31, "3DNow"),
+            ],
+            (0x8000_0001, CpuidReg::ECX) => &[
+                (0, "LAHF/SAHF"), (1, "CMP_LEGACY"), (2, "SVM"), (3, "EXTAPIC"),
+                (4, "CR8_LEGACY"), (5, "ABM"), (6, "SSE4A"), (7, "MISALIGNSSE"),
+                (8, "PREFETCHW"), (9, "OSVW"), (10, "IBS"), (11, "XOP"),
+                (12, "SKINIT"), (13, "WDT"), (15, "LWP"), (16, "FMA4"),
+                (17, "TCE"), (21, "TBM"), (22, "TOPOEXT"), (23, "PERFCTR_CORE"),
+                (24, "PERFCTR_NB"), (26, "BPEXT"), (27, "PERFCTR_TSC"),
+                (28, "PERFCTR_LLC"), (29, "MWAITX"), (30, "ADMX"), (31, "DDP"),
+            ],
+            _ => &[],
+        };
+
+        let mut result = Vec::new();
+        for &(bit, name) in names {
+            if (diff_bits >> bit) & 1 == 1 {
+                result.push(format!("bit{}={}", bit, name));
+            }
+        }
+        if result.is_empty() {
+            format!("unknown diff bits: {:#x}", diff_bits)
+        } else {
+            result.join(", ")
         }
     }
 }
