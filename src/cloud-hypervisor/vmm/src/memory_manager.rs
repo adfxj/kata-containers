@@ -2415,58 +2415,6 @@ impl MemoryManager {
                 let layer_path =
                     dest_dir.join(format!("memory-ranges-incremental-{}", incr_idx));
 
-                // Get dirty page ranges using soft-dirty or pagemap-anon
-                let guest_memory = self.guest_memory.memory();
-
-                let filtered = if snapshot_type == SnapshotType::SoftDirty
-                    && self.soft_dirty_armed.load(Ordering::Acquire)
-                {
-                    let (table, stats) =
-                        crate::soft_dirty::filter_memory_ranges_by_anon_and_soft_dirty(
-                            &guest_memory,
-                            &self.snapshot_memory_ranges,
-                        )
-                        .map_err(|e| {
-                            MigratableError::MigrateSend(anyhow::anyhow!(
-                                "soft-dirty filter failed: {e}"
-                            ))
-                        })?;
-                    info!(
-                        "Incremental: soft-dirty found {} dirty ranges ({} bytes)",
-                        table.regions().len(),
-                        stats.saved_bytes
-                    );
-                    table
-                } else {
-                    let (table, stats) =
-                        crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon(
-                            &guest_memory,
-                            &self.snapshot_memory_ranges,
-                        )
-                        .map_err(|e| {
-                            MigratableError::MigrateSend(anyhow::anyhow!(
-                                "pagemap-anon filter failed: {e}"
-                            ))
-                        })?;
-                    info!(
-                        "Incremental: pagemap-anon found {} anon ranges ({} bytes)",
-                        table.regions().len(),
-                        stats.saved_bytes
-                    );
-                    table
-                };
-
-                let dirty_ranges: Vec<(u64, u64)> = filtered
-                    .regions()
-                    .iter()
-                    .map(|r| (r.gpa, r.length))
-                    .collect();
-
-                if dirty_ranges.is_empty() {
-                    info!("Incremental snapshot: no dirty pages, creating empty LSMT layer");
-                }
-
-                // Write dirty pages to LSMT layer
                 let virtual_size: u64 = self
                     .snapshot_memory_ranges
                     .regions()
@@ -2475,6 +2423,71 @@ impl MemoryManager {
                     .max()
                     .unwrap_or(0);
 
+                // Get dirty page ranges:
+                // 1. If dirty_log (KVM dirty bitmap) is enabled, use it — the most
+                //    reliable method, survives balloon MADV_DONTNEED page eviction.
+                // 2. If soft-dirty is armed, use soft-dirty tracking.
+                // 3. Otherwise fall back to pagemap-anon (finds all CoW anon pages).
+                let dirty_ranges: Vec<(u64, u64)> = if self.dirty_log {
+                    let ranges = self.collect_dirty_ranges()?;
+                    info!(
+                        "Incremental: dirty_log found {} dirty ranges",
+                        ranges.len()
+                    );
+                    ranges
+                } else {
+                    let guest_memory = self.guest_memory.memory();
+
+                    let filtered = if snapshot_type == SnapshotType::SoftDirty
+                        && self.soft_dirty_armed.load(Ordering::Acquire)
+                    {
+                        let (table, stats) =
+                            crate::soft_dirty::filter_memory_ranges_by_anon_and_soft_dirty(
+                                &guest_memory,
+                                &self.snapshot_memory_ranges,
+                            )
+                            .map_err(|e| {
+                                MigratableError::MigrateSend(anyhow::anyhow!(
+                                    "soft-dirty filter failed: {e}"
+                                ))
+                            })?;
+                        info!(
+                            "Incremental: soft-dirty found {} dirty ranges ({} bytes)",
+                            table.regions().len(),
+                            stats.saved_bytes
+                        );
+                        table
+                    } else {
+                        let (table, stats) =
+                            crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon(
+                                &guest_memory,
+                                &self.snapshot_memory_ranges,
+                            )
+                            .map_err(|e| {
+                                MigratableError::MigrateSend(anyhow::anyhow!(
+                                    "pagemap-anon filter failed: {e}"
+                                ))
+                            })?;
+                        info!(
+                            "Incremental: pagemap-anon found {} anon ranges ({} bytes)",
+                            table.regions().len(),
+                            stats.saved_bytes
+                        );
+                        table
+                    };
+
+                    filtered
+                        .regions()
+                        .iter()
+                        .map(|r| (r.gpa, r.length))
+                        .collect()
+                };
+
+                if dirty_ranges.is_empty() {
+                    info!("Incremental snapshot: no dirty pages, creating empty LSMT layer");
+                }
+
+                let guest_memory = self.guest_memory.memory();
                 let reader = GuestMemReader(&*guest_memory);
 
                 let size = lsmt::snapshot::capture_dirty_pages(
