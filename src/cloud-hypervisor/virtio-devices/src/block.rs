@@ -6,6 +6,8 @@
 //
 // Copyright © 2020 Intel Corporation
 //
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::cmp::max;
@@ -21,7 +23,7 @@ use std::{io, result};
 use anyhow::anyhow;
 use block::async_io::{AsyncIo, AsyncIoError};
 use block::disk_file::AsyncFullDiskFile;
-use block::error::{BlockError, BlockResult};
+use block::error::BlockError;
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
@@ -155,7 +157,7 @@ struct BlockEpollHandler {
     disk_image: Box<dyn AsyncIo>,
     disk_nsectors: Arc<AtomicU64>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
-    serial: Vec<u8>,
+    serial: Box<[u8]>,
     kill_evt: EventFd,
     pause_evt: EventFd,
     writeback: Arc<AtomicBool>,
@@ -164,7 +166,7 @@ struct BlockEpollHandler {
     inflight_requests: VecDeque<(u16, Request)>,
     rate_limiter: Option<RateLimiterGroupHandle>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
-    host_cpus: Option<Vec<usize>>,
+    host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
     disable_sector0_writes: bool,
 }
@@ -303,7 +305,7 @@ impl BlockEpollHandler {
             request.writeback = self.writeback.load(Ordering::Acquire);
 
             let result = request.execute_async(
-                desc_chain.memory(),
+                self.mem.memory().into_inner(),
                 self.disk_nsectors.load(Ordering::SeqCst),
                 self.disk_image.as_mut(),
                 &self.serial,
@@ -317,15 +319,7 @@ impl BlockEpollHandler {
             }) = result
             {
                 if let Some(batch_request) = batch_request {
-                    match batch_request.request_type {
-                        RequestType::In | RequestType::Out => batch_requests.push(batch_request),
-                        _ => {
-                            unreachable!(
-                                "Unexpected batch request type: {:?}",
-                                request.request_type()
-                            )
-                        }
-                    }
+                    batch_requests.push(batch_request);
                     batch_inflight_requests.push((desc_chain.head_index(), request));
                 } else {
                     self.inflight_requests
@@ -363,24 +357,26 @@ impl BlockEpollHandler {
             }
         }
 
-        match self.disk_image.submit_batch_requests(&batch_requests) {
-            Ok(()) => {
-                self.inflight_requests.extend(batch_inflight_requests);
-            }
-            Err(e) => {
-                // If batch submission fails, report VIRTIO_BLK_S_IOERR for all requests.
-                for (user_data, request) in batch_inflight_requests {
-                    warn!("Request failed with batch submission: {request:x?} {e:?}");
-                    let desc_index = user_data;
-                    let mem = self.mem.memory();
-                    mem.write_obj(VIRTIO_BLK_S_IOERR as u8, request.status_addr())
-                        .map_err(Error::RequestStatus)?;
-                    queue
-                        .add_used(mem.deref(), desc_index, 1)
-                        .map_err(Error::QueueAddUsed)?;
-                    queue
-                        .enable_notification(mem.deref())
-                        .map_err(Error::QueueEnableNotification)?;
+        if !batch_requests.is_empty() {
+            match self.disk_image.submit_batch_operations(batch_requests) {
+                Ok(()) => {
+                    self.inflight_requests.extend(batch_inflight_requests);
+                }
+                Err(e) => {
+                    // If batch submission fails, report VIRTIO_BLK_S_IOERR for all requests.
+                    for (user_data, request) in batch_inflight_requests {
+                        warn!("Request failed with batch submission: {request:x?} {e:?}");
+                        let desc_index = user_data;
+                        let mem = self.mem.memory();
+                        mem.write_obj(VIRTIO_BLK_S_IOERR as u8, request.status_addr())
+                            .map_err(Error::RequestStatus)?;
+                        queue
+                            .add_used(mem.deref(), desc_index, 1)
+                            .map_err(Error::QueueAddUsed)?;
+                        queue
+                            .enable_notification(mem.deref())
+                            .map_err(Error::QueueEnableNotification)?;
+                    }
                 }
             }
         }
@@ -451,13 +447,14 @@ impl BlockEpollHandler {
         let mut read_ops = Wrapping(0);
         let mut write_ops = Wrapping(0);
 
-        while let Some((user_data, result)) = self.disk_image.next_completed_request() {
-            let desc_index = user_data as u16;
+        while let Some(mut completion) = self.disk_image.next_completion() {
+            let result = completion.result;
+            let desc_index = completion.user_data as u16;
 
             let mut request = self.find_inflight_request(desc_index)?;
 
             request
-                .complete_async(&mem)
+                .complete_async(&mem, &mut completion)
                 .map_err(Error::RequestCompleting)?;
 
             let latency = request.start().elapsed().as_micros() as u64;
@@ -723,8 +720,8 @@ pub struct Block {
     seccomp_action: SeccompAction,
     rate_limiter: Option<Arc<RateLimiterGroup>>,
     exit_evt: EventFd,
-    serial: Vec<u8>,
-    queue_affinity: BTreeMap<u16, Vec<usize>>,
+    serial: Box<[u8]>,
+    queue_affinity: BTreeMap<u16, Box<[usize]>>,
     disable_sector0_writes: bool,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
@@ -755,7 +752,7 @@ impl Block {
         rate_limiter: Option<Arc<RateLimiterGroup>>,
         exit_evt: EventFd,
         state: Option<BlockState>,
-        queue_affinity: BTreeMap<u16, Vec<usize>>,
+        queue_affinity: BTreeMap<u16, Box<[usize]>>,
         sparse: bool,
         disable_sector0_writes: bool,
         lock_granularity: LockGranularityChoice,
@@ -862,7 +859,9 @@ impl Block {
                 (disk_nsectors, avail_features, 0, config, false)
             };
 
-        let serial = serial.map_or_else(|| build_serial(&disk_path), Vec::from);
+        let serial = serial
+            .map_or_else(|| build_serial(&disk_path), Vec::from)
+            .into_boxed_slice();
 
         Ok(Block {
             common: VirtioCommon {
@@ -1112,41 +1111,25 @@ impl VirtioDevice for Block {
         let mut epoll_threads = Vec::new();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
-        let queue_data: Vec<(u16, Queue, EventFd, EventFd, EventFd)> = queues
-            .drain(..)
-            .enumerate()
-            .map(|(i, (_, mut queue, queue_evt))| {
-                queue.set_event_idx(event_idx);
-                let (kill_evt, pause_evt) = self.common.dup_eventfds();
-                (i as u16, queue, queue_evt, kill_evt, pause_evt)
-            })
-            .collect();
+        for i in 0..queues.len() {
+            let (_, mut queue, queue_evt) = queues.remove(0);
+            queue.set_event_idx(event_idx);
 
-        let async_ios: Vec<BlockResult<Box<dyn AsyncIo>>> = std::thread::scope(|s| {
-            let disk_image = &self.disk_image;
-            queue_data
-                .iter()
-                .map(|(_, queue, _, _, _)| {
-                    let queue_size = queue.size() as u32;
-                    s.spawn(move || disk_image.create_async_io(queue_size))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect()
-        });
+            let queue_size = queue.size();
+            let (kill_evt, pause_evt) = self.common.dup_eventfds();
+            let queue_idx = i as u16;
 
-        for ((queue_idx, queue, queue_evt, kill_evt, pause_evt), async_io) in
-            queue_data.into_iter().zip(async_ios.into_iter())
-        {
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
                 queue,
                 mem: mem.clone(),
-                disk_image: async_io.map_err(|e| {
-                    error!("failed to create new AsyncIo: {e}");
-                    ActivateError::BadActivate
-                })?,
+                disk_image: self
+                    .disk_image
+                    .create_async_io(queue_size as u32)
+                    .map_err(|e| {
+                        error!("failed to create new AsyncIo: {e}");
+                        ActivateError::BadActivate
+                    })?,
                 disk_nsectors: self.disk_nsectors.clone(),
                 interrupt_cb: interrupt_cb.clone(),
                 serial: self.serial.clone(),
@@ -1155,6 +1138,9 @@ impl VirtioDevice for Block {
                 writeback: self.writeback.clone(),
                 counters: self.counters.clone(),
                 queue_evt,
+                // Analysis during boot shows around ~40 maximum requests
+                // This gives head room for systems with slower I/O without
+                // compromising the cost of the reallocation or memory overhead
                 inflight_requests: VecDeque::with_capacity(64),
                 rate_limiter: self
                     .rate_limiter
@@ -1172,7 +1158,7 @@ impl VirtioDevice for Block {
             let paused_sync = self.common.paused_sync.clone();
 
             spawn_virtio_thread(
-                &format!("{}_q{}", self.id.clone(), queue_idx),
+                &format!("{}_q{}", self.id.clone(), i),
                 &self.seccomp_action,
                 Thread::VirtioBlock,
                 &mut epoll_threads,
