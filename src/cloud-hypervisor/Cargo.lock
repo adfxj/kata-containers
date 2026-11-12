@@ -2246,6 +2246,7 @@ dependencies = [
  "serde_json",
  "test_infra",
  "thiserror 2.0.18",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
 ]
 
