@@ -1,30 +1,35 @@
 // Copyright © 2021 Intel Corporation
 //
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 
-use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::SECTOR_SIZE;
-use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
+use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
+use crate::sparse::{punch_hole, write_zeroes};
+use crate::{SECTOR_SIZE, is_block_device};
 
 pub struct RawFileSync {
     fd: RawFd,
     eventfd: EventFd,
-    completion_list: VecDeque<(u64, i32)>,
+    completion_list: VecDeque<AsyncIoCompletion>,
     alignment: u64,
+    is_block_device: bool,
 }
 
 impl RawFileSync {
     pub fn new(fd: RawFd) -> Self {
+        let is_block_device = is_block_device(fd);
         RawFileSync {
             fd,
             eventfd: EventFd::new(libc::EFD_NONBLOCK).expect("Failed creating EventFd for RawFile"),
             completion_list: VecDeque::new(),
             alignment: SECTOR_SIZE,
+            is_block_device,
         }
     }
 }
@@ -57,7 +62,8 @@ impl AsyncIo for RawFileSync {
             return Err(AsyncIoError::ReadVectored(std::io::Error::last_os_error()));
         }
 
-        self.completion_list.push_back((user_data, result as i32));
+        self.completion_list
+            .push_back(AsyncIoCompletion::new(user_data, result as i32, None));
         self.eventfd.write(1).unwrap();
 
         Ok(())
@@ -82,7 +88,54 @@ impl AsyncIo for RawFileSync {
             return Err(AsyncIoError::WriteVectored(std::io::Error::last_os_error()));
         }
 
-        self.completion_list.push_back((user_data, result as i32));
+        self.completion_list
+            .push_back(AsyncIoCompletion::new(user_data, result as i32, None));
+        self.eventfd.write(1).unwrap();
+
+        Ok(())
+    }
+
+    fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
+        let offset = op.offset();
+        let is_read = op.is_read();
+        let iovecs = op.iovecs();
+
+        let result = if is_read {
+            // SAFETY: the memory pointed to by `iovecs` is backed by the op,
+            // and valid for the kernel to write to by construction of
+            // AsyncIoOperation.
+            unsafe {
+                libc::preadv(
+                    self.fd as libc::c_int,
+                    iovecs.as_ptr(),
+                    iovecs.len() as libc::c_int,
+                    offset,
+                )
+            }
+        } else {
+            // SAFETY: the memory pointed to by `iovecs` is backed by the op,
+            // and valid for the kernel to read from by construction of
+            // AsyncIoOperation.
+            unsafe {
+                libc::pwritev(
+                    self.fd as libc::c_int,
+                    iovecs.as_ptr(),
+                    iovecs.len() as libc::c_int,
+                    offset,
+                )
+            }
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(if is_read {
+                AsyncIoError::ReadVectored(error)
+            } else {
+                AsyncIoError::WriteVectored(error)
+            });
+        }
+
+        self.completion_list
+            .push_back(AsyncIoCompletion::from_operation(op, result as i32));
         self.eventfd.write(1).unwrap();
 
         Ok(())
@@ -96,58 +149,33 @@ impl AsyncIo for RawFileSync {
         }
 
         if let Some(user_data) = user_data {
-            self.completion_list.push_back((user_data, result));
+            self.completion_list
+                .push_back(AsyncIoCompletion::new(user_data, result, None));
             self.eventfd.write(1).unwrap();
         }
 
         Ok(())
     }
 
-    fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+    fn next_completion(&mut self) -> Option<AsyncIoCompletion> {
         self.completion_list.pop_front()
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
-
-        // SAFETY: FFI call with valid arguments
-        let result = unsafe {
-            libc::fallocate(
-                self.fd as libc::c_int,
-                mode,
-                offset as libc::off_t,
-                length as libc::off_t,
-            )
-        };
-        if result < 0 {
-            return Err(AsyncIoError::PunchHole(std::io::Error::last_os_error()));
-        }
-
-        self.completion_list.push_back((user_data, result));
+        punch_hole(self.fd, self.is_block_device, offset, length)
+            .map_err(AsyncIoError::PunchHole)?;
+        self.completion_list
+            .push_back(AsyncIoCompletion::new(user_data, 0, None));
         self.eventfd.write(1).unwrap();
-
         Ok(())
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        let mode = FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE;
-
-        // SAFETY: FFI call with valid arguments
-        let result = unsafe {
-            libc::fallocate(
-                self.fd as libc::c_int,
-                mode,
-                offset as libc::off_t,
-                length as libc::off_t,
-            )
-        };
-        if result < 0 {
-            return Err(AsyncIoError::WriteZeroes(std::io::Error::last_os_error()));
-        }
-
-        self.completion_list.push_back((user_data, result));
+        write_zeroes(self.fd, self.is_block_device, offset, length)
+            .map_err(AsyncIoError::WriteZeroes)?;
+        self.completion_list
+            .push_back(AsyncIoCompletion::new(user_data, 0, None));
         self.eventfd.write(1).unwrap();
-
         Ok(())
     }
 }
