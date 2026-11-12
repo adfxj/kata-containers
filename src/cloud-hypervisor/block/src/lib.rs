@@ -34,6 +34,7 @@ mod raw_async_io_tests;
 pub mod raw_disk;
 pub(crate) mod raw_sync;
 mod request;
+pub(crate) mod sparse;
 pub mod vhd;
 pub mod vhdx;
 pub mod vhdx_sync;
@@ -45,7 +46,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
 use std::{cmp, mem, result};
@@ -332,26 +333,25 @@ pub fn block_io_uring_is_supported() -> bool {
     }
 }
 
+/// Returns `true` iff `fd` refers to a block device.
+///
+/// Returns `false` if the `fstat()` probe itself fails. Callers that need to
+/// distinguish "not a block device" from "couldn't tell" should fall back to
+/// regular-file behaviour, which is what every current caller already does.
+pub(crate) fn is_block_device(fd: RawFd) -> bool {
+    // SAFETY: `libc::stat` is POD; zero-initialization is a valid bit pattern
+    // and `fstat` overwrites every field it cares about on success.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: FFI call with a valid fd and a valid out-pointer.
+    let ret = unsafe { libc::fstat(fd, &mut stat) };
+    ret == 0 && stat.st_mode & S_IFMT == S_IFBLK
+}
+
 /// Probe whether the file/device supports punch hole and zero range
 pub fn probe_sparse_support(file: &File) -> bool {
     let fd = file.as_raw_fd();
 
-    let is_block_device = {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: FFI call with valid fd and buffer
-        let ret = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
-        if ret != 0 {
-            warn!(
-                "Failed to stat file descriptor for sparse probe: {}",
-                io::Error::last_os_error()
-            );
-            return false;
-        }
-        // SAFETY: stat result is valid at this point
-        unsafe { (*stat.as_ptr()).st_mode & S_IFMT == S_IFBLK }
-    };
-
-    if is_block_device {
+    if is_block_device(fd) {
         probe_block_device_sparse_support(fd)
     } else {
         probe_file_sparse_support(fd)
