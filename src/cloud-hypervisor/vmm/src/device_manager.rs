@@ -2851,7 +2851,7 @@ impl DeviceManager {
             let queue_affinity = if let Some(queue_affinity) = disk_cfg.queue_affinity.as_ref() {
                 queue_affinity
                     .iter()
-                    .map(|a| (a.queue_index, a.host_cpus.clone()))
+                    .map(|a| (a.queue_index, a.host_cpus.clone().into_boxed_slice()))
                     .collect()
             } else {
                 BTreeMap::new()
