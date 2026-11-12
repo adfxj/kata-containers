@@ -1,5 +1,7 @@
 // Copyright © 2021 Intel Corporation
 //
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::cmp::min;
@@ -10,7 +12,7 @@ use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::write_zeroes::{PunchHole, WriteZeroesAt};
 
-use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
+use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
 use crate::qcow::decoder::Decoder;
 use crate::qcow::metadata::{
     BackingRead, ClusterReadMapping, ClusterWriteMapping, DeallocAction, QcowMetadata,
@@ -33,7 +35,7 @@ pub struct QcowSync {
     cluster_size: u64,
     decoder: Arc<dyn Decoder>,
     eventfd: EventFd,
-    completion_list: VecDeque<(u64, i32)>,
+    completion_list: VecDeque<AsyncIoCompletion>,
 }
 
 impl QcowSync {
@@ -57,19 +59,34 @@ impl QcowSync {
             completion_list: VecDeque::new(),
         }
     }
-}
 
-impl AsyncIo for QcowSync {
-    fn notifier(&self) -> &EventFd {
-        &self.eventfd
+    fn apply_dealloc_action(&mut self, action: &DeallocAction) {
+        match action {
+            DeallocAction::PunchHole {
+                host_offset,
+                length,
+            } => {
+                let _ = self.data_file.file_mut().punch_hole(*host_offset, *length);
+            }
+            DeallocAction::WriteZeroes {
+                host_offset,
+                length,
+            } => {
+                let _ = self
+                    .data_file
+                    .file_mut()
+                    .write_zeroes_at(*host_offset, *length);
+            }
+        }
     }
 
-    fn read_vectored(
+    // SAFETY: each iovec must describe writable memory that remains valid for
+    // this synchronous call and must be safe to turn into a mutable Rust slice.
+    unsafe fn read_iovecs(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
-        user_data: u64,
-    ) -> AsyncIoResult<()> {
+    ) -> AsyncIoResult<usize> {
         let address = offset as u64;
         let total_len: usize = iovecs.iter().map(|v| v.iov_len).sum();
 
@@ -83,7 +100,7 @@ impl AsyncIo for QcowSync {
         for mapping in mappings {
             match mapping {
                 ClusterReadMapping::Zero { length } => {
-                    // SAFETY: iovecs point to valid guest memory buffers
+                    // SAFETY: Guaranteed by read_iovecs' caller.
                     unsafe { zero_fill_iovecs(iovecs, buf_offset, length as usize) };
                     buf_offset += length as usize;
                 }
@@ -103,14 +120,14 @@ impl AsyncIo for QcowSync {
                             self.alignment,
                         )
                         .map_err(AsyncIoError::ReadVectored)?;
-                        // SAFETY: iovecs point to valid guest memory buffers
+                        // SAFETY: Guaranteed by read_iovecs' caller.
                         unsafe { scatter_to_iovecs(iovecs, buf_offset, abuf.as_slice(len)) };
                     } else {
                         // No O_DIRECT, plain buffer is fine.
                         let mut buf = vec![0u8; len];
                         pread_exact(self.data_file.as_raw_fd(), &mut buf, host_offset)
                             .map_err(AsyncIoError::ReadVectored)?;
-                        // SAFETY: iovecs point to valid guest memory buffers
+                        // SAFETY: Guaranteed by read_iovecs' caller.
                         unsafe { scatter_to_iovecs(iovecs, buf_offset, &buf) };
                     }
                     buf_offset += len;
@@ -127,7 +144,7 @@ impl AsyncIo for QcowSync {
                     let decompressed =
                         decompress_cluster(&compressed, self.cluster_size as usize, &*self.decoder)
                             .map_err(AsyncIoError::ReadVectored)?;
-                    // SAFETY: iovecs point to valid guest memory buffers
+                    // SAFETY: Guaranteed by read_iovecs' caller.
                     unsafe {
                         scatter_to_iovecs(
                             iovecs,
@@ -147,25 +164,23 @@ impl AsyncIo for QcowSync {
                         .unwrap()
                         .read_at(backing_offset, &mut buf)
                         .map_err(AsyncIoError::ReadVectored)?;
-                    // SAFETY: iovecs point to valid guest memory buffers
+                    // SAFETY: Guaranteed by read_iovecs' caller.
                     unsafe { scatter_to_iovecs(iovecs, buf_offset, &buf) };
                     buf_offset += length as usize;
                 }
             }
         }
 
-        self.completion_list
-            .push_back((user_data, total_len as i32));
-        self.eventfd.write(1).unwrap();
-        Ok(())
+        Ok(total_len)
     }
 
-    fn write_vectored(
+    // SAFETY: each iovec must describe readable memory that remains valid for
+    // this synchronous call and must be safe to turn into a shared Rust slice.
+    unsafe fn write_iovecs(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
-        user_data: u64,
-    ) -> AsyncIoResult<()> {
+    ) -> AsyncIoResult<usize> {
         let address = offset as u64;
         let total_len: usize = iovecs.iter().map(|v| v.iov_len).sum();
         let mut buf_offset = 0usize;
@@ -206,7 +221,7 @@ impl AsyncIo for QcowSync {
                         // O_DIRECT, gather directly into aligned buffer.
                         let mut abuf = AlignedBuf::new(count, self.alignment)
                             .map_err(AsyncIoError::WriteVectored)?;
-                        // SAFETY: iovecs point to valid guest memory buffers
+                        // SAFETY: Guaranteed by write_iovecs' caller.
                         unsafe {
                             gather_from_iovecs_into(iovecs, buf_offset, abuf.as_mut_slice(count));
                         }
@@ -219,7 +234,7 @@ impl AsyncIo for QcowSync {
                         .map_err(AsyncIoError::WriteVectored)?;
                     } else {
                         // No O_DIRECT, plain buffer is fine.
-                        // SAFETY: iovecs point to valid guest memory buffers
+                        // SAFETY: Guaranteed by write_iovecs' caller.
                         let buf = unsafe { gather_from_iovecs(iovecs, buf_offset, count) };
                         pwrite_all(self.data_file.as_raw_fd(), &buf, host_offset)
                             .map_err(AsyncIoError::WriteVectored)?;
@@ -229,8 +244,66 @@ impl AsyncIo for QcowSync {
             buf_offset += count;
         }
 
+        Ok(total_len)
+    }
+}
+
+impl AsyncIo for QcowSync {
+    fn notifier(&self) -> &EventFd {
+        &self.eventfd
+    }
+
+    fn read_vectored(
+        &mut self,
+        offset: libc::off_t,
+        iovecs: &[libc::iovec],
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        // SAFETY: the legacy caller is responsible for keeping the borrowed
+        // iovecs valid for this synchronous call and for ensuring that turning
+        // their pointers into Rust slices does not violate aliasing rules.
+        let total_len = unsafe { self.read_iovecs(offset, iovecs)? };
         self.completion_list
-            .push_back((user_data, total_len as i32));
+            .push_back(AsyncIoCompletion::new(user_data, total_len as i32, None));
+        self.eventfd.write(1).unwrap();
+        Ok(())
+    }
+
+    fn write_vectored(
+        &mut self,
+        offset: libc::off_t,
+        iovecs: &[libc::iovec],
+        user_data: u64,
+    ) -> AsyncIoResult<()> {
+        // SAFETY: the legacy caller is responsible for keeping the borrowed
+        // iovecs valid for this synchronous call and for ensuring that turning
+        // their pointers into Rust slices does not violate aliasing rules.
+        let total_len = unsafe { self.write_iovecs(offset, iovecs)? };
+        self.completion_list
+            .push_back(AsyncIoCompletion::new(user_data, total_len as i32, None));
+        self.eventfd.write(1).unwrap();
+        Ok(())
+    }
+
+    fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
+        let offset = op.offset();
+        let is_read = op.is_read();
+        let iovecs = op.iovecs();
+        let total_len = if is_read {
+            // SAFETY: AsyncIoOperation keeps the iovec target alive for this
+            // synchronous call. Host-memory operations also satisfy the
+            // aliasing requirement above; guest-memory-backed iovecs remain a
+            // temporary unsound qcow sync case deferred to a later fix.
+            unsafe { self.read_iovecs(offset, iovecs)? }
+        } else {
+            // SAFETY: AsyncIoOperation keeps the iovec target alive for this
+            // synchronous call. Host-memory operations also satisfy the
+            // aliasing requirement above; guest-memory-backed iovecs remain a
+            // temporary unsound qcow sync case deferred to a later fix.
+            unsafe { self.write_iovecs(offset, iovecs)? }
+        };
+        self.completion_list
+            .push_back(AsyncIoCompletion::from_operation(op, total_len as i32));
         self.eventfd.write(1).unwrap();
         Ok(())
     }
@@ -238,54 +311,36 @@ impl AsyncIo for QcowSync {
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
         self.metadata.flush().map_err(AsyncIoError::Fsync)?;
         if let Some(user_data) = user_data {
-            self.completion_list.push_back((user_data, 0));
+            self.completion_list
+                .push_back(AsyncIoCompletion::new(user_data, 0, None));
             self.eventfd.write(1).unwrap();
         }
         Ok(())
     }
 
-    fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+    fn next_completion(&mut self) -> Option<AsyncIoCompletion> {
         self.completion_list.pop_front()
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        let virtual_size = self.metadata.virtual_size();
-        let cluster_size = self.cluster_size;
-
         let result = self
             .metadata
             .deallocate_bytes(
                 offset,
                 length as usize,
                 self.sparse,
-                virtual_size,
-                cluster_size,
+                false,
                 self.backing_file.as_deref(),
             )
             .map_err(AsyncIoError::PunchHole);
 
         match result {
             Ok(actions) => {
-                for action in actions {
-                    match action {
-                        DeallocAction::PunchHole {
-                            host_offset,
-                            length,
-                        } => {
-                            let _ = self.data_file.file_mut().punch_hole(host_offset, length);
-                        }
-                        DeallocAction::WriteZeroes {
-                            host_offset,
-                            length,
-                        } => {
-                            let _ = self
-                                .data_file
-                                .file_mut()
-                                .write_zeroes_at(host_offset, length);
-                        }
-                    }
+                for action in &actions {
+                    self.apply_dealloc_action(action);
                 }
-                self.completion_list.push_back((user_data, 0));
+                self.completion_list
+                    .push_back(AsyncIoCompletion::new(user_data, 0, None));
                 self.eventfd.write(1).unwrap();
                 Ok(())
             }
@@ -295,7 +350,8 @@ impl AsyncIo for QcowSync {
                 } else {
                     -libc::EIO
                 };
-                self.completion_list.push_back((user_data, errno));
+                self.completion_list
+                    .push_back(AsyncIoCompletion::new(user_data, errno, None));
                 self.eventfd.write(1).unwrap();
                 Ok(())
             }
@@ -303,25 +359,100 @@ impl AsyncIo for QcowSync {
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        // For QCOW2 write_zeroes uses cluster deallocation, same as punch_hole.
-        // Unallocated clusters inherently read as zero in the QCOW2 format.
-        self.punch_hole(offset, length, user_data)
+        let result = self
+            .metadata
+            .deallocate_bytes(
+                offset,
+                length as usize,
+                self.sparse,
+                true,
+                self.backing_file.as_deref(),
+            )
+            .map_err(AsyncIoError::WriteZeroes);
+
+        match result {
+            Ok(actions) => {
+                for action in &actions {
+                    self.apply_dealloc_action(action);
+                }
+                self.completion_list
+                    .push_back(AsyncIoCompletion::new(user_data, 0, None));
+                self.eventfd.write(1).unwrap();
+                Ok(())
+            }
+            Err(e) => {
+                let errno = if let AsyncIoError::WriteZeroes(ref io_err) = e {
+                    -io_err.raw_os_error().unwrap_or(libc::EIO)
+                } else {
+                    -libc::EIO
+                };
+                self.completion_list
+                    .push_back(AsyncIoCompletion::new(user_data, errno, None));
+                self.eventfd.write(1).unwrap();
+                Ok(())
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod unit_tests {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::RawFd;
-    use std::thread;
+    use std::path::Path;
+    use std::{env, thread};
 
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::async_io::{AsyncIoCompletion, OwnedIoBuffer};
     use crate::disk_file::{AsyncDiskFile, DiskSize, Resizable};
-    use crate::qcow::{BackingFileConfig, ImageType, QcowFile, RawFile};
+    use crate::error::BlockErrorKind;
+    use crate::qcow::{
+        BackingFileConfig, Error as QcowError, ImageType, QcowFile, QcowHeader, RawFile,
+    };
     use crate::qcow_common::unit_tests::compress_allocated_clusters;
     use crate::qcow_disk::QcowDisk;
+
+    const TEST_L1_L2_ADDR_MASK: u64 = 0x00ff_ffff_ffff_fe00;
+    const TEST_HEADER_L1_TABLE_OFFSET: u64 = 40;
+    const TEST_COMPRESSED_FLAG: u64 = 1 << 62;
+    const TEST_ZERO_FLAG: u64 = 1;
+
+    fn read_be_u64_at(file: &mut File, offset: u64) -> u64 {
+        let mut bytes = [0u8; 8];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        u64::from_be_bytes(bytes)
+    }
+
+    fn write_be_u64_at(file: &mut File, offset: u64, value: u64) {
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    fn first_l2_entry_offset(file: &mut File) -> u64 {
+        let l1_table_offset = read_be_u64_at(file, TEST_HEADER_L1_TABLE_OFFSET);
+        let l1_entry = read_be_u64_at(file, l1_table_offset);
+        let l2_table_addr = l1_entry & TEST_L1_L2_ADDR_MASK;
+        assert_ne!(l2_table_addr, 0);
+        l2_table_addr
+    }
+
+    fn set_low_bit_on_first_compressed_l2_entry(file: &mut File) {
+        let l2_entry_offset = first_l2_entry_offset(file);
+        let l2_entry = read_be_u64_at(file, l2_entry_offset);
+        assert_ne!(l2_entry & TEST_COMPRESSED_FLAG, 0);
+        write_be_u64_at(file, l2_entry_offset, l2_entry | TEST_ZERO_FLAG);
+        file.sync_all().unwrap();
+    }
+
+    fn first_l2_entry(file: &mut File) -> u64 {
+        let l2_entry_offset = first_l2_entry_offset(file);
+        read_be_u64_at(file, l2_entry_offset)
+    }
 
     fn create_disk_with_data(
         file_size: u64,
@@ -349,32 +480,76 @@ mod unit_tests {
         (temp_file, disk)
     }
 
+    fn create_overlay_disk_with_raw_backing_pattern(
+        file_size: u64,
+        value: u8,
+        direct_io: bool,
+    ) -> (TempFile, TempFile, QcowDisk) {
+        let backing_temp = TempFile::new().unwrap();
+        let backing_data = vec![value; file_size as usize];
+        backing_temp.as_file().write_all(&backing_data).unwrap();
+        backing_temp.as_file().sync_all().unwrap();
+        let backing_path = backing_temp.as_path().to_str().unwrap().to_string();
+
+        let overlay_temp = TempFile::new().unwrap();
+        {
+            let raw = RawFile::new(overlay_temp.as_file().try_clone().unwrap(), false);
+            let backing_config = BackingFileConfig {
+                path: backing_path,
+                format: Some(ImageType::Raw),
+            };
+            QcowFile::new_from_backing(raw, 3, file_size, &backing_config, true).unwrap();
+        }
+
+        let disk = QcowDisk::new(
+            overlay_temp.as_file().try_clone().unwrap(),
+            direct_io,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+
+        (backing_temp, overlay_temp, disk)
+    }
+
+    fn completion_tuple(completion: &AsyncIoCompletion) -> (u64, i32) {
+        (completion.user_data, completion.result)
+    }
+
+    fn next_completion(async_io: &mut dyn AsyncIo) -> (u64, i32) {
+        completion_tuple(&async_io.next_completion().unwrap())
+    }
+
     fn async_read(disk: &QcowDisk, offset: u64, len: usize) -> Vec<u8> {
         let mut async_io = disk.create_async_io(1).unwrap();
-        let mut buf = vec![0xFFu8; len];
-        let iovec = libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-        };
         async_io
-            .read_vectored(offset as libc::off_t, &[iovec], 1)
+            .read_to_vec(
+                offset as libc::off_t,
+                OwnedIoBuffer::from_vec(vec![0xFF; len]),
+                1,
+            )
             .unwrap();
-        let (user_data, result) = async_io.next_completed_request().unwrap();
+        let mut completion = async_io.next_completion().unwrap();
+        let (user_data, result) = completion_tuple(&completion);
         assert_eq!(user_data, 1);
         assert_eq!(result as usize, len, "read should return requested length");
-        buf
+        match completion.buffer.take() {
+            Some(buffer) => buffer.as_slice().to_vec(),
+            other => panic!("unexpected read completion: {other:?}"),
+        }
     }
 
     fn async_write(disk: &QcowDisk, offset: u64, data: &[u8]) {
         let mut async_io = disk.create_async_io(1).unwrap();
-        let iovec = libc::iovec {
-            iov_base: data.as_ptr().cast::<libc::c_void>().cast_mut(),
-            iov_len: data.len(),
-        };
         async_io
-            .write_vectored(offset as libc::off_t, &[iovec], 1)
+            .write_from_vec(
+                offset as libc::off_t,
+                OwnedIoBuffer::from_vec(data.to_vec()),
+                1,
+            )
             .unwrap();
-        let (user_data, result) = async_io.next_completed_request().unwrap();
+        let (user_data, result) = next_completion(async_io.as_mut());
         assert_eq!(user_data, 1);
         assert_eq!(result as usize, data.len());
     }
@@ -387,7 +562,7 @@ mod unit_tests {
 
         let mut async_io = disk.create_async_io(1).unwrap();
         async_io.punch_hole(offset, data.len() as u64, 100).unwrap();
-        let (user_data, result) = async_io.next_completed_request().unwrap();
+        let (user_data, result) = next_completion(async_io.as_mut());
         assert_eq!(user_data, 100);
         assert_eq!(result, 0, "punch_hole should succeed");
         drop(async_io);
@@ -409,7 +584,7 @@ mod unit_tests {
         async_io
             .write_zeroes(offset, data.len() as u64, 200)
             .unwrap();
-        let (user_data, result) = async_io.next_completed_request().unwrap();
+        let (user_data, result) = next_completion(async_io.as_mut());
         assert_eq!(user_data, 200);
         assert_eq!(result, 0, "write_zeroes should succeed");
         drop(async_io);
@@ -419,6 +594,41 @@ mod unit_tests {
             read_buf.iter().all(|&b| b == 0),
             "Zeroed region should read as zeros"
         );
+    }
+
+    #[test]
+    fn test_write_zeroes_compressed_entry_checks_compressed_before_zero_bit() {
+        let cluster_size = 1u64 << 16;
+        let data = vec![0xEE; cluster_size as usize];
+        let (temp, disk) = create_disk_with_data(100 * 1024 * 1024, &data, 0, true, false);
+        drop(disk);
+
+        compress_allocated_clusters(&mut temp.as_file().try_clone().unwrap());
+        set_low_bit_on_first_compressed_l2_entry(&mut temp.as_file().try_clone().unwrap());
+
+        let disk = QcowDisk::new(
+            temp.as_file().try_clone().unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut async_io = disk.create_async_io(1).unwrap();
+        async_io.write_zeroes(0, cluster_size, 200).unwrap();
+        let (user_data, result) = async_io.next_completed_request().unwrap();
+        assert_eq!(user_data, 200);
+        assert_eq!(result, 0);
+
+        async_io.fsync(Some(201)).unwrap();
+        let (user_data, result) = async_io.next_completed_request().unwrap();
+        assert_eq!(user_data, 201);
+        assert_eq!(result, 0);
+        drop(async_io);
+        drop(disk);
+
+        let l2_entry = first_l2_entry(&mut temp.as_file().try_clone().unwrap());
+        assert_eq!(l2_entry, 0);
     }
 
     #[test]
@@ -454,13 +664,13 @@ mod unit_tests {
         async_io.punch_hole(128 * 1024, 64 * 1024, 2).unwrap();
         async_io.punch_hole(256 * 1024, 64 * 1024, 3).unwrap();
 
-        let (ud, res) = async_io.next_completed_request().unwrap();
+        let (ud, res) = next_completion(async_io.as_mut());
         assert_eq!(ud, 1);
         assert_eq!(res, 0);
-        let (ud, res) = async_io.next_completed_request().unwrap();
+        let (ud, res) = next_completion(async_io.as_mut());
         assert_eq!(ud, 2);
         assert_eq!(res, 0);
-        let (ud, res) = async_io.next_completed_request().unwrap();
+        let (ud, res) = next_completion(async_io.as_mut());
         assert_eq!(ud, 3);
         assert_eq!(res, 0);
         assert!(async_io.next_completed_request().is_none());
@@ -477,7 +687,7 @@ mod unit_tests {
         async_io1
             .punch_hole(offset, data.len() as u64, 100)
             .unwrap();
-        let (user_data, result) = async_io1.next_completed_request().unwrap();
+        let (user_data, result) = next_completion(async_io1.as_mut());
         assert_eq!(user_data, 100);
         assert_eq!(result, 0);
         drop(async_io1);
@@ -500,7 +710,7 @@ mod unit_tests {
         // Punch hole to simulate DISCARD
         let mut async_io1 = disk.create_async_io(1).unwrap();
         async_io1.punch_hole(offset, data.len() as u64, 1).unwrap();
-        let (user_data, result) = async_io1.next_completed_request().unwrap();
+        let (user_data, result) = next_completion(async_io1.as_mut());
         assert_eq!(user_data, 1);
         assert_eq!(result, 0, "punch_hole should succeed");
         drop(async_io1);
@@ -523,7 +733,7 @@ mod unit_tests {
 
         let mut async_io = disk.create_async_io(1).unwrap();
         async_io.fsync(Some(10)).unwrap();
-        let (ud, res) = async_io.next_completed_request().unwrap();
+        let (ud, res) = next_completion(async_io.as_mut());
         assert_eq!(ud, 10);
         assert_eq!(res, 0);
         drop(async_io);
@@ -656,6 +866,242 @@ mod unit_tests {
     #[test]
     fn test_backing_file_read_direct_io() {
         test_backing_file_read_impl(true);
+    }
+
+    fn create_raw_backing(path: &Path, pattern: &[u8]) {
+        let mut backing_file = File::create(path).unwrap();
+        backing_file.write_all(pattern).unwrap();
+        backing_file.sync_all().unwrap();
+    }
+
+    fn create_qcow2_overlay(overlay_path: &Path, backing_path: &str, file_size: u64) {
+        let raw = RawFile::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(overlay_path)
+                .unwrap(),
+            false,
+        );
+        let backing_config = BackingFileConfig {
+            path: backing_path.to_string(),
+            format: Some(ImageType::Raw),
+        };
+        let _overlay =
+            QcowFile::new_from_backing(raw, 3, file_size, &backing_config, true).unwrap();
+    }
+
+    fn create_qcow2_overlay_header(overlay_path: &Path, backing_path: &str, file_size: u64) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(overlay_path)
+            .unwrap();
+        let header =
+            QcowHeader::create_for_size_and_path(3, file_size, Some(backing_path)).unwrap();
+        header.write_to(&mut file).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn test_relative_backing_file_read() {
+        let test_dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let cwd = env::current_dir().unwrap();
+        assert_ne!(cwd.as_path(), test_dir.as_path());
+
+        let backing_path = test_dir.as_path().join("backing.raw");
+        let overlay_path = test_dir.as_path().join("overlay.qcow2");
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 2;
+        let pattern: Vec<u8> = (0..file_size as usize).map(|i| (i % 251) as u8).collect();
+
+        create_raw_backing(&backing_path, &pattern);
+        create_qcow2_overlay(&overlay_path, "backing.raw", file_size);
+
+        let disk =
+            QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false).unwrap();
+
+        let buf = async_read(&disk, 0, cluster_size as usize);
+        assert_eq!(
+            &buf[..],
+            &pattern[..cluster_size as usize],
+            "Relative backing file should resolve from the overlay image directory"
+        );
+    }
+
+    #[test]
+    fn test_missing_relative_backing_file_error_uses_resolved_path() {
+        let test_dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let overlay_path = test_dir.as_path().join("overlay.qcow2");
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 2;
+
+        create_qcow2_overlay_header(&overlay_path, "missing.raw", file_size);
+
+        let err = QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false)
+            .unwrap_err();
+        assert!(matches!(err.kind(), BlockErrorKind::Io));
+
+        let expected_path = test_dir
+            .as_path()
+            .join("missing.raw")
+            .to_string_lossy()
+            .into_owned();
+        match err.downcast_ref::<QcowError>() {
+            Some(QcowError::BackingFileIo(path, _)) => assert_eq!(path, &expected_path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_relative_backing_file_with_parent_components() {
+        let test_dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let overlay_dir = test_dir.as_path().join("overlay");
+        let sibling_dir = test_dir.as_path().join("sibling");
+        std::fs::create_dir(&overlay_dir).unwrap();
+        std::fs::create_dir(&sibling_dir).unwrap();
+
+        let backing_path = sibling_dir.join("backing.raw");
+        let overlay_path = overlay_dir.join("overlay.qcow2");
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 2;
+        let pattern: Vec<u8> = (0..file_size as usize).map(|i| (i % 251) as u8).collect();
+
+        create_raw_backing(&backing_path, &pattern);
+        create_qcow2_overlay(&overlay_path, "../sibling/backing.raw", file_size);
+
+        let disk =
+            QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false).unwrap();
+
+        let buf = async_read(&disk, 0, cluster_size as usize);
+        assert_eq!(
+            &buf[..],
+            &pattern[..cluster_size as usize],
+            "Relative backing file with parent components should resolve from the overlay image directory"
+        );
+    }
+
+    #[test]
+    fn test_absolute_backing_file_path_read() {
+        let test_dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let backing_path = test_dir.as_path().join("backing.raw");
+        let overlay_path = test_dir.as_path().join("overlay.qcow2");
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 2;
+        let pattern: Vec<u8> = (0..file_size as usize).map(|i| (i % 251) as u8).collect();
+
+        create_raw_backing(&backing_path, &pattern);
+        create_qcow2_overlay(&overlay_path, backing_path.to_str().unwrap(), file_size);
+
+        let disk =
+            QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false).unwrap();
+
+        let buf = async_read(&disk, 0, cluster_size as usize);
+        assert_eq!(
+            &buf[..],
+            &pattern[..cluster_size as usize],
+            "Absolute backing file path should be used as is"
+        );
+    }
+
+    #[test]
+    fn test_relative_backing_file_falls_back_for_fd_without_filesystem_path() {
+        let overlay_temp = TempFile::new().unwrap();
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 2;
+
+        {
+            let mut file = overlay_temp.as_file().try_clone().unwrap();
+            let header =
+                QcowHeader::create_for_size_and_path(3, file_size, Some("missing.raw")).unwrap();
+            header.write_to(&mut file).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let mut overlay_file = overlay_temp.into_file();
+        overlay_file.rewind().unwrap();
+        let err = QcowDisk::new(overlay_file, false, true, true, false).unwrap_err();
+        assert!(matches!(err.kind(), BlockErrorKind::Io));
+
+        match err.downcast_ref::<QcowError>() {
+            Some(QcowError::BackingFileIo(path, _)) => assert_eq!(path, "missing.raw"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn test_write_zeroes_unallocated_overlay_with_backing_must_read_zero_impl(direct_io: bool) {
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 4;
+        let offset = cluster_size;
+        let (_backing_temp, _overlay_temp, disk) =
+            create_overlay_disk_with_raw_backing_pattern(file_size, 0xAB, direct_io);
+
+        let mut async_io = disk.create_async_io(1).unwrap();
+        async_io.write_zeroes(offset, cluster_size, 42).unwrap();
+        let (user_data, result) = async_io.next_completed_request().unwrap();
+        assert_eq!(user_data, 42);
+        assert_eq!(result, 0);
+        drop(async_io);
+
+        let buf = async_read(&disk, offset, cluster_size as usize);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "zeroed unallocated overlay cluster exposed backing data"
+        );
+    }
+
+    #[test]
+    fn test_write_zeroes_unallocated_overlay_with_backing_must_read_zero() {
+        test_write_zeroes_unallocated_overlay_with_backing_must_read_zero_impl(false);
+    }
+
+    #[test]
+    fn test_write_zeroes_unallocated_overlay_with_backing_must_read_zero_direct_io() {
+        test_write_zeroes_unallocated_overlay_with_backing_must_read_zero_impl(true);
+    }
+
+    fn test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(
+        direct_io: bool,
+    ) {
+        let cluster_size = 1u64 << 16;
+        let file_size = cluster_size * 4;
+        let offset = cluster_size;
+        let patch_offset = 0x4000usize;
+        let patch_len = 0x1000usize;
+        let (_backing_temp, _overlay_temp, disk) =
+            create_overlay_disk_with_raw_backing_pattern(file_size, 0xAB, direct_io);
+
+        let mut async_io = disk.create_async_io(1).unwrap();
+        async_io.write_zeroes(offset, cluster_size, 42).unwrap();
+        let (_user_data, result) = async_io.next_completed_request().unwrap();
+        assert_eq!(result, 0);
+        drop(async_io);
+
+        let patch = [0x99u8; 0x1000];
+        async_write(&disk, offset + patch_offset as u64, &patch[..patch_len]);
+
+        let buf = async_read(&disk, offset, cluster_size as usize);
+        assert!(buf[..patch_offset].iter().all(|&b| b == 0));
+        assert!(
+            buf[patch_offset..patch_offset + patch_len]
+                .iter()
+                .all(|&b| b == 0x99)
+        );
+        assert!(buf[patch_offset + patch_len..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data() {
+        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(false);
+    }
+
+    #[test]
+    fn test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_direct_io() {
+        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(true);
     }
 
     fn test_backing_file_read_qcow2_backing_impl(direct_io: bool) {
@@ -1274,7 +1720,7 @@ mod unit_tests {
         {
             let mut async_io = disk.create_async_io(1).unwrap();
             async_io.punch_hole(0, cluster_size, 42).unwrap();
-            let (ud, res) = async_io.next_completed_request().unwrap();
+            let (ud, res) = next_completion(async_io.as_mut());
             assert_eq!(ud, 42);
             assert_eq!(res, 0);
         }
@@ -1432,7 +1878,7 @@ mod unit_tests {
         {
             let mut aio = disk.create_async_io(1).unwrap();
             aio.punch_hole(punch_offset, punch_len, 10).unwrap();
-            let (ud, res) = aio.next_completed_request().unwrap();
+            let (ud, res) = next_completion(aio.as_mut());
             assert_eq!(ud, 10);
             assert_eq!(res, 0);
         }
@@ -1548,61 +1994,34 @@ mod unit_tests {
         let a = vec![0xAAu8; 16 * 1024];
         let b = vec![0xBBu8; 32 * 1024];
         let c = vec![0xCCu8; 16 * 1024];
-        let iovecs_w = [
-            libc::iovec {
-                iov_base: a.as_ptr().cast::<libc::c_void>().cast_mut(),
-                iov_len: a.len(),
-            },
-            libc::iovec {
-                iov_base: b.as_ptr().cast::<libc::c_void>().cast_mut(),
-                iov_len: b.len(),
-            },
-            libc::iovec {
-                iov_base: c.as_ptr().cast::<libc::c_void>().cast_mut(),
-                iov_len: c.len(),
-            },
-        ];
         let total = a.len() + b.len() + c.len();
+        let mut write_buf = Vec::with_capacity(total);
+        write_buf.extend_from_slice(&a);
+        write_buf.extend_from_slice(&b);
+        write_buf.extend_from_slice(&c);
 
         let mut aio = disk.create_async_io(1).unwrap();
-        aio.write_vectored(0, &iovecs_w, 1).unwrap();
-        let (ud, res) = aio.next_completed_request().unwrap();
+        aio.write_from_vec(0, OwnedIoBuffer::from_vec(write_buf), 1)
+            .unwrap();
+        let (ud, res) = next_completion(aio.as_mut());
         assert_eq!(ud, 1);
         assert_eq!(res as usize, total);
         aio.fsync(Some(2)).unwrap();
         drop(aio);
 
-        // Read back into 3 iovecs of different sizes
-        let mut r1 = vec![0u8; 8 * 1024];
-        let mut r2 = vec![0u8; 48 * 1024];
-        let mut r3 = vec![0u8; 8 * 1024];
-        let iovecs_r = [
-            libc::iovec {
-                iov_base: r1.as_mut_ptr().cast(),
-                iov_len: r1.len(),
-            },
-            libc::iovec {
-                iov_base: r2.as_mut_ptr().cast(),
-                iov_len: r2.len(),
-            },
-            libc::iovec {
-                iov_base: r3.as_mut_ptr().cast(),
-                iov_len: r3.len(),
-            },
-        ];
-
         let mut aio = disk.create_async_io(1).unwrap();
-        aio.read_vectored(0, &iovecs_r, 10).unwrap();
-        let (ud, res) = aio.next_completed_request().unwrap();
+        aio.read_to_vec(0, OwnedIoBuffer::from_vec(vec![0; total]), 10)
+            .unwrap();
+        let mut completion = aio.next_completion().unwrap();
+        let (ud, res) = completion_tuple(&completion);
         assert_eq!(ud, 10);
         assert_eq!(res as usize, total);
         drop(aio);
 
-        // Reassemble the read buffers into a flat vec
-        let mut got = Vec::with_capacity(total);
-        got.extend_from_slice(&r1);
-        got.extend_from_slice(&r2);
-        got.extend_from_slice(&r3);
+        let got = match completion.buffer.take() {
+            Some(buffer) => buffer.as_slice().to_vec(),
+            other => panic!("unexpected read completion: {other:?}"),
+        };
 
         // Build expected from the write buffers
         let mut expected = Vec::with_capacity(total);
