@@ -297,7 +297,8 @@ impl AsyncIo for QcowSync {
                 offset,
                 length as usize,
                 self.sparse,
-                false,
+                self.metadata.virtual_size(),
+                self.metadata.cluster_size(),
                 self.backing_file.as_deref(),
             )
             .map_err(AsyncIoError::PunchHole);
@@ -333,7 +334,8 @@ impl AsyncIo for QcowSync {
                 offset,
                 length as usize,
                 self.sparse,
-                true,
+                self.metadata.virtual_size(),
+                self.metadata.cluster_size(),
                 self.backing_file.as_deref(),
             )
             .map_err(AsyncIoError::WriteZeroes);
