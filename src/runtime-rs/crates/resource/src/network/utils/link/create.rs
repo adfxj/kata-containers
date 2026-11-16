@@ -92,7 +92,10 @@ pub fn create_link(name: &str, link_type: LinkType, queues: usize) -> Result<()>
     };
 
     let queues = if queues == 0 { 2 } else { queues };
-    if queues > 2 {
+    // network_queues is vcpu * 2 (virtqueues including RX and TX),
+    // but each TAP fd corresponds to one queue pair, so TAP fd count = queues / 2
+    let tap_queues = queues / 2;
+    if tap_queues > 1 {
         flags |= libc::IFF_MULTI_QUEUE | libc::IFF_NO_PI;
     } else {
         flags |= libc::IFF_ONE_QUEUE;
@@ -107,8 +110,8 @@ pub fn create_link(name: &str, link_type: LinkType, queues: usize) -> Result<()>
     files.push(file);
 
     // create other queues
-    if queues > 1 {
-        for _ in 0..queues - 1 {
+    if tap_queues > 1 {
+        for _ in 0..tap_queues - 1 {
             files.push(create_queue(&result_name, flags)?.0);
         }
     }
