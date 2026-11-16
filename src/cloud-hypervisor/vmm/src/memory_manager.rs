@@ -4067,6 +4067,14 @@ impl MemoryManager {
 
         debug_assert_eq!(file_cursor, total_len);
 
+        // Ensure all data is flushed to disk before the snapshot is considered
+        // complete. Without this, concurrent snapshot writes on XFS may leave
+        // dirty page cache pages that can be corrupted under memory pressure,
+        // producing incomplete snapshot files that crash on restore.
+        memory_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         Ok(())
     }
 
@@ -4216,6 +4224,10 @@ impl MemoryManager {
             // Move to next range.
             offset += range.length;
         }
+
+        memory_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         Ok(())
     }
