@@ -731,7 +731,20 @@ impl Container {
                 true,
                 &device_manager,
             )
+            .await?;
+
+        // clean up cpu/mem resource records to avoid accumulation when
+        // containers are repeatedly created and fail in the same sandbox
+        self.resource_manager
+            .update_linux_resource(
+                &self.config.container_id,
+                inner.linux_resources.as_ref(),
+                ResourceUpdateOp::Del,
+            )
             .await
+            .ok();
+
+        Ok(())
     }
 }
 
