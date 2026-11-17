@@ -3532,6 +3532,14 @@ impl MemoryManager {
             self.save_range_to_file(&memory_file, range, file_off)?;
         }
 
+        // Ensure all data is flushed to disk before the snapshot is considered
+        // complete. Without this, concurrent snapshot writes on XFS may leave
+        // dirty page cache pages that can be corrupted under memory pressure,
+        // producing incomplete snapshot files that crash on restore.
+        memory_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         info!(
             "PagemapAnon snapshot saved: {} anon bytes written to {:?}",
             stats.saved_bytes,
@@ -3678,6 +3686,15 @@ impl MemoryManager {
                 Self::calculate_file_offset_for_gpa(range.gpa, range.length, &gpa_to_file_offset)?;
             self.save_range_to_file(&memory_file, range, file_off)?;
         }
+
+        // Ensure all data is flushed to disk before the snapshot is considered
+        // complete. Without this, concurrent snapshot writes on XFS may leave
+        // dirty page cache pages that can be corrupted under memory pressure,
+        // producing incomplete snapshot files that crash on restore.
+        memory_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         info!(
             "Soft-dirty snapshot saved: {} dirty bytes written to {:?}",
             stats.saved_bytes,
