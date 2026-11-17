@@ -713,7 +713,8 @@ impl CpusConfig {
             .add("affinity")
             .add("features")
             .add("nested")
-            .add("core_scheduling");
+            .add("core_scheduling")
+            .add("compatible");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
         let boot_vcpus: u32 = parser
@@ -777,6 +778,11 @@ impl CpusConfig {
             .map_err(Error::ParseCpus)?
             .unwrap_or(CoreScheduling::Vm);
 
+        let compatible = parser
+            .convert::<CompatibleMode>("compatible")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or_default();
+
         Ok(CpusConfig {
             boot_vcpus,
             max_vcpus,
@@ -787,6 +793,7 @@ impl CpusConfig {
             features,
             nested,
             core_scheduling,
+            compatible,
         })
     }
 }

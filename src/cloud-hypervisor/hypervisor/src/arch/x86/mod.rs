@@ -13,6 +13,9 @@
 
 use core::fmt;
 
+use serde::de::{self, Deserializer};
+use serde::ser::Serializer;
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::CpuVendor;
@@ -264,6 +267,96 @@ impl fmt::Display for CpuIdEntry {
 }
 
 pub const CPUID_FLAG_VALID_INDEX: u32 = 1;
+
+/// Serializes number to hex string
+pub fn serialize_to_hex_str<S, N>(number: &N, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    N: fmt::LowerHex,
+{
+    serializer.serialize_str(format!("{:#x}", number).as_str())
+}
+
+/// Deserializes number from string (hex or binary prefixed).
+pub fn deserialize_from_str_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let number_str = String::deserialize(deserializer)?;
+    let deserialized_number = if let Some(s) = number_str.strip_prefix("0b") {
+        u32::from_str_radix(s, 2)
+    } else if let Some(s) = number_str.strip_prefix("0x") {
+        u32::from_str_radix(s, 16)
+    } else {
+        return Err(de::Error::custom(format!(
+            "No supported number system prefix found in value [{}]. Make sure to prefix \
+             the number with '0x' for hexadecimal numbers or '0b' for binary numbers.",
+            number_str,
+        )));
+    }
+    .map_err(|err| {
+        de::Error::custom(format!(
+            "Failed to parse string [{}] as a number for CPU template - {:?}",
+            number_str, err
+        ))
+    })?;
+    Ok(deserialized_number)
+}
+
+/// CPUID entry with hex-string serde for JSON-based CPUID templates.
+/// Uses string serialization to keep compatibility with old snapshot formats.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CpuIdCustomEntry {
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub function: u32,
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub index: u32,
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub flags: u32,
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub eax: u32,
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub ebx: u32,
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub ecx: u32,
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub edx: u32,
+}
+
+impl From<CpuIdCustomEntry> for CpuIdEntry {
+    fn from(s: CpuIdCustomEntry) -> Self {
+        Self {
+            function: s.function,
+            index: s.index,
+            flags: s.flags,
+            eax: s.eax,
+            ebx: s.ebx,
+            ecx: s.ecx,
+            edx: s.edx,
+        }
+    }
+}
 
 #[derive(Default, Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FpuState {

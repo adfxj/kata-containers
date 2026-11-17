@@ -19,6 +19,7 @@ use api_client::{
 #[cfg(feature = "dbus_api")]
 use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
+use hypervisor::arch::x86::CpuIdCustomEntry;
 use log::error;
 use option_parser::{ByteSized, ByteSizedParseError};
 use thiserror::Error;
@@ -80,6 +81,10 @@ enum Error {
     InvalidDiskSize(#[source] ByteSizedParseError),
     #[error("Error parsing send migration configuration")]
     SendMigrationConfig(#[from] vmm::api::VmSendMigrationConfigError),
+    #[error("Error in cpuid-get: {0}")]
+    CpuidGet(#[source] anyhow::Error),
+    #[error("Error in cpuid-intersect: {0}")]
+    CpuidIntersect(#[source] anyhow::Error),
 }
 
 enum TargetApi<'a> {
@@ -1337,9 +1342,125 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                     .help("Directory to store LSMT memory snapshot files (memory-ranges, memory-ranges-incremental-N, mem_image.json). Required when --lsmt-memory is set")
                     .num_args(1),
             ),
+        Command::new("cpuid-get")
+            .about("Dump local KVM-supported CPUID to a JSON file (for cross-vendor snapshot compatibility)")
+            .arg(
+                Arg::new("output")
+                    .long("output")
+                    .short('o')
+                    .help("Output file path (default: cpuid.json)")
+                    .num_args(1)
+                    .default_value("cpuid.json"),
+            ),
+        Command::new("cpuid-intersect")
+            .about("Intersect multiple CPUID JSON files into a compatible CPUID template")
+            .arg(
+                Arg::new("files")
+                    .long("files")
+                    .short('F')
+                    .help("List of CPUID JSON files to intersect")
+                    .num_args(1..)
+                    .required(true),
+            )
+            .arg(
+                Arg::new("output")
+                    .long("output")
+                    .short('o')
+                    .help("Output file path (default: cpuid_compatible.json)")
+                    .num_args(1)
+                    .default_value("cpuid_compatible.json"),
+            ),
     ]
     .to_vec()
     .into_boxed_slice()
+}
+
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+fn do_cpuid_get(output: &str) -> ApiResult {
+    use hypervisor::kvm::{kvm_bindings, kvm_ioctls::Kvm};
+    use std::fs::File;
+    use std::io::Write;
+
+    let kvm = Kvm::new().map_err(|e| Error::CpuidGet(e.into()))?;
+    let kvm_cpuid = kvm
+        .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .map_err(|e| Error::CpuidGet(e.into()))?;
+
+    let v: Vec<CpuIdCustomEntry> = kvm_cpuid
+        .as_slice()
+        .iter()
+        .map(|e| CpuIdCustomEntry {
+            function: e.function,
+            index: e.index,
+            flags: if e.flags & kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX != 0 {
+                1
+            } else {
+                0
+            },
+            eax: e.eax,
+            ebx: e.ebx,
+            ecx: e.ecx,
+            edx: e.edx,
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&v).map_err(|e| Error::CpuidGet(e.into()))?;
+    let mut f = File::create(output).map_err(|e| Error::CpuidGet(e.into()))?;
+    f.write_all(json.as_bytes())
+        .map_err(|e| Error::CpuidGet(e.into()))?;
+
+    println!("CPUID written to {output} ({} entries)", v.len());
+    Ok(())
+}
+
+#[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+fn do_cpuid_get(_output: &str) -> ApiResult {
+    Err(Error::CpuidGet(anyhow::anyhow!(
+        "cpuid-get requires KVM and x86_64"
+    )))
+}
+
+fn do_cpuid_intersect(files: &[String], output: &str) -> ApiResult {
+    use std::fs::File;
+    use std::io::Write;
+
+    if files.len() < 2 {
+        return Err(Error::CpuidIntersect(anyhow::anyhow!(
+            "at least 2 CPUID JSON files are required for intersection"
+        )));
+    }
+
+    let load = |path: &str| -> Result<Vec<CpuIdCustomEntry>, Error> {
+        let content = std::fs::read_to_string(path).map_err(|e| Error::CpuidIntersect(e.into()))?;
+        serde_json::from_str(&content).map_err(|e| Error::CpuidIntersect(e.into()))
+    };
+
+    let mut result = load(&files[0])?;
+    for path in files.iter().skip(1) {
+        let other = load(path)?;
+        for entry in &mut result {
+            for patch in &other {
+                if entry.function == patch.function && entry.index == patch.index {
+                    entry.eax &= patch.eax;
+                    entry.ebx &= patch.ebx;
+                    entry.ecx &= patch.ecx;
+                    entry.edx &= patch.edx;
+                }
+            }
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&result).map_err(|e| Error::CpuidIntersect(e.into()))?;
+    let mut f = File::create(output).map_err(|e| Error::CpuidIntersect(e.into()))?;
+    f.write_all(json.as_bytes())
+        .map_err(|e| Error::CpuidIntersect(e.into()))?;
+
+    println!(
+        "Compatible CPUID written to {output} ({} entries, intersected {} files)",
+        result.len(),
+        files.len()
+    );
+    Ok(())
 }
 
 fn main() {
@@ -1354,6 +1475,34 @@ fn main() {
         .subcommands(get_cli_commands_sorted());
 
     let matches = app.get_matches();
+
+    // Handle local commands that don't need an API socket.
+    match matches.subcommand_name() {
+        Some("cpuid-get") => {
+            let sub = matches.subcommand_matches("cpuid-get").unwrap();
+            let output = sub.get_one::<String>("output").unwrap();
+            if let Err(e) = do_cpuid_get(output) {
+                error!("{e}");
+                process::exit(1);
+            }
+            return;
+        }
+        Some("cpuid-intersect") => {
+            let sub = matches.subcommand_matches("cpuid-intersect").unwrap();
+            let files: Vec<String> = sub
+                .get_many::<String>("files")
+                .unwrap()
+                .cloned()
+                .collect();
+            let output = sub.get_one::<String>("output").unwrap();
+            if let Err(e) = do_cpuid_intersect(&files, output) {
+                error!("{e}");
+                process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
 
     let mut target_api = match (
         matches.get_one::<String>("api-socket"),

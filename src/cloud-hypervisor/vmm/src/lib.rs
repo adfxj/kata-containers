@@ -1466,6 +1466,11 @@ impl Vmm {
             let amx = vm_config.lock().unwrap().cpus.features.amx;
             let phys_bits =
                 vm::physical_bits(hypervisor, vm_config.lock().unwrap().cpus.max_phys_bits);
+            let (vendor_compatible, arch_compatible) = match vm_config.lock().unwrap().cpus.compatible {
+                crate::vm_config::CompatibleMode::Vendor => (true, false),
+                crate::vm_config::CompatibleMode::Max => (true, true),
+                crate::vm_config::CompatibleMode::Ignore => (false, false),
+            };
             arch::generate_common_cpuid(
                 hypervisor,
                 &arch::CpuidConfig {
@@ -1474,6 +1479,8 @@ impl Vmm {
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx,
+                    vendor_compatible,
+                    arch_compatible,
                 },
             )
             .map_err(|e| {
@@ -1612,6 +1619,11 @@ impl Vmm {
 
             let phys_bits =
                 vm::physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
+            let (vendor_compatible, arch_compatible) = match vm_config.cpus.compatible {
+                crate::vm_config::CompatibleMode::Vendor => (true, false),
+                crate::vm_config::CompatibleMode::Max => (true, true),
+                crate::vm_config::CompatibleMode::Ignore => (false, false),
+            };
             arch::generate_common_cpuid(
                 self.hypervisor.as_ref(),
                 &arch::CpuidConfig {
@@ -1620,6 +1632,8 @@ impl Vmm {
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx: vm_config.cpus.features.amx,
+                    vendor_compatible,
+                    arch_compatible,
                 },
             )
             .map_err(|e| {

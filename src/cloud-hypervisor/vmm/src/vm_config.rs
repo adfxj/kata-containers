@@ -62,6 +62,43 @@ pub struct CpuTopology {
 // paging.
 pub const DEFAULT_MAX_PHYS_BITS: u8 = 46;
 
+/// CPUID compatibility mode for cross-vendor snapshot distribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum CompatibleMode {
+    /// Intersect CPUID with a JSON template (vendor-level compat)
+    #[default]
+    Ignore,
+    /// Apply both vendor + arch-compatible templates (T2CL/T2A)
+    Max,
+    /// Intersect CPUID with a JSON template (vendor-level compat)
+    Vendor,
+}
+
+impl std::fmt::Display for CompatibleMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompatibleMode::Vendor => write!(f, "vendor"),
+            CompatibleMode::Max => write!(f, "max"),
+            CompatibleMode::Ignore => write!(f, "ignore"),
+        }
+    }
+}
+
+impl std::str::FromStr for CompatibleMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "vendor" => Ok(CompatibleMode::Vendor),
+            "max" => Ok(CompatibleMode::Max),
+            "ignore" => Ok(CompatibleMode::Ignore),
+            _ => Err(format!(
+                "Invalid compatible mode: '{s}'. Valid values: vendor, max, ignore"
+            )),
+        }
+    }
+}
+
 pub fn default_cpuconfig_max_phys_bits() -> u8 {
     DEFAULT_MAX_PHYS_BITS
 }
@@ -84,6 +121,8 @@ pub struct CpusConfig {
     pub nested: bool,
     #[serde(default)]
     pub core_scheduling: CoreScheduling,
+    #[serde(default)]
+    pub compatible: CompatibleMode,
 }
 
 pub const DEFAULT_VCPUS: u32 = 1;
@@ -100,6 +139,7 @@ impl Default for CpusConfig {
             features: CpuFeatures::default(),
             nested: true,
             core_scheduling: CoreScheduling::default(),
+            compatible: CompatibleMode::default(),
         }
     }
 }

@@ -14,6 +14,8 @@ pub mod regs;
 #[cfg(feature = "tdx")]
 pub mod tdx;
 
+pub mod cpuid_filter;
+
 mod mpspec;
 mod mptable;
 mod smbios;
@@ -21,7 +23,7 @@ mod smbios;
 use std::arch::x86_64;
 use std::mem;
 
-use hypervisor::arch::x86::{CPUID_FLAG_VALID_INDEX, CpuIdEntry};
+use hypervisor::arch::x86::{CPUID_FLAG_VALID_INDEX, CpuIdCustomEntry, CpuIdEntry};
 use hypervisor::{CpuVendor, HypervisorCpuError, HypervisorError};
 use linux_loader::loader::bootparam::{boot_params, setup_header};
 use linux_loader::loader::elf::start_info::{
@@ -93,6 +95,8 @@ pub struct CpuidConfig {
     #[cfg(feature = "tdx")]
     pub tdx: bool,
     pub amx: bool,
+    pub vendor_compatible: bool,
+    pub arch_compatible: bool,
 }
 
 #[derive(Debug, Error)]
@@ -190,7 +194,7 @@ pub fn get_max_x2apic_id(topology: (u16, u16, u16, u16)) -> u32 {
     )
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CpuidReg {
     EAX,
     EBX,
@@ -336,9 +340,48 @@ impl CpuidPatch {
 
         false
     }
+
+    /// Intersect CPUID entries with a compatible template (bitwise AND).
+    /// Only applies to feature-flag entries (BitwiseSubset check type).
+    pub fn intersect_cpuid(cpuid: &mut [CpuIdEntry], patches: Vec<CpuIdCustomEntry>) {
+        for entry in cpuid {
+            for patch in patches.iter() {
+                if entry.function == patch.function && entry.index == patch.index {
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::EAX,
+                    ) {
+                        entry.eax &= patch.eax;
+                    }
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::EBX,
+                    ) {
+                        entry.ebx &= patch.ebx;
+                    }
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::ECX,
+                    ) {
+                        entry.ecx &= patch.ecx;
+                    }
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::EDX,
+                    ) {
+                        entry.edx &= patch.edx;
+                    }
+                }
+            }
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum CpuidCompatibleCheck {
     BitwiseSubset, // bitwise subset
     Equal,         // equal in value
@@ -641,6 +684,80 @@ impl CpuidFeatureEntry {
             result.join(", ")
         }
     }
+
+    /// Check if a CPUID entry should be intersected (only BitwiseSubset entries).
+    pub fn entry_need_intersect(function: u32, index: u32, reg: CpuidReg) -> bool {
+        let feature_entry_list = &Self::checked_feature_entry_list();
+        for entry in feature_entry_list {
+            if function == entry.function
+                && index == entry.index
+                && reg == entry.feature_reg
+                && CpuidCompatibleCheck::BitwiseSubset == entry.compatible_check
+            {
+                debug!("intersect cpuid function 0x{:x} reg {:?}", function, reg);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Path to the CPUID compatibility JSON file.
+const CPUID_COMPAT_FILE: &str =
+    "/usr/local/xlet/clh-snapshot/cpuid_compatible.json";
+
+/// Load a CPUID compatibility template from a JSON file.
+pub fn get_json_template() -> Vec<CpuIdCustomEntry> {
+    if std::fs::metadata(CPUID_COMPAT_FILE).is_ok() {
+        debug!("compatible cpuid file {:?}", CPUID_COMPAT_FILE);
+        serde_json::from_str(&std::fs::read_to_string(CPUID_COMPAT_FILE).unwrap()).unwrap()
+    } else {
+        debug!("not found cpuid compatible json file");
+        Vec::new()
+    }
+}
+
+/// Generate a compatible CPUID template from the JSON file.
+pub fn generate_compatible_cpuid() -> cpuid_filter::CustomCpuId {
+    cpuid_filter::CustomCpuId {
+        cpuids: get_json_template(),
+    }
+}
+
+const XSAVE_HDR_SIZE: u32 = 64;
+const XSAVE_HDR_OFFSET: u32 = 512;
+
+const XFEATURE_FP: u32 = 0;
+const XFEATURE_SSE: u32 = 1;
+const XFEATURE_MASK_FP: u32 = 1 << XFEATURE_FP;
+const XFEATURE_MASK_SSE: u32 = 1 << XFEATURE_SSE;
+const XFEATURE_MASK_FPSSE: u32 = XFEATURE_MASK_FP | XFEATURE_MASK_SSE;
+const XFEATURE_MASK_EXTEND: u32 = !(XFEATURE_MASK_FPSSE | (1 << 31));
+
+/// Recalculate the XSAVE state required size after CPUID feature masking.
+pub fn xstate_required_size(xstate: u32) -> u32 {
+    let mut feature_bit = 0;
+    let mut ret = XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET;
+    let mut xstate_bv = xstate & XFEATURE_MASK_EXTEND;
+
+    debug!(
+        "mask extend 0x{:x} bv 0x{:x} xstate 0x{:x}",
+        XFEATURE_MASK_EXTEND, xstate_bv, xstate
+    );
+
+    while xstate_bv != 0 {
+        if xstate_bv & 0x1 != 0 {
+            // SAFETY: call cpuid with valid leaves
+            let leaf = unsafe { std::arch::x86_64::__cpuid_count(0xd, feature_bit) };
+            ret = std::cmp::max(ret, leaf.eax + leaf.ebx);
+            debug!("xstate 0x{:x} ret 0x{:x} leaf {:x?}", xstate_bv, ret, leaf);
+        }
+
+        xstate_bv >>= 1;
+        feature_bit += 1;
+    }
+
+    ret
 }
 
 pub fn generate_common_cpuid(
@@ -713,6 +830,14 @@ pub fn generate_common_cpuid(
     let mut cpuid = hypervisor
         .get_supported_cpuid()
         .map_err(Error::CpuidGetSupported)?;
+
+    // Vendor-compatible: intersect CPUID with fleet-wide JSON template
+    if config.vendor_compatible {
+        let cpuid_compatible = generate_compatible_cpuid();
+        if !cpuid_compatible.cpuids.is_empty() {
+            CpuidPatch::intersect_cpuid(&mut cpuid, cpuid_compatible.cpuids);
+        }
+    }
 
     CpuidPatch::patch_cpuid(&mut cpuid, &cpuid_patches);
 
@@ -891,6 +1016,17 @@ pub fn generate_common_cpuid(
                 function: i,
                 ..Default::default()
             });
+        }
+    }
+
+    // Arch-compatible: apply T2CL/T2A template based on host vendor
+    if config.arch_compatible {
+        cpuid_filter::apply_compatible_template(&mut cpuid);
+
+        for entry in cpuid.as_mut_slice().iter_mut() {
+            if 0xd == entry.function && entry.index == 0 {
+                entry.ecx = xstate_required_size(entry.eax);
+            }
         }
     }
 

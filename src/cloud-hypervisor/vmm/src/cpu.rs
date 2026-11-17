@@ -46,11 +46,11 @@ use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::arch::aarch64::regs::{ID_AA64MMFR0_EL1, TCR_EL1, TTBR1_EL1};
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::CpuIdEntry;
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+#[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::MsrEntry;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use hypervisor::arch::x86::SpecialRegisters;
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+#[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::msr_index;
 #[cfg(feature = "tdx")]
 use hypervisor::kvm::{TdxExitDetails, TdxExitStatus};
@@ -92,7 +92,7 @@ use crate::gdb::{Debuggable, DebuggableError, get_raw_tid};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
-use crate::vm_config::{CoreScheduling, CpusConfig};
+use crate::vm_config::{CompatibleMode, CoreScheduling, CpusConfig};
 use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
@@ -501,7 +501,7 @@ pub struct Vcpu {
     saved_state: Option<CpuState>,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
-    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+    #[cfg(target_arch = "x86_64")]
     tsc_msrs: Vec<MsrEntry>,
 }
 
@@ -533,7 +533,7 @@ impl Vcpu {
             saved_state: None,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
-            #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+            #[cfg(target_arch = "x86_64")]
             tsc_msrs: Vec::new(),
         })
     }
@@ -948,6 +948,13 @@ impl CpuManager {
     ) -> Result<()> {
         self.cpuid = {
             let phys_bits = physical_bits(hypervisor, self.config.max_phys_bits);
+
+            let (vendor_compatible, arch_compatible) = match self.config.compatible {
+                CompatibleMode::Vendor => (true, false),
+                CompatibleMode::Max => (true, true),
+                CompatibleMode::Ignore => (false, false),
+            };
+
             arch::generate_common_cpuid(
                 hypervisor,
                 &arch::CpuidConfig {
@@ -956,6 +963,8 @@ impl CpuManager {
                     #[cfg(feature = "tdx")]
                     tdx,
                     amx: self.config.features.amx,
+                    vendor_compatible,
+                    arch_compatible,
                 },
             )
             .map_err(Error::CommonCpuId)?
@@ -1001,7 +1010,7 @@ impl CpuManager {
 
             // Parse msrs from state, save related msrs in tsc_msrs.
             
-            #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+            #[cfg(target_arch = "x86_64")]
             {
                 let tsc_msrs: Vec<MsrEntry> = match &state {
                     #[cfg(feature = "kvm")]
@@ -1121,7 +1130,7 @@ impl CpuManager {
 
         // Reset tsc msrs for all vcpu, so that KVM could synchronize TSC
         // for restored VM, before vcpu run.
-        #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+        #[cfg(target_arch = "x86_64")]
         if snapshot.is_some() {
             for vcpu in &self.vcpus {
                 let vcpu = vcpu.lock().unwrap();

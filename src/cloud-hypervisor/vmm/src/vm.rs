@@ -3501,19 +3501,24 @@ impl Snapshottable for Vm {
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
-            let amx = self.config.lock().unwrap().cpus.features.amx;
-            let phys_bits = physical_bits(
-                self.hypervisor.as_ref(),
-                self.config.lock().unwrap().cpus.max_phys_bits,
-            );
+            let vm_config = self.config.lock().unwrap();
+            let amx = vm_config.cpus.features.amx;
+            let phys_bits = physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
+            let (vendor_compatible, arch_compatible) = match vm_config.cpus.compatible {
+                crate::vm_config::CompatibleMode::Vendor => (true, false),
+                crate::vm_config::CompatibleMode::Max => (true, true),
+                crate::vm_config::CompatibleMode::Ignore => (false, false),
+            };
             arch::generate_common_cpuid(
                 self.hypervisor.as_ref(),
                 &arch::CpuidConfig {
                     phys_bits,
-                    kvm_hyperv: self.config.lock().unwrap().cpus.kvm_hyperv,
+                    kvm_hyperv: vm_config.cpus.kvm_hyperv,
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx,
+                    vendor_compatible,
+                    arch_compatible,
                 },
             )
             .map_err(|e| {

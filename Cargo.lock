@@ -195,6 +195,7 @@ dependencies = [
  "linux-loader",
  "log",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid 1.23.5",
  "vm-fdt",
