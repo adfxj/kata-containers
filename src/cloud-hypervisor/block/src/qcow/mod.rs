@@ -156,6 +156,8 @@ pub enum Error {
     UnsupportedFeature(#[source] MissingFeatureError),
     #[error("Unsupported refcount order")]
     UnsupportedRefcountOrder,
+    #[error("Images with internal snapshots are not supported")]
+    UnsupportedSnapshots,
     #[error("Unsupported version: {0}")]
     UnsupportedVersion(u32),
     #[error("Failed to write data")]
@@ -383,7 +385,9 @@ pub(crate) fn parse_qcow(
             Error::InvalidMagic
             | Error::BackingFileTooLong(_)
             | Error::InvalidBackingFileName(_) => BlockErrorKind::InvalidFormat,
-            Error::UnsupportedFeature(_) | Error::UnsupportedCompressionType => {
+            Error::UnsupportedFeature(_)
+            | Error::UnsupportedCompressionType
+            | Error::UnsupportedSnapshots => {
                 BlockErrorKind::UnsupportedFeature
             }
             _ => BlockErrorKind::Io,
@@ -496,6 +500,13 @@ pub(crate) fn parse_qcow(
     let mut raw_file = QcowRawFile::from(file, cluster_size, refcount_bits)
         .ok_or_else(|| BlockError::new(BlockErrorKind::InvalidFormat, Error::InvalidClusterSize))?;
     let is_writable = raw_file.file().is_writable();
+
+    if is_writable && header.nb_snapshots != 0 {
+        return Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            Error::UnsupportedSnapshots,
+        ));
+    }
 
     if header.is_corrupt() {
         if is_writable {
