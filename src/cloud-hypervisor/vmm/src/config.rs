@@ -360,6 +360,37 @@ pub enum ValidationError {
     /// Invalid rate-limiter group
     #[error("Invalid rate-limiter group")]
     InvalidRateLimiterGroup,
+    /// A burst duration requires a burst rate
+    #[error("Rate limiter burst duration {0} seconds requires a burst rate")]
+    RateLimiterBurstSecondsWithoutRate(u64),
+    /// Burst rate and duration must be positive
+    #[error("Rate limiter burst rate {0} and duration {1} seconds must be positive")]
+    RateLimiterBurstZero(u64, u64),
+    /// A bounded burst cannot be combined with a one-time burst
+    #[error("Rate limiter burst rate {0} cannot be combined with one-time burst {1}")]
+    RateLimiterBurstWithOneTimeBurst(u64, u64),
+    /// A bounded burst requires an enabled sustained bucket
+    #[error("Rate limiter burst rate {0} requires nonzero size {1} and refill time {2} ms")]
+    RateLimiterBurstDisabledBucket(u64, u64, u64),
+    /// Burst rate cannot be below the sustained rate
+    #[error("Rate limiter burst rate {0} is below the sustained rate of {1} tokens per {2} ms")]
+    RateLimiterBurstBelowSustained(u64, u64, u64),
+    /// Burst capacity must fit in a u64
+    #[error("Rate limiter burst rate {0} times duration {1} seconds overflows token capacity")]
+    RateLimiterBurstCapacityOverflow(u64, u64),
+    /// A recharge duration requires a bounded burst
+    #[error("Rate limiter burst recharge time {0} seconds requires a burst rate")]
+    RateLimiterBurstRechargeWithoutRate(u64),
+    /// Recharge must take longer than refilling the base meter
+    #[error(
+        "Rate limiter burst recharge time {0} seconds must be at least {1} seconds to exceed the base refill time"
+    )]
+    RateLimiterBurstRechargeTooShort(u64, u128),
+    /// Recharge only applies to burst credit above the base capacity
+    #[error(
+        "Rate limiter burst recharge time {0} seconds has no effect: burst capacity {1} does not exceed the base capacity {2}"
+    )]
+    RateLimiterBurstRechargeWithoutCredit(u64, u64, u128),
     /// Rate limiting is not supported with vhost-user
     #[error("Rate limiting is not supported with vhost-user")]
     VhostUserRateLimiterNotSupported,
@@ -1194,77 +1225,137 @@ impl MemoryConfig {
     }
 }
 
+const RATE_LIMITER_OPTIONS: &[&str] = &[
+    "bw_size",
+    "bw_one_time_burst",
+    "bw_refill_time",
+    "bw_burst_rate",
+    "bw_burst_seconds",
+    "bw_burst_recharge_seconds",
+    "ops_size",
+    "ops_one_time_burst",
+    "ops_refill_time",
+    "ops_burst_rate",
+    "ops_burst_seconds",
+    "ops_burst_recharge_seconds",
+];
+
+fn parse_rate_limiter_config(
+    parser: &OptionParser,
+) -> result::Result<RateLimiterConfig, OptionParserError> {
+    let bandwidth = TokenBucketConfig {
+        size: parser.convert("bw_size")?.unwrap_or_default(),
+        one_time_burst: Some(parser.convert("bw_one_time_burst")?.unwrap_or_default()),
+        refill_time: parser.convert("bw_refill_time")?.unwrap_or_default(),
+        burst_rate: parser.convert("bw_burst_rate")?,
+        burst_seconds: parser.convert("bw_burst_seconds")?,
+        burst_recharge_seconds: parser.convert("bw_burst_recharge_seconds")?,
+    };
+    let ops = TokenBucketConfig {
+        size: parser.convert("ops_size")?.unwrap_or_default(),
+        one_time_burst: Some(parser.convert("ops_one_time_burst")?.unwrap_or_default()),
+        refill_time: parser.convert("ops_refill_time")?.unwrap_or_default(),
+        burst_rate: parser.convert("ops_burst_rate")?,
+        burst_seconds: parser.convert("ops_burst_seconds")?,
+        burst_recharge_seconds: parser.convert("ops_burst_recharge_seconds")?,
+    };
+    let [bandwidth, ops] = [bandwidth, ops].map(|bucket| {
+        ((bucket.size != 0 && bucket.refill_time != 0)
+            || bucket.burst_rate.is_some()
+            || bucket.burst_seconds.is_some()
+            || bucket.burst_recharge_seconds.is_some())
+        .then_some(bucket)
+    });
+    Ok(RateLimiterConfig { bandwidth, ops })
+}
+
+fn validate_rate_limiter_config(cfg: &RateLimiterConfig) -> ValidationResult<()> {
+    for bucket in [cfg.bandwidth, cfg.ops].into_iter().flatten() {
+        let Some(rate) = bucket.burst_rate else {
+            if let Some(seconds) = bucket.burst_seconds {
+                return Err(ValidationError::RateLimiterBurstSecondsWithoutRate(seconds));
+            }
+            if let Some(recharge) = bucket.burst_recharge_seconds {
+                return Err(ValidationError::RateLimiterBurstRechargeWithoutRate(
+                    recharge,
+                ));
+            }
+            continue;
+        };
+        let seconds = bucket.burst_seconds.unwrap_or(1);
+        if rate == 0 || seconds == 0 {
+            return Err(ValidationError::RateLimiterBurstZero(rate, seconds));
+        }
+        if let Some(burst) = bucket.one_time_burst
+            && burst > 0
+        {
+            return Err(ValidationError::RateLimiterBurstWithOneTimeBurst(
+                rate, burst,
+            ));
+        }
+        if bucket.size == 0 || bucket.refill_time == 0 {
+            return Err(ValidationError::RateLimiterBurstDisabledBucket(
+                rate,
+                bucket.size,
+                bucket.refill_time,
+            ));
+        }
+        if u128::from(rate) * u128::from(bucket.refill_time) < u128::from(bucket.size) * 1000 {
+            return Err(ValidationError::RateLimiterBurstBelowSustained(
+                rate,
+                bucket.size,
+                bucket.refill_time,
+            ));
+        }
+        if rate.checked_mul(seconds).is_none() {
+            return Err(ValidationError::RateLimiterBurstCapacityOverflow(
+                rate, seconds,
+            ));
+        }
+        if let Some(recharge) = bucket.burst_recharge_seconds {
+            let sustained = u128::from(bucket.size) * 1000;
+            let refill_time = u128::from(bucket.refill_time);
+            let base_depth = sustained.div_ceil(refill_time);
+            let base_refill_seconds = base_depth * refill_time / sustained;
+            let capacity = rate * seconds;
+            if u128::from(capacity) <= base_depth {
+                return Err(ValidationError::RateLimiterBurstRechargeWithoutCredit(
+                    recharge, capacity, base_depth,
+                ));
+            }
+            if u128::from(recharge) <= base_refill_seconds {
+                return Err(ValidationError::RateLimiterBurstRechargeTooShort(
+                    recharge,
+                    base_refill_seconds + 1,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl RateLimiterGroupConfig {
     pub const SYNTAX: &'static str = "Rate Limit Group parameters \
         \"bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
         id=<device_id>\"";
 
     pub fn parse(rate_limit_group: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
-            .add("id");
+        parser.add_all(RATE_LIMITER_OPTIONS).add("id");
         parser
             .parse(rate_limit_group)
             .map_err(Error::ParseRateLimiterGroup)?;
 
         let id = parser.get("id").unwrap_or_default();
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-
         Ok(RateLimiterGroupConfig {
             id,
-            rate_limiter_config: RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            },
+            rate_limiter_config: parse_rate_limiter_config(&parser)
+                .map_err(Error::ParseRateLimiterGroup)?,
         })
     }
 
@@ -1276,6 +1367,8 @@ impl RateLimiterGroupConfig {
         if self.id.is_empty() {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
+
+        validate_rate_limiter_config(&self.rate_limiter_config)?;
 
         Ok(())
     }
@@ -1344,7 +1437,11 @@ impl DiskConfig {
          num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
          vhost_user=on|off,socket=<vhost_user_socket_path>,\
          bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+         bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+         bw_burst_recharge_seconds=<seconds>,\
          ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+         ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+         ops_burst_recharge_seconds=<seconds>,\
          id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
          rate_limit_group=<group_id>,\
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
@@ -1361,12 +1458,7 @@ impl DiskConfig {
             .add("num_queues")
             .add("vhost_user")
             .add("socket")
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
+            .add_all(RATE_LIMITER_OPTIONS)
             .add("_disable_io_uring")
             .add("_disable_aio")
             .add("serial")
@@ -1416,30 +1508,7 @@ impl DiskConfig {
             .unwrap_or(Toggle(false))
             .0;
         let rate_limit_group = parser.get("rate_limit_group");
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
+        let rate_limiter_config = parse_rate_limiter_config(&parser).map_err(Error::ParseDisk)?;
         let serial = parser.get("serial");
         let queue_affinity = parser
             .convert::<Tuple<u16, Vec<usize>>>("queue_affinity")
@@ -1473,32 +1542,9 @@ impl DiskConfig {
             .map_err(Error::ParseDisk)?
             .unwrap_or_default();
 
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
+        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+            || rate_limiter_config.ops.is_some())
+        .then_some(rate_limiter_config);
         let sparse = parser
             .convert::<Toggle>("sparse")
             .map_err(Error::ParseDisk)?
@@ -1559,6 +1605,10 @@ impl DiskConfig {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
 
+        if let Some(cfg) = &self.rate_limiter_config {
+            validate_rate_limiter_config(cfg)?;
+        }
+
         // Check Block device serial length
         if let Some(ref serial) = self.serial
             && serial.len() > VIRTIO_BLK_ID_BYTES as usize
@@ -1596,7 +1646,11 @@ impl NetConfig {
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+    bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+    bw_burst_recharge_seconds=<seconds>,\
     ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+    ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+    ops_burst_recharge_seconds=<seconds>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
     offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off\"";
 
@@ -1619,12 +1673,7 @@ impl NetConfig {
             .add("socket")
             .add("vhost_mode")
             .add("fd")
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
+            .add_all(RATE_LIMITER_OPTIONS)
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(net).map_err(Error::ParseNetwork)?;
 
@@ -1675,56 +1724,11 @@ impl NetConfig {
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
             .map(|v| v.0.iter().map(|e| *e as i32).collect());
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
+        let rate_limiter_config =
+            parse_rate_limiter_config(&parser).map_err(Error::ParseNetwork)?;
+        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+            || rate_limiter_config.ops.is_some())
+        .then_some(rate_limiter_config);
 
         let pci_common = PciDeviceCommonConfig::parse(net)?;
 
@@ -1786,6 +1790,10 @@ impl NetConfig {
 
         if self.vhost_user && self.rate_limiter_config.is_some() {
             return Err(ValidationError::VhostUserRateLimiterNotSupported);
+        }
+
+        if let Some(cfg) = &self.rate_limiter_config {
+            validate_rate_limiter_config(cfg)?;
         }
 
         if let Some(mtu) = self.mtu
@@ -2999,11 +3007,11 @@ impl RestoreConfig {
         \n`fs_sources` is source dir of virtiofs with pattern [tag1@/path/to/dir,tag2@/path/to/dir] \
         \n`restore_taps` is tap devices with pattern [id1@[tap=tap1,ip=...,mask=...,mac=...,host_mac=tap],id2@[tap=tap2,ip=...,mask=...,mac=...],...] \
         \n`host_mac` in restore_taps controls the tap device MAC: `tap` uses the tap device's own MAC; if not specified, the original host_mac from VM config is preserved (default) \
-        \n`disks` is disk devices with pattern [id1@[path=/path/to/disk1,rate_limit_group=group1,bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...] \
+        \n`disks` is disk devices with pattern [id1@[path=/path/to/disk1,rate_limit_group=group1,bw_size=...,bw_one_time_burst=...,bw_refill_time=...,bw_burst_rate=...,bw_burst_seconds=...,bw_burst_recharge_seconds=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...,ops_burst_rate=...,ops_burst_seconds=...,ops_burst_recharge_seconds=...],...] \
         \n`pmem` is pmem devices with pattern [id1@/path/to/pmem1,id2@/path/to/pmem2] \
         \n`memory_vol_url` is memory blob path for reading memory range data from a separate volume \
         \n`serial_socket` is socket path of serial port \
-        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...],...] \
+        \n`rate_limit_groups` is rate limit groups with pattern [id1@[bw_size=...,bw_one_time_burst=...,bw_refill_time=...,bw_burst_rate=...,bw_burst_seconds=...,bw_burst_recharge_seconds=...,ops_size=...,ops_one_time_burst=...,ops_refill_time=...,ops_burst_rate=...,ops_burst_seconds=...,ops_burst_recharge_seconds=...],...] \
         \n`memory_backend` selects the memory snapshot backend: `raw` (default) for the existing single raw file path, or `ublk` for a ublk block device backed by an OverlayBD layer stack \
         \n`ublk_device` is the path to the ublk block device (e.g. /dev/ublkb0) created by the ublk daemon; required when `memory_backend=ublk`";
 
@@ -3112,9 +3120,15 @@ impl RestoreConfig {
                             .add("bw_size")
                             .add("bw_one_time_burst")
                             .add("bw_refill_time")
+                            .add("bw_burst_rate")
+                            .add("bw_burst_seconds")
+                            .add("bw_burst_recharge_seconds")
                             .add("ops_size")
                             .add("ops_one_time_burst")
-                            .add("ops_refill_time");
+                            .add("ops_refill_time")
+                            .add("ops_burst_rate")
+                            .add("ops_burst_seconds")
+                            .add("ops_burst_recharge_seconds");
                         disk_parser.parse(config_str).map_err(Error::ParseRestore)?;
 
                         let path = disk_parser
@@ -3123,60 +3137,11 @@ impl RestoreConfig {
                             .unwrap_or_default();
                         let rate_limit_group = disk_parser.get("rate_limit_group");
 
-                        let bw_size = disk_parser
-                            .convert("bw_size")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let bw_one_time_burst = disk_parser
-                            .convert("bw_one_time_burst")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let bw_refill_time = disk_parser
-                            .convert("bw_refill_time")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let ops_size = disk_parser
-                            .convert("ops_size")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let ops_one_time_burst = disk_parser
-                            .convert("ops_one_time_burst")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let ops_refill_time = disk_parser
-                            .convert("ops_refill_time")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-
-                        let bw_tb_config =
-                            if bw_size != 0 && bw_refill_time != 0 {
-                                Some(TokenBucketConfig {
-                                    size: bw_size,
-                                    one_time_burst: Some(bw_one_time_burst),
-                                    refill_time: bw_refill_time,
-                                })
-                            } else {
-                                None
-                            };
-                        let ops_tb_config =
-                            if ops_size != 0 && ops_refill_time != 0 {
-                                Some(TokenBucketConfig {
-                                    size: ops_size,
-                                    one_time_burst: Some(ops_one_time_burst),
-                                    refill_time: ops_refill_time,
-                                })
-                            } else {
-                                None
-                            };
                         let rate_limiter_config =
-                            if bw_tb_config.is_some() || ops_tb_config.is_some() {
-                                Some(RateLimiterConfig {
-                                    bandwidth: bw_tb_config,
-                                    ops: ops_tb_config,
-                                })
-                            } else {
-                                None
-                            };
+                            parse_rate_limiter_config(&disk_parser).map_err(Error::ParseRestore)?;
+                        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+                            || rate_limiter_config.ops.is_some())
+                        .then_some(rate_limiter_config);
 
                         Ok(RestoreDiskConfig {
                             id: id.clone(),
@@ -3217,61 +3182,23 @@ impl RestoreConfig {
                             .add("bw_size")
                             .add("bw_one_time_burst")
                             .add("bw_refill_time")
+                            .add("bw_burst_rate")
+                            .add("bw_burst_seconds")
+                            .add("bw_burst_recharge_seconds")
                             .add("ops_size")
                             .add("ops_one_time_burst")
-                            .add("ops_refill_time");
+                            .add("ops_refill_time")
+                            .add("ops_burst_rate")
+                            .add("ops_burst_seconds")
+                            .add("ops_burst_recharge_seconds");
                         group_parser.parse(config_str).map_err(Error::ParseRestore)?;
 
-                        let bw_size = group_parser
-                            .convert("bw_size")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let bw_one_time_burst = group_parser
-                            .convert("bw_one_time_burst")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let bw_refill_time = group_parser
-                            .convert("bw_refill_time")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let ops_size = group_parser
-                            .convert("ops_size")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let ops_one_time_burst = group_parser
-                            .convert("ops_one_time_burst")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-                        let ops_refill_time = group_parser
-                            .convert("ops_refill_time")
-                            .map_err(Error::ParseRestore)?
-                            .unwrap_or_default();
-
-                        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-                            Some(TokenBucketConfig {
-                                size: bw_size,
-                                one_time_burst: Some(bw_one_time_burst),
-                                refill_time: bw_refill_time,
-                            })
-                        } else {
-                            None
-                        };
-                        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-                            Some(TokenBucketConfig {
-                                size: ops_size,
-                                one_time_burst: Some(ops_one_time_burst),
-                                refill_time: ops_refill_time,
-                            })
-                        } else {
-                            None
-                        };
+                        let rate_limiter_config = parse_rate_limiter_config(&group_parser)
+                            .map_err(Error::ParseRestore)?;
 
                         Ok(RateLimiterGroupConfig {
                             id: id.clone(),
-                            rate_limiter_config: RateLimiterConfig {
-                                bandwidth: bw_tb_config,
-                                ops: ops_tb_config,
-                            },
+                            rate_limiter_config,
                         })
                     })
                     .collect::<Result<_>>()
@@ -4548,6 +4475,9 @@ mod unit_tests {
                         size: 1000,
                         one_time_burst: Some(0),
                         refill_time: 100,
+                        burst_rate: None,
+                        burst_seconds: None,
+                        burst_recharge_seconds: None,
                     }),
                     ops: None,
                 }
@@ -4563,11 +4493,578 @@ mod unit_tests {
                         size: 1000,
                         one_time_burst: Some(0),
                         refill_time: 100,
+                        burst_rate: None,
+                        burst_seconds: None,
+                        burst_recharge_seconds: None,
                     }),
                 }
             }
         );
         Ok(())
+    }
+
+    fn parse_rate_limiter_configs(options: &str) -> [RateLimiterConfig; 3] {
+        [
+            DiskConfig::parse(options)
+                .unwrap()
+                .rate_limiter_config
+                .unwrap(),
+            // SAFETY: These test inputs contain no inherited descriptors.
+            unsafe { NetConfig::parse(options) }
+                .unwrap()
+                .rate_limiter_config
+                .unwrap(),
+            RateLimiterGroupConfig::parse(options)
+                .unwrap()
+                .rate_limiter_config,
+        ]
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_parsing() {
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,bw_burst_seconds=3,\
+            ops_size=100,ops_refill_time=1000,ops_burst_rate=400,ops_burst_seconds=2";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(2000),
+                burst_seconds: Some(3),
+                burst_recharge_seconds: None,
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(400),
+                burst_seconds: Some(2),
+                burst_recharge_seconds: None,
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,\
+            ops_size=100,ops_refill_time=1000,ops_burst_rate=400";
+        let expected = RateLimiterConfig {
+            bandwidth: expected.bandwidth.map(|b| TokenBucketConfig {
+                burst_seconds: None,
+                ..b
+            }),
+            ops: expected.ops.map(|b| TokenBucketConfig {
+                burst_seconds: None,
+                ..b
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_recharge_parsing() {
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,bw_burst_seconds=3,\
+            bw_burst_recharge_seconds=4,ops_size=100,ops_refill_time=1000,ops_burst_rate=400,\
+            ops_burst_seconds=2,ops_burst_recharge_seconds=5";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(2000),
+                burst_seconds: Some(3),
+                burst_recharge_seconds: Some(4),
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(400),
+                burst_seconds: Some(2),
+                burst_recharge_seconds: Some(5),
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+            for result in rate_limiter_validation_results(config) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_plain_parsing() {
+        let options = "bw_size=1000,bw_refill_time=100,bw_one_time_burst=2000,\
+            ops_size=100,ops_refill_time=100,ops_one_time_burst=200";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(2000),
+                refill_time: 100,
+                burst_rate: None,
+                burst_seconds: None,
+                burst_recharge_seconds: None,
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(200),
+                refill_time: 100,
+                burst_rate: None,
+                burst_seconds: None,
+                burst_recharge_seconds: None,
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+
+        for config in parse_rate_limiter_configs(
+            "bw_size=1000,bw_refill_time=100,ops_size=100,ops_refill_time=100",
+        ) {
+            assert_eq!(
+                config,
+                RateLimiterConfig {
+                    bandwidth: expected.bandwidth.map(|b| TokenBucketConfig {
+                        one_time_burst: Some(0),
+                        ..b
+                    }),
+                    ops: expected.ops.map(|b| TokenBucketConfig {
+                        one_time_burst: Some(0),
+                        ..b
+                    }),
+                }
+            );
+        }
+
+        for options in ["", "bw_size=1000", "ops_refill_time=100"] {
+            assert_eq!(
+                DiskConfig::parse(options).unwrap().rate_limiter_config,
+                None
+            );
+            assert_eq!(
+                // SAFETY: These test inputs contain no inherited descriptors.
+                unsafe { NetConfig::parse(options) }
+                    .unwrap()
+                    .rate_limiter_config,
+                None
+            );
+            assert_eq!(
+                RateLimiterGroupConfig::parse(options)
+                    .unwrap()
+                    .rate_limiter_config,
+                RateLimiterConfig::default()
+            );
+        }
+    }
+
+    fn rate_limiter_validation_results(cfg: RateLimiterConfig) -> [ValidationResult<()>; 3] {
+        let vm_config: VmConfig = serde_json::from_str("{}").unwrap();
+        let mut disk = raw_disk_fixture();
+        disk.rate_limiter_config = Some(cfg);
+        let mut net = net_fixture();
+        net.rate_limiter_config = Some(cfg);
+        let group = RateLimiterGroupConfig {
+            id: "group0".to_string(),
+            rate_limiter_config: cfg,
+        };
+        [
+            disk.validate(&vm_config),
+            net.validate(&vm_config),
+            group.validate(&vm_config),
+        ]
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_disabled_parsing() {
+        for (options, expected) in [
+            (
+                "bw_burst_rate=2000",
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 0),
+            ),
+            (
+                "ops_burst_rate=2000",
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 0),
+            ),
+            (
+                "bw_burst_seconds=2",
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                "ops_burst_seconds=2",
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                "bw_burst_recharge_seconds=4",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(4),
+            ),
+            (
+                "ops_burst_recharge_seconds=4",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(4),
+            ),
+            (
+                "bw_burst_recharge_seconds=0",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(0),
+            ),
+            (
+                "ops_burst_recharge_seconds=0",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(0),
+            ),
+        ] {
+            for cfg in parse_rate_limiter_configs(options) {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_validation() {
+        let bucket = TokenBucketConfig {
+            size: 1000,
+            one_time_burst: Some(0),
+            refill_time: 1000,
+            burst_rate: Some(2000),
+            burst_seconds: Some(2),
+            burst_recharge_seconds: None,
+        };
+        let invalid = [
+            (
+                TokenBucketConfig {
+                    burst_rate: None,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstZero(0, 2),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_seconds: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstZero(2000, 0),
+            ),
+            (
+                TokenBucketConfig {
+                    one_time_burst: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstWithOneTimeBurst(2000, 1),
+            ),
+            (
+                TokenBucketConfig { size: 0, ..bucket },
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 1000),
+            ),
+            (
+                TokenBucketConfig {
+                    refill_time: 0,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 1000, 0),
+            ),
+            (
+                TokenBucketConfig {
+                    size: 1001,
+                    burst_rate: Some(1000),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstBelowSustained(1000, 1001, 1000),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(u64::MAX),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstCapacityOverflow(u64::MAX, 2),
+            ),
+        ];
+        for (bucket, expected) in invalid {
+            for cfg in [
+                RateLimiterConfig {
+                    bandwidth: Some(bucket),
+                    ops: None,
+                },
+                RateLimiterConfig {
+                    bandwidth: None,
+                    ops: Some(bucket),
+                },
+            ] {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+
+        for bucket in [
+            bucket,
+            TokenBucketConfig {
+                one_time_burst: None,
+                burst_seconds: None,
+                ..bucket
+            },
+            // Depth can be smaller than size: size/refill_time defines only the rate.
+            TokenBucketConfig {
+                size: 10_000,
+                refill_time: 10_000,
+                burst_rate: Some(1000),
+                burst_seconds: Some(1),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: u64::MAX,
+                refill_time: u64::MAX,
+                burst_rate: Some(u64::MAX),
+                burst_seconds: Some(1),
+                ..bucket
+            },
+            // No new validation is applied to plain buckets.
+            TokenBucketConfig {
+                one_time_burst: Some(2000),
+                burst_rate: None,
+                burst_seconds: None,
+                ..bucket
+            },
+        ] {
+            for result in rate_limiter_validation_results(RateLimiterConfig {
+                bandwidth: Some(bucket),
+                ops: Some(bucket),
+            }) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_recharge_validation() {
+        let bucket = TokenBucketConfig {
+            size: 1,
+            one_time_burst: Some(0),
+            refill_time: 2000,
+            burst_rate: Some(2),
+            burst_seconds: Some(2),
+            burst_recharge_seconds: Some(3),
+        };
+        let invalid = [
+            (
+                TokenBucketConfig {
+                    burst_rate: None,
+                    burst_seconds: None,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeWithoutRate(3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(0, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(1, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(2),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(2, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    size: 3,
+                    burst_recharge_seconds: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(1, 2),
+            ),
+            (
+                TokenBucketConfig {
+                    refill_time: u64::MAX,
+                    burst_recharge_seconds: Some(u64::MAX / 1000),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(
+                    u64::MAX / 1000,
+                    u128::from(u64::MAX / 1000) + 1,
+                ),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(1),
+                    burst_seconds: Some(1),
+                    burst_recharge_seconds: Some(10),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeWithoutCredit(10, 1, 1),
+            ),
+        ];
+        for (bucket, expected) in invalid {
+            for cfg in [
+                RateLimiterConfig {
+                    bandwidth: Some(bucket),
+                    ops: None,
+                },
+                RateLimiterConfig {
+                    bandwidth: None,
+                    ops: Some(bucket),
+                },
+            ] {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+
+        for bucket in [
+            bucket,
+            TokenBucketConfig {
+                size: 3,
+                burst_recharge_seconds: Some(2),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: u64::MAX,
+                refill_time: u64::MAX,
+                burst_rate: Some(u64::MAX),
+                burst_seconds: Some(1),
+                burst_recharge_seconds: Some(u64::MAX),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: 2_000_000_001,
+                refill_time: 4_000_000_000_000,
+                burst_rate: Some(1),
+                burst_seconds: Some(10),
+                burst_recharge_seconds: Some(2),
+                ..bucket
+            },
+            TokenBucketConfig {
+                refill_time: u64::MAX,
+                burst_recharge_seconds: Some(u64::MAX / 1000 + 1),
+                ..bucket
+            },
+        ] {
+            for result in rate_limiter_validation_results(RateLimiterConfig {
+                bandwidth: Some(bucket),
+                ops: Some(bucket),
+            }) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_serde() {
+        let old_json = r#"{"size":1000,"one_time_burst":0,"refill_time":1000}"#;
+        let plain: TokenBucketConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(plain.burst_rate, None);
+        assert_eq!(plain.burst_seconds, None);
+        assert_eq!(plain.burst_recharge_seconds, None);
+        assert_eq!(serde_json::to_string(&plain).unwrap(), old_json);
+        let old_config_json = format!(r#"{{"bandwidth":{old_json},"ops":null}}"#);
+        let plain_config: RateLimiterConfig = serde_json::from_str(&old_config_json).unwrap();
+        assert_eq!(plain_config.bandwidth, Some(plain));
+        assert_eq!(
+            serde_json::to_string(&plain_config).unwrap(),
+            old_config_json
+        );
+
+        let burst = TokenBucketConfig {
+            burst_rate: Some(2000),
+            burst_seconds: Some(3),
+            ..plain
+        };
+        let json = serde_json::to_string(&burst).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TokenBucketConfig>(&json).unwrap(),
+            burst
+        );
+        let config = RateLimiterConfig {
+            bandwidth: Some(burst),
+            ops: Some(burst),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RateLimiterConfig>(&json).unwrap(),
+            config
+        );
+
+        let recharge = TokenBucketConfig {
+            burst_recharge_seconds: Some(4),
+            ..burst
+        };
+        let json = serde_json::to_string(&recharge).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["burst_recharge_seconds"], 4);
+        assert_eq!(
+            serde_json::from_str::<TokenBucketConfig>(&json).unwrap(),
+            recharge
+        );
+        let config = RateLimiterConfig {
+            bandwidth: Some(recharge),
+            ops: Some(recharge),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RateLimiterConfig>(&json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_token_bucket_config() {
+        let plain = TokenBucketConfig {
+            size: 1000,
+            one_time_burst: Some(2000),
+            refill_time: 100,
+            burst_rate: None,
+            burst_seconds: None,
+            burst_recharge_seconds: None,
+        };
+        let bucket = plain.token_bucket().unwrap();
+        assert_eq!(bucket.capacity(), 1000);
+        assert_eq!(bucket.one_time_burst(), 2000);
+        assert_eq!(bucket.refill_time_ms(), 100);
+        assert_eq!(bucket.budget(), 1000);
+
+        let burst = TokenBucketConfig {
+            one_time_burst: Some(0),
+            burst_rate: Some(20_000),
+            ..plain
+        };
+        let bucket = burst.token_bucket().unwrap();
+        assert_eq!(bucket.capacity(), 20_000);
+        assert_eq!(bucket.one_time_burst(), 0);
+        assert_eq!(bucket.refill_time_ms(), 100);
+        let bucket = TokenBucketConfig {
+            burst_seconds: Some(3),
+            ..burst
+        }
+        .token_bucket()
+        .unwrap();
+        assert_eq!(bucket.capacity(), 60_000);
+        let bucket = TokenBucketConfig {
+            burst_seconds: Some(3),
+            burst_recharge_seconds: Some(4),
+            ..burst
+        }
+        .token_bucket()
+        .unwrap();
+        assert_eq!(bucket.capacity(), 60_000);
+        assert_eq!(bucket.budget(), 60_000);
     }
 
     #[test]
