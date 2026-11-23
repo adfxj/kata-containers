@@ -9,13 +9,16 @@ use std::process::Command;
 fn main() {
     let mut version = "v".to_owned() + env!("CARGO_PKG_VERSION");
 
-    if let Ok(git_out) = Command::new("git").args(["describe", "--dirty"]).output()
+    if let Ok(git_out) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
         && git_out.status.success()
         && let Ok(git_out_str) = String::from_utf8(git_out.stdout)
     {
-        version = git_out_str;
+        let mut git_str = git_out_str;
         // Pop the trailing newline.
-        version.pop();
+        git_str.pop();
+        version.push_str(&format!("-{git_str}"));
     }
 
     // Append CH_EXTRA_VERSION to version if it is set.
