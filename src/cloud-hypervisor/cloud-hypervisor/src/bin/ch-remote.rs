@@ -19,6 +19,7 @@ use api_client::{
 #[cfg(feature = "dbus_api")]
 use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
+#[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::CpuIdCustomEntry;
 use log::error;
 use option_parser::{ByteSized, ByteSizedParseError};
@@ -1420,6 +1421,7 @@ fn do_cpuid_get(_output: &str) -> ApiResult {
     )))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn do_cpuid_intersect(files: &[String], output: &str) -> ApiResult {
     use std::fs::File;
     use std::io::Write;
@@ -1461,6 +1463,13 @@ fn do_cpuid_intersect(files: &[String], output: &str) -> ApiResult {
         files.len()
     );
     Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn do_cpuid_intersect(_files: &[String], _output: &str) -> ApiResult {
+    Err(Error::CpuidIntersect(anyhow::anyhow!(
+        "cpuid-intersect requires x86_64"
+    )))
 }
 
 fn main() {

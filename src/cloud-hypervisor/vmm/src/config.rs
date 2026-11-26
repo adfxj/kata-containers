@@ -613,6 +613,7 @@ impl<'a> VmParams<'a> {
             args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
         #[cfg(feature = "ivshmem")]
         let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
+        #[cfg(target_arch = "x86_64")]
         let sys_ctrl = args.get_flag("sys-ctrl");
         VmParams {
             cpus,

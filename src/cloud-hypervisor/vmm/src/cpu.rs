@@ -92,7 +92,9 @@ use crate::gdb::{Debuggable, DebuggableError, get_raw_tid};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
-use crate::vm_config::{CompatibleMode, CoreScheduling, CpusConfig};
+use crate::vm_config::{CoreScheduling, CpusConfig};
+#[cfg(target_arch = "x86_64")]
+use crate::vm_config::CompatibleMode;
 use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
